@@ -48,4 +48,38 @@ describe('tracker', () => {
     for (let i = 0; i < 6; i++) s = t.update({ corners: quad(), balls: [det(0.004, 0, true)], diag });
     expect(s.balls).toHaveLength(1);
   });
+
+  it('ids are never reused: not after reset(), not by a tracker created with firstId = nextId()', () => {
+    const t = createTracker({ ballRadius: R });
+    const diag = 800;
+    const balls = [det(0.1, 0), det(0.5, 0.2), det(-0.4, 0.3)];
+    t.update({ corners: quad(), balls, diag });
+    const before = new Set(t.update({ corners: quad(), balls, diag }).balls.map((b) => b.id));
+    expect(before.size).toBe(3);
+    t.reset();
+    t.update({ corners: quad(), balls, diag });
+    const after = t.update({ corners: quad(), balls, diag }).balls.map((b) => b.id);
+    expect(after).toHaveLength(3);
+    for (const id of after) expect(before.has(id), id).toBe(false);
+    const u = createTracker({ ballRadius: R, firstId: t.nextId() });
+    u.update({ corners: quad(), balls, diag });
+    const third = u.update({ corners: quad(), balls, diag }).balls.map((b) => b.id);
+    for (const id of third) {
+      expect(before.has(id), id).toBe(false);
+      expect(after.includes(id), id).toBe(false);
+    }
+  });
+
+  it('resetLock() drops the lock but keeps the ball tracks and their ids', () => {
+    const t = createTracker({ ballRadius: R });
+    const diag = 800;
+    const balls = [det(0.1, 0), det(0.5, 0.2)];
+    let s = t.update({ corners: quad(), balls, diag });
+    for (let i = 0; i < 6; i++) s = t.update({ corners: quad(), balls, diag });
+    expect(s.status).toBe('locked');
+    const ids = s.balls.map((b) => b.id);
+    t.resetLock();
+    expect(t.update({ corners: quad(), balls, diag }).status).toBe('unstable');
+    expect(t.update({ corners: quad(), balls, diag }).balls.map((b) => b.id)).toEqual(ids);
+  });
 });
