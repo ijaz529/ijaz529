@@ -52,7 +52,7 @@ cp ios/ExportOptions.plist "$EXPORT_PLIST"
 /usr/libexec/PlistBuddy -c "Set :teamID $APPLE_TEAM_ID" "$EXPORT_PLIST"
 if [[ "$UPLOAD" != "1" ]]; then /usr/libexec/PlistBuddy -c "Set :destination export" "$EXPORT_PLIST"; fi
 
-echo "Archiving $IOS_BUNDLE_ID $MARKETING_VERSION ($BUILD_NUMBER) for team $APPLE_TEAM_ID with $(xcodebuild -version | head -1)"
+echo "Archiving $IOS_BUNDLE_ID $MARKETING_VERSION ($BUILD_NUMBER) for team $APPLE_TEAM_ID with $(xcodebuild -version | sed -n 1p)"
 rm -rf "$ARCHIVE" "$EXPORT_DIR"
 mkdir -p build
 xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
@@ -86,6 +86,6 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo "## TestFlight"
     echo ""
     echo "- $MSG"
-    echo "- $(xcodebuild -version | head -1), team \`$APPLE_TEAM_ID\`"
+    echo "- $(xcodebuild -version | sed -n 1p), team \`$APPLE_TEAM_ID\`"
   } >> "$GITHUB_STEP_SUMMARY"
 fi

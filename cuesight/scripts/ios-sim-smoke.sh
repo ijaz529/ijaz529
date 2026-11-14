@@ -63,7 +63,7 @@ else
   fi
   IFS=$'\t' read -r UDID SIM_NAME SIM_RT <<< "$SIM_LINE"
 fi
-XCODE_VER=$(xcodebuild -version | head -1)
+XCODE_VER=$(xcodebuild -version | sed -n 1p)
 note "## CueSight iOS Simulator smoke test"
 note ""
 note "- Simulator: **$SIM_NAME** ($SIM_RT) \`$UDID\`"
@@ -120,7 +120,7 @@ wait_for() { # wait_for <fixed-string> <seconds>
   for ((i = 0; i < $2 * 2; i++)); do grep -qF -- "$1" "$CONSOLE" 2>/dev/null && return 0; sleep 0.5; done
   return 1
 }
-alive() { xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -q "UIKitApplication:$BUNDLE_ID"; }
+alive() { xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -F "UIKitApplication:$BUNDLE_ID" >/dev/null; }
 shot() { xcrun simctl io "$UDID" screenshot --type=png "$OUT/$1.png" >/dev/null 2>&1 && echo "$OUT/$1.png"; }
 settle_until() { local t=$(( LAUNCHED_AT + $1 - $(date +%s) )); (( t > 0 )) && sleep "$t" || true; }
 png_stats() { # prints "w h luma_std bg_fraction" for a PNG (8-bit RGB/RGBA), using only Node's zlib
