@@ -1,8 +1,8 @@
 /**
  * Ray-traced synthetic pool table (research.md R-13): exact ground truth for vision tests and the
  * fake-camera video for end-to-end tests. Models the bed, cushion blocks (cloth-covered, with a
- * visible nose face), wooden rails, pocket holes, shaded balls (solid/stripe, specular highlight)
- * and ball shadows, seen by a pinhole camera.
+ * visible nose face), wooden rails, pocket holes, shaded balls (solid/stripe, specular highlight),
+ * ball shadows and optional cue sticks, seen by a pinhole camera.
  */
 import type { TableSpec } from '../../core/types';
 import type { Vec2, Vec3 } from '../../core/vec';
@@ -15,6 +15,22 @@ export interface SynthBall {
   pos: Vec2;
   color: RGB;
   stripe?: boolean;
+  /** Stripe axis (the band is the great circle around it). Default: a fixed pseudo-random axis per index. */
+  axis?: Vec3;
+}
+
+/**
+ * A cue stick: a tapered round shaft (cone frustum) from the tip to the butt, both in table metres
+ * with z = height above the bed. The first `ferrule` metres from the tip are drawn in ferrule white.
+ */
+export interface SynthStick {
+  tip: Vec3;
+  butt: Vec3;
+  /** Shaft radius at the tip and at the butt (m). ASSUMPTION: a typical cue is ~13 mm at the tip, ~30 mm at the butt. */
+  tipRadius: number;
+  buttRadius: number;
+  color?: RGB;
+  ferrule?: number;
 }
 
 export interface SynthCamera {
@@ -41,6 +57,8 @@ export interface SynthScene {
   light?: Vec3;
   /** Amplitude of deterministic cloth noise (0..1). */
   noise?: number;
+  /** Optional cue sticks (vision robustness fixtures). They occlude, but cast no shadow. */
+  sticks?: SynthStick[];
 }
 
 export const BALL_COLORS: Record<string, RGB> = {
@@ -53,6 +71,9 @@ export const BALL_COLORS: Record<string, RGB> = {
   green: [20, 110, 50],
   maroon: [120, 20, 30],
   black: [18, 18, 20],
+  // Snooker colours. ASSUMPTION: sRGB approximations of typical ball pigments (no colorimetric source).
+  pink: [235, 120, 150],
+  brown: [120, 70, 30],
 };
 
 export interface CameraModel {
@@ -229,7 +250,7 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
   };
 
   // Ball stripe axes (deterministic per index).
-  const axes = scene.balls.map((_, i) => norm3({ x: Math.sin(i * 1.7), y: Math.cos(i * 2.3), z: 0.6 + 0.3 * Math.sin(i) }));
+  const axes = scene.balls.map((b, i) => norm3(b.axis ?? { x: Math.sin(i * 1.7), y: Math.cos(i * 2.3), z: 0.6 + 0.3 * Math.sin(i) }));
 
   // Flat, allocation-free scene data for the per-ray loops. Every expression below reproduces the
   // arithmetic of the original object-based tracer term by term, so frames are bit-identical.
@@ -272,6 +293,20 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
     bRail[k] = bx.kind === 'rail' ? 1 : 0;
   }
   const oArr = [C.x, C.y, C.z];
+  // Sticks: cone frustums, flattened like the balls. Per stick: tip (3), unit axis (3), length,
+  // tip radius, taper (radius change per metre), ferrule length, RGB.
+  const sticks = scene.sticks ?? [];
+  const nSticks = sticks.length;
+  const stk = new Float64Array(nSticks * 14);
+  for (let s = 0; s < nSticks; s++) {
+    const st = sticks[s]!;
+    const ax = st.butt.x - st.tip.x;
+    const ay = st.butt.y - st.tip.y;
+    const az = st.butt.z - st.tip.z;
+    const L = Math.hypot(ax, ay, az);
+    const col = st.color ?? [196, 160, 110];
+    stk.set([st.tip.x, st.tip.y, st.tip.z, ax / L, ay / L, az / L, L, st.tipRadius, (st.buttRadius - st.tipRadius) / L, st.ferrule ?? 0.012, col[0], col[1], col[2], 0], s * 14);
+  }
 
   const frame = createFrame(width, height);
   const Rm = cam.R;
@@ -295,6 +330,46 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
         tBest = t;
         hitKind = 1;
         ballIdx = i;
+      }
+    }
+    // Sticks: |p|² − (p·w)² = (r0 + k·(p·w))², p = o + t·d − tip, 0 ≤ p·w ≤ L (end caps ignored).
+    let stickIdx = -1;
+    let stickAlong = 0;
+    for (let s = 0; s < nSticks; s++) {
+      const o = s * 14;
+      const px0 = ox - stk[o]!;
+      const py0 = oy - stk[o + 1]!;
+      const pz0 = oz - stk[o + 2]!;
+      const wx = stk[o + 3]!;
+      const wy = stk[o + 4]!;
+      const wz = stk[o + 5]!;
+      const L = stk[o + 6]!;
+      const r0 = stk[o + 7]!;
+      const kk = stk[o + 8]!;
+      const dw = dx * wx + dy * wy + dz * wz;
+      const pw = px0 * wx + py0 * wy + pz0 * wz;
+      const dd = dx * dx + dy * dy + dz * dz;
+      const pd = px0 * dx + py0 * dy + pz0 * dz;
+      const pp = px0 * px0 + py0 * py0 + pz0 * pz0;
+      // (pp + 2t·pd + t²dd) − (pw + t·dw)² − (r0 + k(pw + t·dw))² = 0
+      const qa = dd - dw * dw - kk * kk * dw * dw;
+      const qb = 2 * (pd - pw * dw - (r0 + kk * pw) * kk * dw);
+      const qc = pp - pw * pw - (r0 + kk * pw) * (r0 + kk * pw);
+      const disc = qb * qb - 4 * qa * qc;
+      if (disc < 0 || Math.abs(qa) < 1e-12) continue;
+      const sq = Math.sqrt(disc);
+      const t1 = Math.min((-qb - sq) / (2 * qa), (-qb + sq) / (2 * qa));
+      const t2 = Math.max((-qb - sq) / (2 * qa), (-qb + sq) / (2 * qa));
+      for (let root = 0; root < 2; root++) {
+        const t = root === 0 ? t1 : t2;
+        const along = pw + t * dw;
+        if (t > 1e-6 && t < tBest && along >= 0 && along <= L) {
+          tBest = t;
+          hitKind = 6;
+          stickIdx = s;
+          stickAlong = along;
+          break;
+        }
       }
     }
     // Boxes (slab method), record the entering face: axis index and sign.
@@ -399,6 +474,23 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
       col[0] = base[0] * k + 255 * spec;
       col[1] = base[1] * k + 255 * spec;
       col[2] = base[2] * k + 255 * spec;
+      return;
+    }
+    if (hitKind === 6) {
+      // Stick: Lambert shading only. Outward normal ∝ p − (a + r(a)·k)·w.
+      const o = stickIdx * 14;
+      const kk = stk[o + 8]!;
+      const rr = stk[o + 7]! + kk * stickAlong;
+      const qx = px - stk[o]! - (stickAlong + rr * kk) * stk[o + 3]!;
+      const qy = py - stk[o + 1]! - (stickAlong + rr * kk) * stk[o + 4]!;
+      const qz = pz - stk[o + 2]! - (stickAlong + rr * kk) * stk[o + 5]!;
+      const nl = Math.hypot(qx, qy, qz) || 1;
+      const dn = (qx * lx + qy * ly + qz * lz) / nl;
+      const k = 0.35 + 0.7 * Math.max(0, dn);
+      const ferrule = stickAlong < stk[o + 9]!;
+      col[0] = (ferrule ? 235 : stk[o + 10]!) * k;
+      col[1] = (ferrule ? 232 : stk[o + 11]!) * k;
+      col[2] = (ferrule ? 220 : stk[o + 12]!) * k;
       return;
     }
     if (hitKind === 5) {
