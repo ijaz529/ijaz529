@@ -22,8 +22,16 @@ async function tapBallThenPocket(page, sel, pocketId) {
   }, sel);
   await page.mouse.click(b.at.x, b.at.y);
   await page.waitForFunction((id) => window.__cuesight.state.targetId === id, b.id, { timeout: 8000 });
-  await twoFrames(page);
-  const q = await page.evaluate((k) => window.__cuesight.practiceToScreen(window.__cuesight.state.table.pockets.find((p) => p.id === k).mouthCenter), pocketId);
+  // The table re-frames (animated) when the sheet or the Snap card grows: wait until the pocket is still.
+  const at = () => page.evaluate((k) => window.__cuesight.practiceToScreen(window.__cuesight.state.table.pockets.find((p) => p.id === k).mouthCenter), pocketId);
+  let q = await at();
+  for (let i = 0; i < 60; i++) {
+    await twoFrames(page);
+    await page.waitForTimeout(150);
+    const r = await at();
+    if (Math.hypot(r.x - q.x, r.y - q.y) < 0.5) break;
+    q = r;
+  }
   await page.mouse.click(q.x, q.y);
   await page.waitForFunction((k) => window.__cuesight.state.pocketId === k, pocketId, { timeout: 8000 });
 }

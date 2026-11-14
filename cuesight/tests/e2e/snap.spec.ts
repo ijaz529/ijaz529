@@ -28,10 +28,26 @@ const OBJECT_ORANGE: [number, number, number] = [0xe6, 0x9f, 0x00];
 const settled = (page: Page) =>
   page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(!(window as unknown as { __cuesight: Hook }).__cuesight.view3d?.isAnimating?.())))));
 
+/** The pocket's on-screen position once the table has stopped moving (re-frames are animated). */
+async function stableScreenPoint(page: Page, pocket: string): Promise<V2> {
+  let last: V2 | null = null;
+  for (let i = 0; i < 60; i++) {
+    await settled(page);
+    const q = await page.evaluate((pk) => {
+      const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+      return h.practiceToScreen(h.state.table.pockets.find((p) => p.id === pk)!.mouthCenter);
+    }, pocket);
+    if (last && Math.hypot(q.x - last.x, q.y - last.y) < 0.5) return q;
+    last = q;
+    await page.waitForTimeout(150);
+  }
+  return last!;
+}
+
 /**
  * Taps the detected ball nearest to `pos` (table metres) on the layout table, then a pocket. The
- * pocket is located after the ball tap: picking a target adds the step-2 call to action to the top
- * card, and the table re-frames into the space left.
+ * pocket is located after the ball tap, once the table is still: picking a target adds the step-2
+ * call to action to the top card, and the table re-frames (animated) into the space left.
  */
 async function pick(page: Page, pos: V2, pocket: string) {
   await settled(page);
@@ -42,11 +58,7 @@ async function pick(page: Page, pos: V2, pocket: string) {
   }, pos);
   await page.mouse.click(ball.at.x, ball.at.y);
   await page.waitForFunction((id) => (window as unknown as { __cuesight: Hook & { state: { targetId: string | null } } }).__cuesight.state.targetId === id, ball.id);
-  await settled(page);
-  const at = await page.evaluate((pk) => {
-    const h = (window as unknown as { __cuesight: Hook }).__cuesight;
-    return h.practiceToScreen(h.state.table.pockets.find((q) => q.id === pk)!.mouthCenter);
-  }, pocket);
+  const at = await stableScreenPoint(page, pocket);
   await page.mouse.click(at.x, at.y);
   await page.waitForFunction((pk) => (window as unknown as { __cuesight: Hook & { state: { pocketId: string | null } } }).__cuesight.state.pocketId === pk, pocket);
 }

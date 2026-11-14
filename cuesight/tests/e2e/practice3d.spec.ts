@@ -32,10 +32,17 @@ const settled = (page: Page) =>
 async function planB1(page: Page) {
   const ball = await screenOf(page, { ball: 'b1' });
   await page.mouse.click(ball.x, ball.y);
-  // Picking a target can change the sheet's peek height, and the table re-frames: locate the pocket now.
+  // Picking a target can change the sheet's peek height, and the table re-frames (animated): locate
+  // the pocket once it is still.
   await page.waitForFunction(() => (window as unknown as { __cuesight: { state: { targetId: string | null } } }).__cuesight.state.targetId === 'b1');
-  await settled(page);
-  const pocket = await screenOf(page, { pocket: 'TR' });
+  let pocket = await screenOf(page, { pocket: 'TR' });
+  for (let i = 0; i < 60; i++) {
+    await settled(page);
+    await page.waitForTimeout(150);
+    const q = await screenOf(page, { pocket: 'TR' });
+    if (Math.hypot(q.x - pocket.x, q.y - pocket.y) < 0.5) break;
+    pocket = q;
+  }
   await page.mouse.click(pocket.x, pocket.y);
   await expect(page.getByTestId('cut')).toHaveText('30.0°');
 }

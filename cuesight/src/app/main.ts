@@ -15,6 +15,7 @@ import { Overlay, containMapping, type OverlayData } from './render/overlay';
 import { rgbCss } from './render/palette';
 import { TableView } from './render/table-view';
 import { loadSettings, physicsFor, saveSettings, tableFor, type Settings } from './settings';
+import { perspectivePocketNames } from './pocket-names';
 import { createStore, type AppState, type Mode } from './store';
 import { createTable3D, type CameraPreset, type Pick3D, type Scene3DData, type Table3D } from './render3d';
 import { createSnapController } from './snap/controller';
@@ -216,15 +217,15 @@ function labelOf(id: string): string {
   return b?.label ?? id;
 }
 
-/** Pocket names as the player sees them: screen-relative on the practice table, near/far in camera and Snap. */
+/** Pocket names as the player sees them: screen-relative on the practice table, near/far in camera and Snap (unique, see pocket-names.ts). */
 function pocketNames(): Record<PocketId, string> {
   const out = { ...POCKET_NAMES };
-  const name = (pk: (typeof S.table.pockets)[number], q: Vec2, c: Vec2, camera: boolean) => {
+  const name = (pk: (typeof S.table.pockets)[number], q: Vec2, c: Vec2) => {
     const dx = q.x - c.x;
     const dy = q.y - c.y;
-    const v = camera ? (dy < 0 ? 'far' : 'near') : dy < 0 ? 'top' : 'bottom';
+    const v = dy < 0 ? 'top' : 'bottom';
     const h = dx < 0 ? 'left' : 'right';
-    if (pk.kind === 'corner') return camera ? `${v} ${h} corner` : `${v}-${h} corner`;
+    if (pk.kind === 'corner') return `${v}-${h} corner`;
     return Math.abs(dx) > Math.abs(dy) ? `${h} side` : `${v} side`;
   };
   if (S.mode === 'practice') {
@@ -234,11 +235,11 @@ function pocketNames(): Record<PocketId, string> {
       const right = { x: up.y, y: -up.x };
       for (const pk of S.table.pockets) {
         const m = pk.mouthCenter;
-        out[pk.id] = name(pk, { x: m.x * right.x + m.y * right.y, y: -(m.x * up.x + m.y * up.y) }, { x: 0, y: 0 }, false);
+        out[pk.id] = name(pk, { x: m.x * right.x + m.y * right.y, y: -(m.x * up.x + m.y * up.y) }, { x: 0, y: 0 });
       }
     } else {
       const c = practiceView.toCanvas({ x: 0, y: 0 });
-      for (const pk of S.table.pockets) out[pk.id] = name(pk, practiceView.toCanvas(pk.mouthCenter), c, false);
+      for (const pk of S.table.pockets) out[pk.id] = name(pk, practiceView.toCanvas(pk.mouthCenter), c);
     }
   } else {
     const cal = S.mode === 'snap' ? S.snap.overview?.vision?.calibration : (S.frozen?.calibration ?? S.vision?.calibration);
@@ -248,8 +249,8 @@ function pocketNames(): Record<PocketId, string> {
         const w = H[6]! * p.x + H[7]! * p.y + H[8]!;
         return { x: (H[0]! * p.x + H[1]! * p.y + H[2]!) / w, y: (H[3]! * p.x + H[4]! * p.y + H[5]!) / w };
       };
-      const c = pr({ x: 0, y: 0 });
-      for (const pk of S.table.pockets) out[pk.id] = name(pk, pr(pk.mouthCenter), c, true);
+      const pockets = S.table.pockets;
+      Object.assign(out, perspectivePocketNames(pockets, (id) => pr(pockets.find((pk) => pk.id === id)!.mouthCenter)));
     }
   }
   return out;

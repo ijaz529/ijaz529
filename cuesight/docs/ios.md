@@ -91,9 +91,9 @@ The workflow lives at the **git root** (the app is in `cuesight/`). It runs on p
 | Job | Runner | What it does |
 |---|---|---|
 | `web` | ubuntu | `npm ci`, typecheck, Vitest, `vite build`, gzip sizes in the run summary |
-| `chromium-e2e` | ubuntu | the Playwright suite with Chromium and the synthetic fake camera |
+| `chromium-e2e` | ubuntu | the Playwright suite with Chromium (Pixel 7, plus iPhone SE and iPad layouts for the 3D table, Snap and 2D-fallback specs), the synthetic fake camera, the offline check and the bundle-size budget |
 | `ios-simulator` | macos-15 | newest Xcode, tour web build, `cap sync`, `scripts/ios-sim-smoke.sh`; artifact **ios-simulator-screenshots** |
-| `webkit-e2e` | macos-15 | `playwright.webkit.config.ts`: the e2e suite in WebKit with the iPhone 15 profile (the live fake-camera spec is Chromium-only and skipped) |
+| `webkit-e2e` | macos-15 | `playwright.webkit.config.ts`: the e2e suite in WebKit with the iPhone 15 profile (tests tagged `@chromium-only`, the live fake-camera spec and the offline check, are skipped) |
 | `testflight` | macos-15 | after `web` and `ios-simulator`: archive + upload, only when the secrets below exist; otherwise a notice and a green, skipped job |
 
 The Xcode version is the newest one installed on the runner; pin one with the repository variable
