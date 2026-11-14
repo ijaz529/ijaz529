@@ -254,6 +254,24 @@ function centroid(poly: Vec2[]): Vec2 | null {
   return { x: x / poly.length, y: y / poly.length };
 }
 
+/**
+ * FR-119: the cue ball is (partly) in the photo but the strike point on its face is not, e.g. a draw
+ * stroke on a cue ball cut by the bottom edge. Says where it went and which way to aim the phone.
+ */
+function strikeOffPhoto(pose: CameraPose, p: Vec2): string {
+  const dx = p.x < 0 ? -p.x : Math.max(0, p.x - pose.width);
+  const dy = p.y < 0 ? -p.y : Math.max(0, p.y - pose.height);
+  const [where, fix] =
+    dy >= dx
+      ? p.y > pose.height
+        ? ['below', 'aim the phone a little lower']
+        : ['above', 'aim the phone a little higher']
+      : p.x < 0
+        ? ['left of', 'turn a little to the left']
+        : ['right of', 'turn a little to the right'];
+  return `The strike point is just ${where} the photo: ${fix} and retake. It is shown on the spin ball.`;
+}
+
 function polyInFrame(pose: CameraPose, poly: Vec2[]): boolean {
   return poly.length > 0 && poly.some((p) => inImage(pose, p));
 }
@@ -340,9 +358,11 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
     pocket: pocket.some((r) => r.some((p) => inImage(pose, p))),
   };
 
+  const face = inFrame.cue && cueCenter && cueRadiusPx > 0 ? strikeFace(cueCenter, cueRadiusPx, side, vert) : null;
   const messages: string[] = [];
   if (!inFrame.cue) messages.push('The cue ball is outside the photo. Step back a little so the cue ball is in the picture, then retake.');
   else if (strike && !strike.visible) messages.push('This photo is not from behind the cue ball. Crouch behind it, facing the shot, and retake. The strike point is shown on the spin ball.');
+  else if (face && !inImage(pose, face.dot)) messages.push(strikeOffPhoto(pose, face.dot));
   if (!inFrame.ghost && !inFrame.target) messages.push('The target ball is out of the photo. Turn toward the shot and retake.');
   else if (!inFrame.pocket) messages.push('The pocket is out of the photo. Follow the orange line off the edge.');
 
@@ -361,7 +381,7 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
     cueCenter: cueCenter ?? centroid(cueBall),
     cueRadiusPx,
     strike,
-    face: inFrame.cue && cueCenter && cueRadiusPx > 0 ? strikeFace(cueCenter, cueRadiusPx, side, vert) : null,
+    face,
     miscue,
     cross,
     cueAxis,

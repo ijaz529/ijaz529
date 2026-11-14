@@ -147,6 +147,58 @@ test.describe('3D practice table (feature 002 US1)', () => {
     await expect(page.getByTestId('shot-card')).toBeVisible();
   });
 
+  test('idle: no animation frames and no GL draws without interaction (FR-109, SC-101)', async ({ page }) => {
+    await planB1(page);
+    await expect(page.getByTestId('shot-card')).toContainText('recommended for position', { timeout: 20_000 });
+    await settled(page);
+    // Count from here on: requestAnimationFrame is looked up on window by every loop, and every 3D draw
+    // goes through the WebGL2 prototype.
+    await page.evaluate(() => {
+      const w = window as unknown as { __rafs: number; __draws: number };
+      w.__rafs = 0;
+      w.__draws = 0;
+      const raf = window.requestAnimationFrame.bind(window);
+      window.requestAnimationFrame = (cb) => raf((t) => (w.__rafs++, cb(t)));
+      const P = WebGL2RenderingContext.prototype as unknown as Record<string, (...a: unknown[]) => unknown>;
+      for (const k of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+        const o = P[k]!;
+        P[k] = function (this: unknown, ...a: unknown[]) {
+          w.__draws++;
+          return o.apply(this, a);
+        };
+      }
+    });
+    // A frame already scheduled before the counters were installed may still land: start counting after it.
+    await page.waitForTimeout(700);
+    await page.evaluate(() => {
+      const w = window as unknown as { __rafs: number; __draws: number };
+      w.__rafs = 0;
+      w.__draws = 0;
+    });
+    await page.waitForTimeout(1500);
+    expect(await page.evaluate(() => (window as unknown as { __rafs: number; __draws: number }).__rafs)).toBe(0);
+    expect(await page.evaluate(() => (window as unknown as { __rafs: number; __draws: number }).__draws)).toBe(0);
+  });
+
+  test('a GPU context lost for good falls back to the 2D table, keeping the layout and the plan (FR-110)', async ({ page }) => {
+    await planB1(page);
+    const before = await balls(page);
+    const lost = await page.evaluate(() => {
+      const gl = document.querySelector<HTMLCanvasElement>('#table3d')!.getContext('webgl2');
+      const ext = gl?.getExtension('WEBGL_lose_context');
+      ext?.loseContext();
+      return !!ext;
+    });
+    test.skip(!lost, 'WEBGL_lose_context unavailable');
+    // No webglcontextrestored follows: after 3 s the app switches to the 2D table and says so.
+    await expect(page.locator('body')).not.toHaveClass(/has-3d/, { timeout: 6_000 });
+    expect(await hook(page)).toBe(false);
+    await expect(page.locator('#toast')).toContainText('2D table');
+    await expect(page.locator('#table')).toBeVisible();
+    expect(await balls(page)).toEqual(before);
+    await expect(page.getByTestId('cut')).toHaveText('30.0°');
+  });
+
   test('drag a ball to move it', async ({ page }) => {
     const before = (await balls(page)).find((b) => b.id === 'b2')!;
     const p = await screenOf(page, { ball: 'b2' });

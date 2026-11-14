@@ -171,6 +171,24 @@ describe('player guide geometry on the fixture pose', () => {
     expect(g.messages.join(' ')).toMatch(/cue ball is outside the photo/);
   });
 
+  it('says so when the strike point falls off the photo while the cue ball is cut by the edge (FR-119)', () => {
+    // snap-player-cut.png: the cue-ball centre sits on the bottom edge, so a low (draw) strike point is
+    // below the photo. The guide must say where it went and how to fix it, not just clip the dot.
+    const cut = fx.photos.playerCut!;
+    const p = plan(0, -0.5);
+    const g = buildPlayerGuide({ pose: cut.pose, table, plan: p, cue: cue.pos, target: target.pos, stroke: p.stroke });
+    expect(g.inFrame.cue).toBe(true);
+    expect(g.face).not.toBeNull();
+    expect(g.face!.dot.y).toBeGreaterThan(cut.pose.height);
+    expect(g.messages.join(' ')).toMatch(/strike point is just below the photo/);
+    expect(g.messages.join(' ')).toMatch(/spin ball/);
+    // A high (follow) strike point on the same photo is on the picture: no such message.
+    const q = plan(0, 0.3);
+    const h = buildPlayerGuide({ pose: cut.pose, table, plan: q, cue: cue.pos, target: target.pos, stroke: q.stroke });
+    expect(h.face!.dot.y).toBeLessThan(cut.pose.height);
+    expect(h.messages.join(' ')).not.toMatch(/strike point/);
+  });
+
   it('clips lines at the camera instead of mirroring what is behind it', () => {
     const C = cameraCenter(pose);
     // A line on the cloth from far in front of the camera to well behind it.

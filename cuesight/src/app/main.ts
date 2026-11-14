@@ -138,9 +138,11 @@ const canvas3d = $<HTMLCanvasElement>('#table3d');
 const force2d = params.get('renderer') === '2d';
 let cameraPreset: CameraPreset | 'custom' = 'overview';
 let view3d: Table3D | null = null;
+/** The GPU context was lost for good (or could not be rebuilt): 2D for the rest of the session (FR-110). */
+let failed3d = false;
 /** Creates or drops the 3D table to match the URL flag and the "3D table" setting. */
 function sync3D(): void {
-  const want = !force2d && S.settings.table3d;
+  const want = !force2d && !failed3d && S.settings.table3d;
   if (want && !view3d) {
     view3d = createTable3D(
       canvas3d,
@@ -171,6 +173,30 @@ function sync3D(): void {
   document.body.classList.toggle('has-3d', !!view3d);
   view3d?.resize();
 }
+// FR-110 / contracts/render3d-api.md § Context loss: a GPU context that is lost for good (no
+// `webglcontextrestored` within 3 s), or that the renderer could not rebuild, falls back to the 2D table.
+// The layout, selection and plan live in the app state, so nothing is lost.
+let lostTimer = 0;
+function fail3D(): void {
+  window.clearTimeout(lostTimer);
+  if (failed3d || !view3d) return;
+  failed3d = true;
+  sync3D();
+  queueInsets();
+  store.update(() => {});
+  toast('The 3D table stopped working on this device — showing the 2D table.', 4000);
+}
+canvas3d.addEventListener('webglcontextlost', () => {
+  window.clearTimeout(lostTimer);
+  if (view3d) lostTimer = window.setTimeout(fail3D, 3000);
+});
+canvas3d.addEventListener('webglcontextrestored', () => {
+  window.clearTimeout(lostTimer);
+  // The renderer rebuilds its GPU resources in its own listener; check the outcome after it ran.
+  window.setTimeout(() => {
+    if (view3d?.isFailed?.()) fail3D();
+  }, 0);
+});
 let told2d = false;
 let last3D: unknown[] = [];
 
@@ -770,6 +796,7 @@ function setMode(mode: Mode, initial = false): void {
   document.body.dataset.mode = mode;
   if (mode === 'camera') void enterCamera();
   else leaveCamera();
+  startOverlayLoop();
   const u = new URL(location.href);
   u.searchParams.set('mode', mode);
   history.replaceState(null, '', u);
@@ -1236,12 +1263,19 @@ window.addEventListener('resize', () => {
   store.update(() => {});
 });
 
-// Live redraw of the overlay while the camera runs (video moves even if state doesn't).
+// Live redraw of the overlay while the camera runs (video moves even if state doesn't). The loop only
+// runs in Live: Practice and Snap stay idle between changes (FR-109, SC-101: no frames without interaction).
+let overlayRaf = 0;
 function overlayLoop(): void {
-  if (S.mode === 'camera') overlay.draw(overlayData(), frameMapping());
-  requestAnimationFrame(overlayLoop);
+  overlayRaf = 0;
+  if (S.mode !== 'camera') return;
+  overlay.draw(overlayData(), frameMapping());
+  overlayRaf = requestAnimationFrame(overlayLoop);
 }
-requestAnimationFrame(overlayLoop);
+function startOverlayLoop(): void {
+  if (!overlayRaf && S.mode === 'camera') overlayRaf = requestAnimationFrame(overlayLoop);
+}
+startOverlayLoop();
 
 // Test/debug hook (no data leaves the page).
 declare global {

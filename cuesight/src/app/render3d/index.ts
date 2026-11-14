@@ -98,6 +98,11 @@ export interface Table3D {
   setInsets?(insets: { top?: number; right?: number; bottom?: number; left?: number }): void;
   /** Optional extension: true while a camera transition is running (for tests). */
   isAnimating?(): boolean;
+  /**
+   * Optional extension (contracts/render3d-api.md § Proposed extensions): true once a lost GPU context
+   * could not be rebuilt on `webglcontextrestored`; the view then draws nothing and the app falls back to 2D.
+   */
+  isFailed?(): boolean;
 }
 
 export interface Table3DOptions {
@@ -173,6 +178,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   let dirty = true;
   let raf = 0;
   let lost = false;
+  let failed = false;
   let destroyed = false;
   let drag: DragState | null = null;
   let play: PlaybackState | null = null;
@@ -905,6 +911,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
         uploadRibbons(true);
       }
     } catch (err) {
+      failed = true;
       console.warn('CueSight 3D: context restore failed', err);
     }
     markDirty();
@@ -970,6 +977,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       markDirty();
     },
     isAnimating: () => anim !== null && now() - anim.t0 < anim.dur,
+    isFailed: () => failed,
   };
   return api;
 }
