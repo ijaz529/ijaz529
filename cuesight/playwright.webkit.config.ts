@@ -11,6 +11,9 @@
  */
 import { defineConfig, devices } from '@playwright/test';
 
+/** Preview-server port. Override with E2E_PORT to run two suites at once (e.g. parallel worktrees). */
+const PORT = Number(process.env.E2E_PORT) || 4173;
+
 export default defineConfig({
   testDir: 'tests/e2e',
   timeout: 90_000,
@@ -24,13 +27,13 @@ export default defineConfig({
     : [['list']],
   outputDir: 'test-results/webkit',
   use: {
-    baseURL: 'http://localhost:4173',
+    baseURL: `http://localhost:${PORT}`,
     trace: process.env.CI ? 'retain-on-failure' : 'off',
     screenshot: 'only-on-failure',
   },
   webServer: {
-    command: 'npx vite preview --port 4173 --strictPort',
-    url: 'http://localhost:4173',
+    command: `npx vite preview --port ${PORT} --strictPort`,
+    url: `http://localhost:${PORT}`,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
   },

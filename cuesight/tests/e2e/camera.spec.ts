@@ -38,7 +38,7 @@ test.describe('camera denied', () => {
         value: { getUserMedia: () => Promise.reject(Object.assign(new Error('denied'), { name: 'NotAllowedError' })) },
       });
     });
-    await page.goto('http://localhost:4173/?mode=camera');
+    await page.goto('/?mode=camera');
     await expect(page.locator('#camera-msg')).toContainText('never uploaded');
     await page.getByRole('button', { name: 'Use practice table' }).click();
     await expect(page.locator('body')).toHaveAttribute('data-mode', 'practice');

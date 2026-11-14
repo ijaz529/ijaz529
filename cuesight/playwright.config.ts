@@ -1,4 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
+
+/** Preview-server port. Override with E2E_PORT to run two suites at once (e.g. parallel worktrees). */
+const PORT = Number(process.env.E2E_PORT) || 4173;
 import { fileURLToPath } from 'node:url';
 
 const fakeVideo = fileURLToPath(new URL('./tests/fixtures/table.y4m', import.meta.url));
@@ -12,12 +15,12 @@ export default defineConfig({
   fullyParallel: false,
   reporter: [['list']],
   use: {
-    baseURL: 'http://localhost:4173',
+    baseURL: `http://localhost:${PORT}`,
     trace: 'off',
   },
   webServer: {
-    command: 'npx vite preview --port 4173 --strictPort',
-    url: 'http://localhost:4173',
+    command: `npx vite preview --port ${PORT} --strictPort`,
+    url: `http://localhost:${PORT}`,
     reuseExistingServer: true,
     timeout: 60_000,
   },
