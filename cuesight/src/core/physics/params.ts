@@ -32,7 +32,11 @@ export const DEFAULT_PHYSICS: PhysicsParams = {
   squirtMassRatio: 23,
   dt: 0.001,
   maxTime: 12,
-  /** Minimum OB speed at the mouth to count as "makes it" with some pace. */
+  /**
+   * ASSUMPTION: object-ball speed at the mouth line regarded as "makes it with pace" (≈0.46 m of
+   * extra roll at μr 0.01). A coaching margin (minimum power / "too soft"), not a physical minimum:
+   * the planner's hard test is whether the simulated ball crosses the capture line (simulate.ts).
+   */
   pocketArrivalSpeed: 0.3,
 };
 
