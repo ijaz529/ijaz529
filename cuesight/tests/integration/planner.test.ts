@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { rollingDeflection } from '../../src/core/physics/analytic';
 import { DEFAULT_PHYSICS } from '../../src/core/physics/params';
+import { simulate } from '../../src/core/physics/simulate';
+import { strikeBall } from '../../src/core/physics/strike';
 import { planShot, stunVert } from '../../src/core/shot/planner';
 import { pocketWindow } from '../../src/core/shot/pocket-window';
 import { powerToSpeed } from '../../src/core/shot/power';
 import { makeTable, pocketById } from '../../src/core/table';
 import type { ShotPlan, Trajectory } from '../../src/core/types';
-import { add, angleBetween, angleOf, deg, fromAngle, norm, rad, scale, sub, v2, type Vec2 } from '../../src/core/vec';
+import { add, angleBetween, angleOf, deg, fromAngle, norm, rad, rotate, scale, sub, v2, type Vec2 } from '../../src/core/vec';
 import { layout } from '../helpers/layout';
 
 const P = DEFAULT_PHYSICS;
@@ -136,10 +138,95 @@ describe('planShot', () => {
     const cue = v2(-1.1, -0.3);
     const plan = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: 1, side: 0, vert: 0 } }, P);
     expect(plan.minPower).toBeGreaterThan(1);
+    expect(plan.obPocketed).toBe(false);
     expect(has(plan, 'too-soft')).toBe(true);
-    const ok = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: Math.ceil(plan.minPower) + 1, side: 0, vert: 0 } }, P);
+    // Updated to the split messages: power 1 does not get the cue ball there or the object ball in.
+    expect(plan.warnings.find((w) => w.code === 'too-soft')!.message).toMatch(/won't reach the object ball|stops short/);
+    // minPowerSafe is the old "arrives with pace" minimum (≥ the bare minimum); above it nothing warns.
+    expect(plan.minPowerSafe!).toBeGreaterThanOrEqual(plan.minPower);
+    const ok = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: Math.ceil(plan.minPowerSafe!) + 1, side: 0, vert: 0 } }, P);
     expect(has(ok, 'too-soft')).toBe(false);
     expect(ok.obPocketed).toBe(true);
+  });
+
+  it("never says 'stops short' for a stroke the simulation pots (50 seeded layouts near the minimum)", () => {
+    let seed = 12345;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const hx = T.length / 2 - R;
+    const hy = T.width / 2 - R;
+    let n = 0;
+    const potted = { below: 0, safe: 0 };
+    const short = { below: 0, safe: 0 };
+    for (let tries = 0; n < 50 && tries < 4000; tries++) {
+      const ob = v2((rnd() * 2 - 1) * hx * 0.9, (rnd() * 2 - 1) * hy * 0.9);
+      const cue = v2((rnd() * 2 - 1) * hx * 0.9, (rnd() * 2 - 1) * hy * 0.9);
+      if (Math.hypot(ob.x - cue.x, ob.y - cue.y) < 4 * R) continue;
+      const lay = layout({ cue, ob });
+      const probe = planShot(lay, { targetId: 'ob' }, P, { record: false });
+      if (!probe.makeable || probe.minPowerSafe! > 10 || probe.minPower - 0.2 < 1) continue;
+      n++;
+      // Just below the bare minimum, and just below the "with pace" minimum (the old planner's
+      // minimum, where it said "stops short" for balls that drop).
+      const powers = { below: probe.minPower - 0.2, safe: probe.minPowerSafe! - 0.2 };
+      for (const k of ['below', 'safe'] as const) {
+        const plan = planShot(lay, { targetId: 'ob', pocketId: probe.pocketId, stroke: { power: powers[k], side: 0, vert: 0 } }, P, { record: false });
+        const saysShort = plan.warnings.some((w) => /stops short/.test(w.message));
+        if (plan.obPocketed) potted[k]++;
+        if (saysShort) short[k]++;
+        // Never contradicts the simulation: "stops short" only when the ball stayed on the table.
+        if (saysShort) expect(plan.objectPath.pocket, `${k} ${JSON.stringify({ cue, ob })}`).toBeNull();
+        expect(plan.obPocketed && saysShort, `${k} ${JSON.stringify({ cue, ob })}`).toBe(false);
+      }
+    }
+    expect(n).toBe(50);
+    console.log(`of 50: potted at minPower − 0.2 ${potted.below}, at minPowerSafe − 0.2 ${potted.safe}; "stops short" ${short.below} / ${short.safe}`);
+    // Not vacuous: balls do drop below the old minimum, and below the bare minimum they stop short.
+    expect(potted.safe).toBeGreaterThan(25);
+    expect(short.below).toBeGreaterThan(25);
+  });
+
+  it('a hanger at power 1.5 is potted and never called "stops short"', () => {
+    const pk = pocketById(T, 'TR');
+    const { lay } = cutLayout(add(pk.mouthCenter, scale(pk.inward, 0.08)), 'TR', 40, 0.25);
+    const plan = planShot(lay, { targetId: 'ob', pocketId: 'TR', stroke: { power: 1.5, side: 0, vert: 0 } }, P);
+    expect(plan.obPocketed).toBe(true);
+    expect(plan.warnings.some((w) => /stops short/.test(w.message))).toBe(false);
+    expect(plan.minPower).toBeLessThanOrEqual(1.5);
+  });
+
+  it("says the cue ball won't reach when it stops before the object ball", () => {
+    const pk = pocketById(T, 'TR');
+    const ob = add(pk.mouthCenter, scale(pk.inward, 0.3));
+    const cue = add(ob, scale(pk.inward, 1.35));
+    const plan = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: 1, side: 0, vert: 0 } }, P);
+    expect(plan.obPocketed).toBe(false);
+    const w = plan.warnings.find((x) => x.code === 'too-soft');
+    expect(w?.message).toMatch(/cue ball won't reach the object ball/);
+    expect(w?.message).not.toMatch(/stops short/);
+  });
+
+  it('a blocked shot names the best other pocket in the warning and the tip (blocked-shot-no-alternative)', () => {
+    const ob = v2(0.6, 0.25);
+    const cue = v2(-0.3, 0);
+    const w = pocketWindow(ob, pocketById(T, 'TR'), R);
+    const blk = v2((ob.x + w.mouthHit.x) / 2, (ob.y + w.mouthHit.y) / 2);
+    const plan = planShot(layout({ cue, ob, blk }), { targetId: 'ob', pocketId: 'TR' }, P);
+    expect(plan.makeable).toBe(false);
+    expect(plan.alternatives[0]?.pocketId).toBe('BR');
+    const blocked = plan.warnings.find((x) => x.code === 'blocked-object')!;
+    expect(blocked.message).toMatch(/Try the bottom-right corner/);
+    expect(plan.tip).toMatch(/bottom-right corner/);
+  });
+
+  it('a fully boxed ball says no other pocket is clear', () => {
+    const ob = v2(-0.4, 0.3);
+    const g = 2 * R + 0.001;
+    const lay = layout({ cue: v2(0.5, -0.2), ob, w1: v2(ob.x + g, ob.y), w2: v2(ob.x - g, ob.y), w3: v2(ob.x, ob.y + g), w4: v2(ob.x, ob.y - g) });
+    const plan = planShot(lay, { targetId: 'ob' }, P);
+    expect(plan.makeable).toBe(false);
+    expect(plan.alternatives).toHaveLength(0);
+    expect(plan.warnings.some((x) => /No other pocket is clear for this ball/.test(x.message))).toBe(true);
+    expect(plan.tip).toMatch(/No other pocket is clear/);
   });
 
   it('side spin reports squirt and compensates aim', () => {
@@ -148,23 +235,32 @@ describe('planShot', () => {
     expect(plan.squirtDeg).toBeGreaterThan(0.5);
     expect(plan.squirtDeg).toBeLessThan(3);
     expect(plan.obPocketed).toBe(true);
+    // The drawn line (cue → ghost) is the cue ball's path: aimDir and the first simulated leg.
+    const cue = lay.balls.find((b) => b.id === 'cue')!.pos;
+    const toGhost = norm(sub(plan.ghost, cue));
+    expect(Math.abs(deg(angleBetween(toGhost, plan.aimDir)))).toBeLessThan(1e-6);
+    const leg = norm(sub(plan.cuePath.points[1]!, plan.cuePath.points[0]!));
+    expect(Math.abs(deg(angleBetween(toGhost, leg)))).toBeLessThan(0.05);
   });
 
-  it('stays fast with a full snooker layout (22 balls)', () => {
-    const balls: Record<string, Vec2> = { cue: v2(-1.2, 0.1), t: v2(0.5, 0.2) };
-    let k = 0;
-    for (let row = 0; row < 5; row++) for (let c = 0; c <= row; c++) balls[`r${k++}`] = v2(1.0 + row * 0.046, (c - row / 2) * 0.054);
-    for (let i = 0; i < 5; i++) balls[`c${i}`] = v2(-0.9 + i * 0.3, -0.6 + 0.1 * i);
-    const lay = layout(balls, 'snooker12');
-    planShot(lay, { targetId: 't' }, P); // warm-up (JIT)
-    const runs: number[] = [];
-    for (let i = 0; i < 5; i++) {
-      const t0 = performance.now();
-      planShot(lay, { targetId: 't' }, P);
-      runs.push(performance.now() - t0);
+  it('aiming the cue along the drawn line with side spin misses: the squirt correction is not in the line', () => {
+    for (const side of [0.3, -0.3]) {
+      const { lay } = cutLayout(v2(0.4, 0.15), 'TR', -25, 1.2); // −25°: the cue ball stays on the table at 1.2 m
+      const stroke = { power: 4, side, vert: 0 };
+      const plan = planShot(lay, { targetId: 'ob', pocketId: 'TR', stroke }, P);
+      expect(plan.obPocketed).toBe(true);
+      // A cue aimed along the line shown sends the ball squirt° off it, away from the english side.
+      const dir = rotate(plan.aimDir, Math.sign(side) * rad(Math.abs(plan.squirtDeg)));
+      const st = strikeBall(dir, powerToSpeed(stroke.power), side, 0, R, P.squirtMassRatio);
+      const sim = simulate(
+        T,
+        lay.balls.map((b) => (b.kind === 'cue' ? { id: b.id, pos: b.pos, vel: st.vel, omega: st.omega } : { id: b.id, pos: b.pos })),
+        P,
+        { record: false },
+      );
+      expect(sim.final['ob']!.pocket).not.toBe('TR');
     }
-    runs.sort((a, b) => a - b);
-    console.log(`planShot (22 balls) median ${runs[2]!.toFixed(1)} ms`);
-    expect(runs[2]!).toBeLessThan(250); // budget 50 ms on device; generous CI guard
   });
+
+  // The 22-ball planShot timing guard lives in perf.test.ts (median of 5 < 100 ms).
 });

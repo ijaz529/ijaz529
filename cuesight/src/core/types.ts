@@ -133,7 +133,9 @@ export type WarningCode =
   | 'ob-missed'
   | 'thin-cut'
   | 'frozen'
-  | 'miscue-risk';
+  | 'miscue-risk'
+  /** The simulated ball misses because no aim with the ghost clear of the rail cancels the throw. */
+  | 'throw-uncompensable';
 
 export interface Warning {
   code: WarningCode;
@@ -149,7 +151,14 @@ export interface ShotPlan {
   makeable: boolean;
   ghost: Vec2;
   ghostUncorrected: Vec2;
+  /** Unit direction the cue ball travels (cue ball → ghost ball): the line the app draws. */
   aimDir: Vec2;
+  /**
+   * Unit direction of the cue stick: aimDir rotated by the squirt correction (clockwise for right
+   * english), so the ball squirts onto aimDir. Equal to aimDir without side spin. Optional for
+   * older producers; consumers fall back to aimDir.
+   */
+  cueAimDir?: Vec2;
   contactPoint: Vec2;
   obDir: Vec2;
   cutAngleDeg: number;
@@ -159,10 +168,28 @@ export interface ShotPlan {
   fractionLabel: string;
   throwDeg: number;
   throwShiftMm: number;
+  /**
+   * Which way the throw correction moved the ghost from ghostUncorrected: 'thinner' (usual
+   * cut-induced throw), 'thicker' (outside english throws the ball thin), or 'left'/'right' of the
+   * cue-ball line for a near-straight shot. Absent when there is no shift.
+   */
+  throwShiftDir?: 'thinner' | 'thicker' | 'left' | 'right';
   squirtDeg: number;
   stroke: Stroke;
   strokeSource: 'player' | 'recommended' | 'default';
+  /**
+   * Lowest power (analytic chain) at which the cue ball reaches the object ball and the object ball
+   * just crosses the pocket's capture line (> 10: not even at full power). Below it the ball stops
+   * short. It is optimistic: the chain ignores the backspin a rolling cue ball gives the object
+   * ball, and the simulation needs ≈6 % more cue-ball speed (median of 50 random pool9 layouts,
+   * up to 12 %). Advice uses minPowerSafe.
+   */
   minPower: number;
+  /**
+   * Lowest power at which the object ball reaches the mouth with some pace (≥ pocketArrivalSpeed):
+   * the figure "too soft" advice quotes. Always set by planShot.
+   */
+  minPowerSafe?: number;
   cuePath: Trajectory;
   objectPath: Trajectory;
   otherPaths: Trajectory[];
@@ -191,9 +218,21 @@ export interface ShotSuggestion {
 
 export interface Recommendation {
   stroke: Stroke;
+  /** Robust score (worst of nominal and ±6/±12 % speed); −Infinity only when no stroke pots the ball. */
   score: number;
   reachable: boolean;
   restError?: number;
   rest?: Vec2 | null;
+  /** planShot simulations run (deterministic for a given layout, request and budget). */
   evaluated: number;
+  /**
+   * True when no stroke was verified against ±6/±12 % speed errors (every candidate checked scratched
+   * or missed at some speed, or the evaluation budget ran out first): treat the stroke as possibly
+   * speed-sensitive and say so.
+   */
+  fragile?: boolean;
+  /** Next-shot quality (0..1) of the chosen stroke on the post-shot table (default objective only). */
+  nextQuality?: number;
+  /** The optional wall-clock safety cap (RecommendOptions.timeCapMs) cut the search short. */
+  timedOut?: boolean;
 }

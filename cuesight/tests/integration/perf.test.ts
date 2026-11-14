@@ -1,10 +1,12 @@
 /**
  * Performance guards (Constitution IV). Device budgets: plan < 50 ms, vision ≥ 10 Hz (< 100 ms),
- * position search < 1.5 s. CI guards are looser to absorb shared-runner noise; actual numbers are
- * printed for the record.
+ * position search < 1.5 s. CI guards are looser to absorb shared-runner noise (about ×2); actual
+ * numbers are printed for the record. recommendStroke is budgeted by evaluation count, not by the
+ * clock, so the time it takes here is what the default budget really costs.
  */
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PHYSICS } from '../../src/core/physics/params';
+import { planShot } from '../../src/core/shot/planner';
 import { recommendStroke } from '../../src/core/shot/position';
 import { suggestShots } from '../../src/core/shot/suggest';
 import { v2, type Vec2 } from '../../src/core/vec';
@@ -32,6 +34,24 @@ describe('performance budgets', () => {
     console.log(`recommendStroke median ${median(t).toFixed(0)} ms over ${evaluated} simulated strokes`);
     expect(evaluated).toBeGreaterThan(50);
     expect(median(t)).toBeLessThan(1500);
+  });
+
+  it('planShot on a full 22-ball snooker layout: median of 5 below 100 ms', () => {
+    const sb: Record<string, Vec2> = { cue: v2(-1.2, 0.1), t: v2(0.5, 0.2) };
+    let k = 0;
+    for (let row = 0; row < 5; row++) for (let c = 0; c <= row; c++) sb[`r${k++}`] = v2(1.0 + row * 0.046, (c - row / 2) * 0.054);
+    for (let i = 0; i < 5; i++) sb[`c${i}`] = v2(-0.9 + i * 0.3, -0.6 + 0.1 * i);
+    const snooker = layout(sb, 'snooker12');
+    expect(snooker.balls).toHaveLength(22);
+    planShot(snooker, { targetId: 't' }, DEFAULT_PHYSICS); // warm-up (JIT)
+    const runs: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      planShot(snooker, { targetId: 't' }, DEFAULT_PHYSICS);
+      runs.push(performance.now() - t0);
+    }
+    console.log(`planShot (22 balls) median ${median(runs).toFixed(1)} ms`);
+    expect(median(runs)).toBeLessThan(100); // device budget 50 ms; CI factor 2
   });
 
   it('suggestions on a 9-ball layout within 2 s', () => {
