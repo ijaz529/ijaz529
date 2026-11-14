@@ -121,6 +121,28 @@ describe('table filling the frame (pocket cut-outs wider than a fixed refine ban
   });
 });
 
+describe('a table cut off by the frame border: null or exact, never a wrong outline', () => {
+  // Near-rail side views with one near corner just off-screen. A side running into the border is
+  // supported by two separate clusters (its real edge and stray points near the border); a line
+  // through both used to give a confident outline 2-3.4 % of the diagonal off.
+  const cams: [string, SynthCamera][] = [
+    ['(0.677, −1.910, 1.442) fov63.9', { pos: { x: 0.6768802, y: -1.9104572, z: 1.4420085 }, target: { x: 0.0023461, y: -0.2050598, z: 0 }, fovDeg: 63.948667 }],
+    ['(0.527, −1.706, 1.594) fov65.5', { pos: { x: 0.5266352, y: -1.7057492, z: 1.594243 }, target: { x: -0.0144974, y: -0.162916, z: 0 }, fovDeg: 65.4704 }],
+    ['(−0.409, −1.669, 1.887) fov64.0', { pos: { x: -0.4090023, y: -1.6685463, z: 1.8874973 }, target: { x: 0.1123408, y: -0.1221668, z: 0 }, fovDeg: 64.025444 }],
+  ];
+  it.each(cams)('side view from %s: detectTable is null or every corner is within 1.5 %% of the diagonal', (name, cam) => {
+    const truth = cornersOf(cam, 640, 480);
+    expect(truth.some((p) => p.x < 0 || p.y < 0 || p.x > 640 || p.y > 480), `${name}: a corner is off-screen`).toBe(true);
+    const det = detectTable(renderOf(cam, 640, 480));
+    const diag = Math.hypot(640, 480);
+    if (det) {
+      const errs = cornerErrors(truth, det.corners);
+      console.log(`truncated ${name}: corner errors ${errs.map((e) => ((100 * e) / diag).toFixed(2)).join(', ')} % of diag, quality ${det.quality.toFixed(3)}`);
+      for (const e of errs) expect(e / diag).toBeLessThan(0.015);
+    } else console.log(`truncated ${name}: null`);
+  });
+});
+
 describe('grey (low-saturation) cloth', () => {
   it.each(GREYS)('cloth rgb(%i, %i, %i): automatic detection finds the corners within 1.5%% of the diagonal', (r, g, b) => {
     for (const pose of ['corner', 'side'] as const) {
@@ -132,6 +154,45 @@ describe('grey (low-saturation) cloth', () => {
       const errs = cornerErrors(trueCorners(pose), det!.corners);
       console.log(`grey ${r},${g},${b} ${pose}: corner errors px ${errs.map((e) => e.toFixed(1)).join(', ')} (quality ${det!.quality.toFixed(2)})`);
       for (const e of errs) expect(e / diag).toBeLessThan(0.015);
+    }
+  });
+
+  // A pure grey (S < 0.08) on the default grey floor: the neutral model also matches the floor (a
+  // larger component outside the rails); the table is the component the camera is aimed at.
+  it.each([
+    [120, 120, 120],
+    [110, 112, 116],
+    [150, 150, 150],
+  ] as RGB[])('pure grey cloth rgb(%i, %i, %i) on a grey floor, side, corner and overhead views: corners within 1.5 %% of the diagonal', (r, g, b) => {
+    for (const pose of ['side', 'corner', 'overhead'] as const) {
+      const frame = renderSyntheticTable({ ...scene(pose, { cloth: [r, g, b] }), ss: 1 });
+      const det = detectTable(frame);
+      expect(det, pose).not.toBeNull();
+      const diag = Math.hypot(frame.width, frame.height);
+      const errs = cornerErrors(trueCorners(pose), det!.corners);
+      console.log(`pure grey ${r},${g},${b} ${pose}: corner errors px ${errs.map((e) => e.toFixed(1)).join(', ')} (quality ${det!.quality.toFixed(2)})`);
+      for (const e of errs) expect(e / diag).toBeLessThan(0.015);
+      expect(det!.quality).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  // End and corner views put the wooden rails and floor in the central window (≈ 30 % saturated):
+  // the chromatic vote goes to the floor, and the grey cloth must still be found.
+  it.each([
+    [110, 116, 124],
+    [80, 86, 92],
+    [120, 120, 120],
+  ] as RGB[])('cloth rgb(%i, %i, %i) on a wooden floor, end and corner views: found as neutral cloth, corners within 1.5 %% of the diagonal', (r, g, b) => {
+    for (const pose of ['end', 'corner'] as const) {
+      const frame = renderSyntheticTable({ ...scene(pose, { cloth: [r, g, b] }), floor: [150, 95, 45], ss: 1 });
+      const det = detectTable(frame);
+      expect(det, pose).not.toBeNull();
+      expect(det!.cloth.kind).toBe('neutral');
+      const diag = Math.hypot(frame.width, frame.height);
+      const errs = cornerErrors(trueCorners(pose), det!.corners);
+      console.log(`grey ${r},${g},${b} on wood ${pose}: corner errors px ${errs.map((e) => e.toFixed(1)).join(', ')} (quality ${det!.quality.toFixed(2)})`);
+      for (const e of errs) expect(e / diag).toBeLessThan(0.015);
+      expect(det!.quality).toBeGreaterThanOrEqual(0.9);
     }
   });
 });

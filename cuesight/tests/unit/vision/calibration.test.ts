@@ -80,6 +80,32 @@ describe('long/short rail assignment under corner noise', () => {
     expect(swaps).toBe(0);
   });
 
+  // Far, low end views: the image side lengths are a poor guide (in the first, the end rails even look
+  // longer than the long rails), so the focal-constraint scoring must decide the assignment.
+  const farEnds: [string, SynthCamera, number, number][] = [
+    // [name, camera, σ px, trials]
+    ['far end view (−3.2, 0.02, 1.2) fov45, σ = 0.7 px', { pos: { x: -3.2, y: 0.02, z: 1.2 }, target: { x: 0.4, y: 0, z: 0 }, fovDeg: 45 }, 0.7, 200],
+    // Here the wrong assignment's equal-norm constraint has no solution under noise: the infeasibility
+    // penalty is what rejects it (without it, 13 of 500 trials swap).
+    ['far end view (−4.08, −0.3, 1.27) fov62.8, σ = 2 px', { pos: { x: -4.08, y: -0.3, z: 1.27 }, target: { x: -0.19, y: -0.13, z: 0 }, fovDeg: 62.8 }, 2, 500],
+  ];
+  it.each(farEnds)('%s: no trial swaps the rails', (_name, cam, s, trials) => {
+    const exact = corners(cam);
+    expect(exact.every((p) => p.x > 0 && p.y > 0 && p.x < W && p.y < H)).toBe(true);
+    const d = (a: Vec2, b: Vec2) => Math.hypot(a.x - b.x, a.y - b.y);
+    // True long rails (0-1, 2-3) look shorter than the end rails.
+    if (cam.fovDeg === 45) expect((d(exact[0]!, exact[1]!) + d(exact[2]!, exact[3]!)) / (d(exact[1]!, exact[2]!) + d(exact[3]!, exact[0]!))).toBeLessThan(0.8);
+    const r = rng(2024);
+    let swaps = 0;
+    for (let trial = 0; trial < trials; trial++) {
+      const noisy = exact.map((p) => ({ x: p.x + gauss(r) * s, y: p.y + gauss(r) * s }));
+      const cal = calibrationFromCorners(noisy, table, W, H, { fovDeg: 65 });
+      expect(cal).not.toBeNull();
+      if (swapped(cal!, cam)) swaps++;
+    }
+    expect(swaps).toBe(0);
+  });
+
   it('the corners that used to swap the rails (≤ 1.73 px from the truth) choose the correct assignment', () => {
     const noisy = [
       { x: 495.9, y: 429.6 },
@@ -187,6 +213,29 @@ describe('quad validation (bad taps)', () => {
       expect(cal!.camera.z).toBeGreaterThan(1);
     });
   }
+});
+
+describe('honest focal source', () => {
+  it('a straight overhead view under σ = 0.5 px noise never reports a focal more than 15 % off as estimated', () => {
+    // Both table axes are nearly parallel to the image: the focal is not observable, and a barely
+    // tilted axis must not be taken as a constraint (Snap hands an 'estimated' focal to player-view).
+    const cam: SynthCamera = { pos: { x: 0, y: -0.15, z: 2.7 }, target: { x: 0, y: 0, z: 0 }, fovDeg: 64 };
+    const exact = corners(cam);
+    const trueF = cameraModel(cam, W, H).f;
+    const r = rng(55);
+    let bad = 0;
+    for (let trial = 0; trial < 300; trial++) {
+      const cal = calibrationFromCorners(
+        exact.map((p) => ({ x: p.x + gauss(r) * 0.5, y: p.y + gauss(r) * 0.5 })),
+        table,
+        W,
+        H,
+        { fovDeg: 65 },
+      )!;
+      if (cal.focalSource === 'estimated' && Math.abs(cal.focal / trueF - 1) > 0.15) bad++;
+    }
+    expect(bad).toBe(0);
+  });
 });
 
 describe('field of view from settings', () => {
