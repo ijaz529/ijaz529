@@ -22,6 +22,7 @@ import { createTable3D, type CameraPreset, type FrameInfo, type Pick3D, type Sce
 import { landscapeFrame } from './render3d/camera';
 import { createSnapController } from './snap/controller';
 import { initialSnap, snapReducer, type SnapEvent } from './snap/session';
+import { registerServiceWorker } from './sw-update';
 import { buildSettings, buildStrokeControls, buildToolbar, renderSuggestions } from './ui/controls';
 import { hydrateIcons } from './ui/icons';
 import { mountOnboarding } from './ui/onboarding';
@@ -1338,9 +1339,10 @@ window.__cuesight = hook;
 export type CueSightHook = typeof hook;
 
 // PWA: offline support in production web builds only (not inside the iOS app, not from file: etc.).
+// A new deploy is offered with "Reload" (src/app/sw-update.ts), never forced on the open page.
 const nativeShell = isNativeShell();
 if (import.meta.env.PROD && 'serviceWorker' in navigator && !nativeShell && (location.protocol === 'https:' || location.protocol === 'http:')) {
-  window.addEventListener('load', () => void navigator.serviceWorker.register('./sw.js').catch(() => undefined));
+  window.addEventListener('load', () => registerServiceWorker(navigator.serviceWorker, $<HTMLElement>('#stage')));
 }
 
 sync3D();

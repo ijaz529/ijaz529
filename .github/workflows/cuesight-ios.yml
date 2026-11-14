@@ -1,5 +1,8 @@
 # CueSight: web checks, iOS Simulator smoke test with screenshots, WebKit iPhone e2e, and TestFlight upload.
 # The app lives in cuesight/; see cuesight/docs/ios.md for local builds and the one-time TestFlight setup.
+#
+# Runs on pushes to main and claude/**, on pull requests into main, and by hand. TestFlight uploads happen only
+# for pushes to main and for manual runs with "upload" ticked, and only after every check job has passed.
 name: CueSight iOS
 
 on:
@@ -8,16 +11,24 @@ on:
     paths:
       - 'cuesight/**'
       - '.github/workflows/cuesight-ios.yml'
+  pull_request:
+    branches: ['main']
+    paths:
+      - 'cuesight/**'
+      - '.github/workflows/cuesight-ios.yml'
   workflow_dispatch:
     inputs:
       upload:
         description: 'Upload the build to TestFlight (needs the App Store Connect secrets)'
         type: boolean
-        default: true
+        default: false
 
+# One run at a time per pull request (or per branch / tag for pushes and manual runs); a newer run cancels the one
+# it supersedes. Runs that may upload (a push to main, a manual run with "upload") are never cancelled: they have
+# their own group, so a check-only run cannot cancel them either, and a newer one waits instead.
 concurrency:
-  group: cuesight-ios-${{ github.ref }}
-  cancel-in-progress: true
+  group: cuesight-ios-${{ github.event.pull_request.number || github.ref }}${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.upload)) && '-upload' || '' }}
+  cancel-in-progress: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.upload)) }}
 
 permissions:
   contents: read
@@ -33,8 +44,11 @@ env:
   XCODE_VERSION: ${{ vars.XCODE_VERSION }}
 
 jobs:
+  # Every check job skips a pull request whose head is a claude/** branch of this repository: that branch's push
+  # run already tests the same commits (no double macOS minutes). Pull requests from other branches and forks run.
   web:
     name: Web (typecheck, unit tests, build)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -60,6 +74,7 @@ jobs:
 
   chromium-e2e:
     name: Chromium phone e2e
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -82,6 +97,7 @@ jobs:
 
   ios-simulator:
     name: iOS Simulator (build, launch, screenshots)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -114,6 +130,7 @@ jobs:
 
   webkit-e2e:
     name: WebKit iPhone 15 e2e
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -142,8 +159,14 @@ jobs:
 
   testflight:
     name: TestFlight upload
-    needs: [web, ios-simulator]
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.upload)
+    # Only after every check passed (web, both e2e suites, the Simulator smoke test), and only for a push to main
+    # or a manual run with "upload" ticked (FR-136): never for pull requests or other branches.
+    needs: [web, chromium-e2e, ios-simulator, webkit-e2e]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.upload)
+    # Its own group, never cancelled: a newer upload waits for the one in progress instead of killing it mid-upload.
+    concurrency:
+      group: cuesight-ios-testflight
+      cancel-in-progress: false
     runs-on: macos-15
     timeout-minutes: 60
     steps:

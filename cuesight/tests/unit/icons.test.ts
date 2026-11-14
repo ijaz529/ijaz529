@@ -3,8 +3,10 @@
  * IHDR for exact size and colour type (2 = RGB, no alpha; 6 = RGBA) and validates the manifest and the
  * iOS asset catalog / Info.plist essentials. Regenerate the PNGs with `npm run icons`.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { precacheList } from '../../scripts/sw-precache';
 
 function ihdr(path: string): { width: number; height: number; bitDepth: number; colorType: number } {
   const b = readFileSync(path);
@@ -84,8 +86,12 @@ describe('web app manifest', () => {
     expect(m.icons.some((i) => i.purpose === 'any' && i.sizes === '192x192')).toBe(true);
   });
   it('the service worker precaches every manifest icon', () => {
+    // The precache list is written into dist/sw.js at build time from every built and public file
+    // (scripts/sw-precache.ts; checked on a real build in tests/unit/sw-precache.test.ts).
     const sw = readFileSync('public/sw.js', 'utf8');
-    for (const i of m.icons) expect(sw).toContain(`./${i.src}`);
+    expect(sw).toContain('c.addAll([...SHELL, ...BUILD_ASSETS])');
+    const list = precacheList(readdirSync('public', { recursive: true, withFileTypes: true }).filter((d) => d.isFile()).map((d) => relative('public', join(d.parentPath, d.name))));
+    for (const i of m.icons) expect(list).toContain(`./${i.src}`);
   });
 });
 

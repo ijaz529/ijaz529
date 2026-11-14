@@ -5,6 +5,7 @@ export default defineConfig({
   base: './',
   plugins: [swPrecache()],
   worker: { format: 'es' },
-  build: { target: 'es2022', sourcemap: true },
+  // No source maps: dist is what the PWA serves and what `cap sync` copies into the iOS app bundle.
+  build: { target: 'es2022', sourcemap: false },
   server: { host: false },
 });
