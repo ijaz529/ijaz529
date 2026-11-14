@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 import { makeTable } from '../../../src/core/table';
 import type { Frame } from '../../../src/vision/image';
 import { createPipeline } from '../../../src/vision/pipeline';
+import { cameraModel, renderSyntheticTable, type RGB } from '../../../src/vision/synth/render';
 import { createTableScratch, detectTable, learnClothInQuad } from '../../../src/vision/table-detect';
+import { POSES, scene } from '../../helpers/scenes';
 
 /** A green cloth quad in the left part of a grey photo: the central window sees no cloth. */
 function offCentreTable(w = 640, h = 480): { frame: Frame; quad: { x: number; y: number }[] } {
@@ -63,5 +65,45 @@ describe('manual corners without an automatic cloth', () => {
     expect(manual.calibration?.source).toBe('manual');
     expect(manual.status).toBe('locked');
     expect(manual.cloth).not.toBeNull();
+  });
+
+  it('a manual quad over the grey background is not locked and has quality 0', () => {
+    const { frame } = offCentreTable();
+    const table = makeTable('pool9');
+    const p = createPipeline({ table, fovDeg: 65, manualCorners: [{ x: 300, y: 100 }, { x: 600, y: 100 }, { x: 600, y: 400 }, { x: 300, y: 400 }] });
+    for (let i = 0; i < 3; i++) {
+      const r = p.process(frame);
+      expect(r.status).not.toBe('locked');
+      expect(r.quality).toBe(0);
+      expect(r.reason).toBe('cloth-unknown');
+    }
+  });
+});
+
+describe('grey cloth with manual corners', () => {
+  const pose = POSES.corner!;
+  it.each([
+    [110, 116, 124],
+    [80, 86, 92],
+  ] as RGB[])('cloth rgb(%i, %i, %i): exact corner taps calibrate, find the balls and lock', (r, g, b) => {
+    const s = scene('corner', { cloth: [r, g, b] });
+    const frame = renderSyntheticTable({ ...s, ss: 1 });
+    const cam = cameraModel(pose, s.width, s.height);
+    const t = s.table;
+    const X = t.length / 2 + t.cushionWidth;
+    const Y = t.width / 2 + t.cushionWidth;
+    const corners = [
+      [-X, -Y],
+      [X, -Y],
+      [X, Y],
+      [-X, Y],
+    ].map(([x, y]) => cam.project({ x: x!, y: y!, z: t.cushionHeight }));
+    const p = createPipeline({ table: t, fovDeg: pose.fovDeg, manualCorners: corners });
+    let res = p.process(frame);
+    for (let i = 0; i < 3; i++) res = p.process(frame);
+    expect(res.calibration).not.toBeNull();
+    expect(res.balls.length).toBeGreaterThanOrEqual(8);
+    expect(res.status).toBe('locked');
+    expect(res.cloth?.kind).toBe('neutral');
   });
 });

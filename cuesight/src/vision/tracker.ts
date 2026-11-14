@@ -20,6 +20,8 @@ export interface TrackedBall {
 
 export interface TrackerOptions {
   ballRadius: number;
+  /** First numeric ball id to issue (default 1). Pass an old tracker's nextId() so ids stay unique. */
+  firstId?: number;
   alpha?: number;
   confirmHits?: number;
   maxMisses?: number;
@@ -65,7 +67,7 @@ export function createTracker(opts: TrackerOptions) {
   let calm = 0;
   let missing = 0;
   let tracks: Track[] = [];
-  let nextId = 1;
+  let nextId = opts.firstId !== undefined && Number.isFinite(opts.firstId) && opts.firstId >= 1 ? Math.floor(opts.firstId) : 1;
 
   function updateCorners(c: Vec2[] | null, diag: number): void {
     if (!c) {
@@ -165,12 +167,24 @@ export function createTracker(opts: TrackerOptions) {
       if (u.balls) updateBalls(u.balls);
       return { status, corners, balls: output() };
     },
+    /** Forget the table lock and all tracks. Ids already issued are never reused. */
     reset(): void {
       status = 'searching';
       corners = null;
       calm = 0;
       missing = 0;
       tracks = [];
+    },
+    /** Forget the table lock (the next quad starts a new lock) but keep the ball tracks and their ids. */
+    resetLock(): void {
+      status = 'searching';
+      corners = null;
+      calm = 0;
+      missing = 0;
+    },
+    /** The next numeric id this tracker would issue. */
+    nextId(): number {
+      return nextId;
     },
   };
 }
