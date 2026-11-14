@@ -41,7 +41,7 @@ export interface TipInput {
   makeable: boolean;
   /** False when the cue ball stops before it reaches the object ball (default true). */
   cbReachesOb?: boolean;
-  /** Power to advise in the "too soft" tip (planShot passes ShotPlan.minPowerSafe; > 10: full power won't do). */
+  /** Power to advise in the "too soft" tip (planShot passes ShotPlan.minPower; > 10: full power won't do). */
   minPower?: number;
   /** Cue ball → ghost distance (m), to give the squirt offset in mm at the ghost ball. */
   cbDistance?: number;

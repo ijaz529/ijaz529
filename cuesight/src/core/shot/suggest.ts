@@ -24,7 +24,7 @@ export function suggestShots(layout: TableLayout, params: PhysicsParams, max = 3
   for (const target of layout.balls) {
     if (target.kind === 'cue') continue;
     for (const pocket of layout.table.pockets) {
-      const g = shotGeometry(layout.table, layout.balls, cue, target, pocket);
+      const g = shotGeometry(layout.table, layout.balls, cue, target, pocket, params);
       if (!g.makeable || g.blockersCue.length || g.blockersObject.length) continue;
       const tol = deg(g.toleranceRad);
       cands.push({ targetId: target.id, pocketId: pocket.id, toleranceDeg: tol, difficulty: difficultyOf(tol), score: Math.log10(Math.max(tol, 1e-4)) });
@@ -38,7 +38,7 @@ export function suggestShots(layout: TableLayout, params: PhysicsParams, max = 3
     const bad = plan.warnings.some(
       (w) => w.code === 'kiss' || w.code === 'ob-missed' || w.code === 'throw-uncompensable' || w.code === 'blocked-cue' || w.code === 'blocked-object',
     );
-    const q = plan.cueRest ? nextShotQuality(postShotLayout(layout, plan), plan.cueRest, [c.targetId]) : 0;
+    const q = plan.cueRest ? nextShotQuality(postShotLayout(layout, plan), plan.cueRest, [c.targetId], undefined, params) : 0;
     verified.push({ ...c, score: c.score + POSITION_WEIGHT * q - (bad ? 2 : 0) - (plan.scratch ? 0.5 : 0) });
   }
   return verified.sort((a, b) => b.score - a.score).slice(0, max);

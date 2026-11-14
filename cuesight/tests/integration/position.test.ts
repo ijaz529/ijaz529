@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_PHYSICS } from '../../src/core/physics/params';
+import { simulate } from '../../src/core/physics/simulate';
+import { strikeBall } from '../../src/core/physics/strike';
 import { planShot } from '../../src/core/shot/planner';
 import { nextShotQuality, positionHeatmap, recommendStroke } from '../../src/core/shot/position';
-import { powerToSpeed, speedToPower } from '../../src/core/shot/power';
+import { POWER_SPEEDS, powerToSpeed } from '../../src/core/shot/power';
 import { makeTable, pocketById } from '../../src/core/table';
 import type { PocketId, ShotPlan, Stroke, TableLayout } from '../../src/core/types';
 import { add, angleOf, fromAngle, rad, scale, sub, v2, type Vec2 } from '../../src/core/vec';
@@ -25,13 +27,24 @@ function postShot(lay: TableLayout, plan: ShotPlan): TableLayout {
 }
 const postQuality = (lay: TableLayout, plan: ShotPlan) => (plan.cueRest ? nextShotQuality(postShot(lay, plan), plan.cueRest, [plan.targetId]) : 0);
 
-/** Re-plan a stroke at ±6 % and ±12 % cue-ball speed: none of them may scratch or miss. */
+/**
+ * Mis-hit the planned stroke by ±6 % and ±12 % cue-ball speed: the same cue line (the plan's aimDir)
+ * at the true speed, no re-aim. None of them may scratch or miss. Overhits past full power
+ * (7 m/s) can't be played and are skipped; underhits below power 1 are simulated at their real
+ * speed (speedToPower would clamp them to power 1 and hide a miss).
+ */
 function expectSpeedRobust(lay: TableLayout, targetId: string, pocketId: PocketId, stroke: Stroke) {
+  const plan = planShot(lay, { targetId, pocketId, stroke }, P, { record: false });
+  const R = lay.table.ballRadius;
   for (const k of [0.88, 0.94, 1.06, 1.12]) {
-    const power = speedToPower(powerToSpeed(stroke.power) * k);
-    const p = planShot(lay, { targetId, pocketId, stroke: { ...stroke, power } }, P, { record: false });
-    expect(p.scratch, `×${k} speed scratches (${JSON.stringify(stroke)})`).toBe(false);
-    expect(p.obPocketed, `×${k} speed misses (${JSON.stringify(stroke)})`).toBe(true);
+    const v = powerToSpeed(stroke.power) * k;
+    if (v > POWER_SPEEDS[POWER_SPEEDS.length - 1]! + 1e-9) continue;
+    const st = strikeBall(plan.aimDir, v, stroke.side, stroke.vert, R, P.squirtMassRatio);
+    const init = lay.balls.map((b) => (b.kind === 'cue' ? { id: b.id, pos: b.pos, vel: st.vel, omega: st.omega } : { id: b.id, pos: b.pos }));
+    const sim = simulate(lay.table, init, P, { record: false });
+    const cueId = lay.balls.find((b) => b.kind === 'cue')!.id;
+    expect(sim.final[cueId]!.pocket, `×${k} speed scratches (${JSON.stringify(stroke)})`).toBeNull();
+    expect(sim.final[targetId]!.pocket, `×${k} speed misses (${JSON.stringify(stroke)})`).toBe(pocketId);
   }
 }
 
@@ -109,11 +122,18 @@ describe('position play', () => {
     const rec = recommendStroke(lay, { targetId: 'ob', pocketId: 'TR' }, P, { landing: v2(0.51, -0.1) });
     expect(rec.reachable).toBe(true);
     expect(rec.restError!).toBeLessThanOrEqual(0.15);
+    // A spot on the bottom rail that only speed-sensitive strokes reach, while strokes that end
+    // elsewhere survive ±6/±12 %: it is reachable (flagged fragile), not traded for a robust stroke
+    // that stops half a metre away.
+    const rail = recommendStroke(lay, { targetId: 'ob', pocketId: 'TR' }, P, { landing: v2(0, -0.6) });
+    console.log(`rail spot: reachable ${rail.reachable}, error ${(rail.restError! * 100).toFixed(1)} cm, fragile ${rail.fragile ?? false}`);
+    expect(rail.reachable).toBe(true);
+    expect(rail.restError!).toBeLessThanOrEqual(0.15);
     // reachable ⇔ some searched stroke pots without scratching and stops within 15 cm of the spot.
     // (The reviewer's layout below had such a grid stroke before the cushion-model rebase; with the
     // current physics the nearest grid stroke stops 19 cm away, so the invariant is what is checked.)
     const lay2 = layout({ cue: v2(-0.2, -0.3), ob: v2(0.7, 0.2), x1: v2(0.2, 0.4), x2: v2(-0.6, 0.1) });
-    const lo = Math.max(1, Math.floor(planShot(lay2, { targetId: 'ob', pocketId: 'TR' }, P, { record: false }).minPower));
+    const lo = Math.max(1, Math.floor(planShot(lay2, { targetId: 'ob', pocketId: 'TR' }, P, { record: false }).minPowerCapture!));
     const outcomes: boolean[] = [];
     for (const spot of [v2(-0.1, 0.1), v2(0.95, 0.2), v2(0.2, -0.3)]) {
       const rec2 = recommendStroke(lay2, { targetId: 'ob', pocketId: 'TR' }, P, { landing: spot });
@@ -154,10 +174,50 @@ describe('position play', () => {
     expect(c.evaluated).toBeLessThan(a.evaluated);
   });
 
+  it('a time cap that fires during the robustness pass is reported (timedOut set at return)', () => {
+    const lay = layout({ cue, ob, next: v2(-0.6, -0.35) });
+    const base = planShot(lay, { targetId: 'ob', pocketId: 'TR' }, P, { record: false });
+    const lo = Math.max(1, Math.floor(base.minPowerCapture!));
+    const grid = (10 - lo + 1) * 18;
+    // The clock stands still through the grid (t0 + one read per grid stroke), then jumps.
+    let reads = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => (reads++ <= grid ? 0 : 1e9));
+    const rec = recommendStroke(lay, { targetId: 'ob', pocketId: 'TR' }, P, { timeCapMs: 1000 });
+    vi.restoreAllMocks();
+    expect(rec.evaluated).toBe(grid);
+    expect(rec.timedOut).toBe(true);
+    expect(rec.fragile).toBe(true);
+  });
+
+  it('underhits of a power-1 stroke are tested at their real speed (power scale clamps at 1)', () => {
+    // Reviewer layouts: the old walk re-ran 0.88×/0.94× of power 1 as power 1 itself and returned a
+    // non-fragile {power 1, vert 0.4} that misses at a real 6–12 % underhit.
+    for (const pos of [
+      { cue: v2(0.6508, -0.1747), ob: v2(0.3899, 0.1145), nx: v2(0.2602, -0.0044) },
+      { cue: v2(-0.7539, -0.4844), ob: v2(-0.0863, 0.4592), nx: v2(-0.2366, 0.0133) },
+    ]) {
+      const lay = layout(pos);
+      const pocketId = planShot(lay, { targetId: 'ob' }, P, { record: false }).pocketId;
+      const rec = recommendStroke(lay, { targetId: 'ob', pocketId }, P);
+      expect(Number.isFinite(rec.score)).toBe(true);
+      if (rec.fragile !== true) expectSpeedRobust(lay, 'ob', pocketId, rec.stroke);
+    }
+  });
+
+  it('the search starts at the bare capture minimum, below the "with pace" minimum', () => {
+    const lay = layout({ cue, ob, next: v2(-0.6, -0.35) });
+    const base = planShot(lay, { targetId: 'ob', pocketId: 'TR' }, P, { record: false });
+    expect(base.minPowerCapture!).toBeLessThan(base.minPower);
+    const seen = new Set<number>();
+    recommendStroke(lay, { targetId: 'ob', pocketId: 'TR' }, P, { onEvaluate: (s) => seen.add(s.power) });
+    expect(Math.min(...seen)).toBe(Math.max(1, Math.floor(base.minPowerCapture!)));
+    expect(Math.min(...seen)).toBeLessThan(Math.ceil(base.minPower));
+  });
+
   it('a small evaluation budget still covers every power (coarse-to-fine order)', () => {
     const lay = layout({ cue, ob, next: v2(-0.6, -0.35) });
     const base = planShot(lay, { targetId: 'ob', pocketId: 'TR' }, P, { record: false });
-    const lo = Math.max(1, Math.floor(base.minPower));
+    const lo = Math.max(1, Math.floor(base.minPowerCapture!));
     const seen = new Set<number>();
     const rec = recommendStroke(lay, { targetId: 'ob', pocketId: 'TR' }, P, { maxEvaluations: 60, onEvaluate: (s) => seen.add(s.power) });
     expect(rec.evaluated).toBeLessThanOrEqual(60);
@@ -167,7 +227,7 @@ describe('position play', () => {
   it('with no budget left for the robustness pass, the best grid stroke comes back with a finite score (robust-loop-skip)', () => {
     const lay = layout({ cue, ob, next: v2(-0.6, -0.35) });
     const base = planShot(lay, { targetId: 'ob', pocketId: 'TR' }, P, { record: false });
-    const lo = Math.max(1, Math.floor(base.minPower));
+    const lo = Math.max(1, Math.floor(base.minPowerCapture!));
     const grid = (10 - lo + 1) * 18;
     let best: { stroke: Stroke; score: number } | null = null;
     const rec = recommendStroke(lay, { targetId: 'ob', pocketId: 'TR' }, P, {

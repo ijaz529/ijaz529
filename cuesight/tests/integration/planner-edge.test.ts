@@ -124,6 +124,55 @@ describe('cue ball frozen to the object ball (frozen-cb)', () => {
     const s = suggestShots(layout({ cue: frozenAt(0, 1), ob }), P, 3);
     expect(s.some((x) => x.targetId === 'ob' && x.pocketId === 'TR')).toBe(true);
   });
+
+  it('line of centres 6° off (window ±1.8°): makeable, because the model throws up to ≈5° at soft pace, and pots', () => {
+    const plan = planShot(layout({ cue: frozenAt(0, 6), ob }), { targetId: 'ob', pocketId: 'TR' }, P);
+    expect(plan.makeable, plan.warnings.map((x) => x.message).join(' | ')).toBe(true);
+    expect(plan.obPocketed).toBe(true);
+    expect(plan.toleranceDeg).toBeGreaterThan(0);
+  });
+
+  it('at a pace where no stroke angle throws it in, it says so instead of "adjust speed or spin"', () => {
+    const plan = planShot(layout({ cue: frozenAt(0, 6), ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: 9, side: 0, vert: 0 } }, P);
+    expect(plan.obPocketed).toBe(false);
+    expect(has(plan, 'ob-missed')).toBe(false);
+    expect(msg(plan, 'throw-uncompensable')).toMatch(/no stroke angle/i);
+  });
+
+  // Reviewer layouts where |throw| peaks near ±25° of stroke angle, so err(stroke angle) is not
+  // monotonic and a plain secant from the line of centres overshoots the potting range.
+  const peaked: [string, Vec2, Vec2, PocketId][] = [
+    ['TR (pots only for strokes 20.5–30.5° right at power 3.5)', v2(0.3284, -0.2574), v2(0.3675, -0.2144), 'TR'],
+    ['TM', v2(0.3721, -0.1651), v2(0.3527, -0.1109), 'TM'],
+    ['BM', v2(-0.9944, 0.4698), v2(-0.9585, 0.4241), 'BM'],
+  ];
+  for (const [name, cue, ob2, pocketId] of peaked)
+    it(`stroke-angle search finds the potting range: ${name}`, () => {
+      const plan = planShot(layout({ cue, ob: ob2 }), { targetId: 'ob', pocketId }, P);
+      expect(plan.makeable).toBe(true);
+      expect(plan.obPocketed, plan.warnings.map((x) => x.message).join(' | ')).toBe(true);
+      expect(has(plan, 'ob-missed')).toBe(false);
+    });
+});
+
+describe('snooker: touching ball', () => {
+  it('a cue ball touching the object ball cannot play it (push stroke) and it is never suggested', () => {
+    const T = makeTable('snooker12');
+    const R = T.ballRadius;
+    const ob = v2(0.8, 0.2);
+    const w = pocketWindow(ob, pocketById(T, 'TR'), R);
+    const lay = layout({ cue: sub(ob, scale(w.dir, 2 * R)), ob }, 'snooker12');
+    const plan = planShot(lay, { targetId: 'ob', pocketId: 'TR' }, P);
+    expect(plan.makeable).toBe(false);
+    expect(msg(plan, 'not-makeable')).toMatch(/touching ball/);
+    expect(msg(plan, 'not-makeable')).toMatch(/push stroke/);
+    expect(suggestShots(lay, P, 3).some((s) => s.targetId === 'ob')).toBe(false);
+    // The same position on a pool table is a legal frozen shot straight at the pocket.
+    const T9 = makeTable('pool9');
+    const w9 = pocketWindow(ob, pocketById(T9, 'TR'), T9.ballRadius);
+    const pool = planShot(layout({ cue: sub(ob, scale(w9.dir, 2 * T9.ballRadius)), ob }), { targetId: 'ob', pocketId: 'TR' }, P);
+    expect(pool.makeable).toBe(true);
+  });
 });
 
 describe('corner hanger past the mouth line (corner-hanger-window-reversed)', () => {

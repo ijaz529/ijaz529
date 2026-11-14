@@ -13,10 +13,12 @@
  *    A probe counts only when the CB reaches the OB before any cushion or jaw; if none does, the
  *    geometric aim is kept. When the search cannot bring the departure inside the window and the
  *    simulated ball then misses, the miss is put down to throw ('throw-uncompensable'), not speed.
- *    Frozen CB: the same kind of search over the stroke angle (≤ 5 probes).
+ *    Frozen CB: a scan of stroke angles toward the pocket side (|throw| peaks near 25–30° of stroke
+ *    angle, so the error is not monotonic), refined around the best sample.
  * 5. Full simulation on the real layout → paths, rest positions, scratch/kiss/miss/too-soft warnings.
  */
-import { straightLineState } from '../physics/analytic';
+import { straightLineState, throwAngle } from '../physics/analytic';
+import { DEFAULT_PHYSICS } from '../physics/params';
 import { simulate, type SimBallInit } from '../physics/simulate';
 import { strikeBall } from '../physics/strike';
 import { POCKET_NAMES } from '../table';
@@ -39,18 +41,12 @@ import { coachingTip, contactSpinOf, difficultyOf, type ThrowShiftDir } from './
 import { cutAngle, cutSide, fractionOf, ghostBall, contactPoint } from './geometry';
 import { pathBlockers } from './obstruction';
 import { mouthIntersect, pocketWindow, type PocketWindow } from './pocket-window';
-import { powerToSpeed } from './power';
+import { POWER_SPEEDS, powerToSpeed } from './power';
 
 export const MAX_CUT_DEG = 88;
 export const THIN_CUT_DEG = 80;
 /** A CB closer than 2R + this (m) to the OB is frozen to it (touching, or overlapping by detection noise). */
 export const FROZEN_EPS = 1e-3;
-/**
- * ASSUMPTION: the largest angle (rad) throw can turn the OB off the line of centres when the CB is
- * frozen to it. Throw is bounded by atan(μ) [A TP A.14], μ ≈ 0.06–0.07 at the slow contact speeds
- * of a frozen shot (params.ballFriction), so ≈ 3.5–4°; 4° is used.
- */
-export const FROZEN_MAX_THROW = rad(4);
 /** How far (m) the ghost-ball centre may sit past a cushion line and still count as on the table. */
 export const GHOST_RAIL_SLACK = 1e-3;
 /** Margin (m) inside the cushion lines that the throw search keeps the ghost, so the CB meets the OB first. */
@@ -67,12 +63,63 @@ export const CAPTURE_MIN_SPEED = 0.02;
  */
 const THROW_SEARCH_RAD = rad(8);
 const THROW_PROBES = 4;
-const FROZEN_PROBES = 5;
-const FROZEN_FIRST_STEP = rad(20);
+/** Frozen CB: stroke angles scanned (rad) on the pocket side, and the scan step. */
 const FROZEN_MAX_STROKE = rad(60);
+const FROZEN_SCAN_STEP = rad(2.5);
+/** Frozen CB: refinement probes around the best scan sample. */
+const FROZEN_REFINE = 8;
+
+/**
+ * Largest throw (rad) the model gives a frozen OB with a centre-ball stroke at CB speed `v`: the
+ * TP A.14 throw [A] (throwAngle, params.ballFriction) maximised over stroke angles up to
+ * FROZEN_MAX_STROKE; `strokeRad` is where the maximum is. Throw peaks where the friction limit μ(U)
+ * meets the stick limit tanθ/7 (≈ 30° at 0.6 m/s with the default μ(v)) and grows as the speed
+ * drops, so the softest stroke that still gets the ball there gives the most.
+ * ASSUMPTION: centre ball, which is what the planner's default and its stroke-angle search use.
+ * Inside english that cancels part of the sliding speed can add ≈0.5° more (TP A.14 at a 60°
+ * stroke, 0.6 m/s), so a player-chosen spin may pot a few shots this bound calls not makeable.
+ */
+export function frozenThrowMax(params: PhysicsParams, v: number): { rad: number; strokeRad: number } {
+  let best = 0;
+  let at = 0;
+  for (let i = 1; i <= 120; i++) {
+    const th = (i / 120) * FROZEN_MAX_STROKE;
+    const t = throwAngle(th, v, 0, 0, params);
+    if (t > best) {
+      best = t;
+      at = th;
+    }
+  }
+  return { rad: best, strokeRad: at };
+}
+
+/**
+ * Throw bound (rad) for a frozen shot into `window`: frozenThrowMax at the softest stroke that
+ * still gets the OB across the capture line (never below power 1, the softest on the scale).
+ */
+function frozenThrowBound(window: PocketWindow, captureDistance: number, params: PhysicsParams): number {
+  let v: number = POWER_SPEEDS[0];
+  let m = frozenThrowMax(params, v);
+  for (let k = 0; k < 2; k++) {
+    // The OB gets the CB's speed times cos(stroke angle) (a cut of that angle with no travel).
+    const p = minimumPower({ cbDistance: 0, cut: m.strokeRad, window, captureDistance }, { vert: 0 }, params, 'capture');
+    if (p > 10) return frozenThrowMax(params, powerToSpeed(10)).rad;
+    const need = powerToSpeed(p);
+    if (need <= v + 1e-9) break;
+    v = need;
+    m = frozenThrowMax(params, v);
+  }
+  return m.rad;
+}
+
+/**
+ * The throw bound for the default physics at the softest stroke (≈ 5°), for reference. The planner
+ * uses frozenThrowBound per shot (softer is more throw, but the ball has to get to the pocket).
+ */
+export const FROZEN_MAX_THROW = frozenThrowMax(DEFAULT_PHYSICS, POWER_SPEEDS[0]).rad;
 
 /** Why a pocket can't be played directly (player text is built in planShot). */
-export type NotMakeableReason = 'no-window' | 'wrong-side' | 'ghost-off-table' | 'too-thin' | 'frozen-line';
+export type NotMakeableReason = 'no-window' | 'wrong-side' | 'ghost-off-table' | 'too-thin' | 'frozen-line' | 'touching-ball';
 
 export interface ShotGeometry {
   pocket: PocketSpec;
@@ -103,6 +150,8 @@ export interface ShotGeometry {
   captureDistance: number;
   /** The CB touches (or overlaps) the OB. */
   frozen: boolean;
+  /** Frozen CB: the most throw (rad) the model allows for this shot (see frozenThrowBound). */
+  frozenMaxThrow?: number;
 }
 
 /** Distance along `dir` from `p` (inside the nose rectangle) to where it leaves the rectangle. */
@@ -176,8 +225,24 @@ function throwAimRange(ob: Vec2, mid: number, reach: number, R: number, lx: numb
   return [seed > mid ? seed : ghostEdge(ob, R, lx, ly, seed, mid - reach), seed < mid ? seed : ghostEdge(ob, R, lx, ly, seed, mid + reach)];
 }
 
-/** Pure geometry for one target/pocket pair (no simulation) — also used by suggestions. */
-export function shotGeometry(table: TableSpec, balls: Ball[], cue: Ball, target: Ball, pocket: PocketSpec): ShotGeometry {
+/**
+ * Snooker table presets, where a cue ball touching a ball may only play away from it (WPBSA rules,
+ * "touching ball": moving the touching ball is a push stroke, a foul).
+ */
+const TOUCHING_BALL_RULE: ReadonlySet<TableSpec['id']> = new Set(['snooker12']);
+
+/**
+ * Pure geometry for one target/pocket pair (no simulation) — also used by suggestions. `params`
+ * (default DEFAULT_PHYSICS) only matters for a frozen CB, where it sets the throw bound.
+ */
+export function shotGeometry(
+  table: TableSpec,
+  balls: Ball[],
+  cue: Ball,
+  target: Ball,
+  pocket: PocketSpec,
+  params: PhysicsParams = DEFAULT_PHYSICS,
+): ShotGeometry {
   const R = table.ballRadius;
   const hx = table.length / 2;
   const hy = table.width / 2;
@@ -206,19 +271,27 @@ export function shotGeometry(table: TableSpec, balls: Ball[], cue: Ball, target:
   const blockersObject = pathBlockers(target.pos, window.mouthHit, balls, clearance, [cue.id, target.id]);
 
   if (frozen) {
-    // The OB can only leave along the line of centres, turned by at most FROZEN_MAX_THROW of throw.
+    // The OB can only leave along the line of centres, turned by at most maxThrow of throw.
     const lc = sub(target.pos, cue.pos);
     const u = Math.hypot(lc.x, lc.y) > 1e-9 ? norm(lc) : window.dir;
     const alpha = Math.abs(angleBetween(u, window.dir));
-    const makeable = window.ok && alpha <= window.halfRad + FROZEN_MAX_THROW;
-    // Margin (rad of OB direction): any throw in [α − half, α + half] pots it and at most
-    // FROZEN_MAX_THROW is available, so the throw margin is half the width of
-    // [α − half, min(α + half, max)]: the full half-width while little throw is needed, falling to 0
-    // at α = half + max. A straight push already has margin half − α. Continuous in α.
+    const maxThrow = window.ok ? frozenThrowBound(window, captureDistance, params) : 0;
+    const touchingRule = TOUCHING_BALL_RULE.has(table.id);
+    const makeable = !touchingRule && window.ok && alpha <= window.halfRad + maxThrow;
+    // Margin (rad of OB direction): any throw in [α − half, α + half] pots it and at most maxThrow
+    // is available, so the throw margin is half the width of [α − half, min(α + half, max)]: the
+    // full half-width while little throw is needed, falling to 0 at α = half + max. A straight push
+    // already has margin half − α. Continuous in α.
     const tol = makeable
-      ? Math.max(0, window.halfRad - alpha, 0.5 * (Math.min(alpha + window.halfRad, FROZEN_MAX_THROW) - (alpha - window.halfRad)))
+      ? Math.max(0, window.halfRad - alpha, 0.5 * (Math.min(alpha + window.halfRad, maxThrow) - (alpha - window.halfRad)))
       : 0;
-    const reason: NotMakeableReason | undefined = makeable ? undefined : !window.ok ? 'no-window' : 'frozen-line';
+    const reason: NotMakeableReason | undefined = makeable
+      ? undefined
+      : touchingRule
+        ? 'touching-ball'
+        : !window.ok
+          ? 'no-window'
+          : 'frozen-line';
     return {
       pocket,
       window,
@@ -237,6 +310,7 @@ export function shotGeometry(table: TableSpec, balls: Ball[], cue: Ball, target:
       aimHi: mid,
       captureDistance,
       frozen,
+      frozenMaxThrow: maxThrow,
     };
   }
 
@@ -370,7 +444,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   if (!target || target.kind === 'cue') throw new Error(`Unknown target ball ${request.targetId}`);
 
   // --- Pocket selection -------------------------------------------------------------------------
-  const geos = table.pockets.map((p) => shotGeometry(table, balls, cue, target, p));
+  const geos = table.pockets.map((p) => shotGeometry(table, balls, cue, target, p, params));
   const usable = (g: ShotGeometry) => g.makeable && g.blockersCue.length === 0 && g.blockersObject.length === 0;
   const ranked = [...geos].sort(
     (a, b) =>
@@ -388,10 +462,12 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   const cutDeg = deg(geo.cut);
   const fr = fractionOf(geo.cut);
   const powerVert = (request.stroke ?? opts.recommended ?? { vert: 0 }).vert;
-  let minPower = minimumPower(geo, { vert: powerVert }, params);
-  let minPowerSafe = minimumPower(geo, { vert: powerVert }, params, 'pace');
+  // minPower: "arrives with pace" (what the app shows and the advice quotes); minPowerCapture: the
+  // bare analytic minimum below which the ball stops short (see ShotPlan).
+  let minPower = minimumPower(geo, { vert: powerVert }, params, 'pace');
+  let minPowerCapture = minimumPower(geo, { vert: powerVert }, params, 'capture');
   const strokeSource: ShotPlan['strokeSource'] = request.stroke ? 'player' : opts.recommended ? 'recommended' : 'default';
-  let stroke = request.stroke ?? opts.recommended ?? defaultStroke(minPowerSafe);
+  let stroke = request.stroke ?? opts.recommended ?? defaultStroke(minPower);
   let speed = powerToSpeed(stroke.power);
 
   if (!geo.makeable) {
@@ -439,6 +515,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   let throwRad = 0;
   let strokeOffset = 0; // frozen: stroke angle relative to the line of centres (rad, CCW +)
   let uncompensable = false; // no clean aim cancels the throw inside the window
+  let frozenMiss: number | null = null; // frozen: no stroke angle throws it inside the window (rad left)
   if (geo.makeable && !geo.frozen) {
     const r = throwSearch(geo, (a) => probe(norm(sub(ghostBall(target.pos, fromAngle(a), R), cue.pos)), geo.window.dir));
     aimAngle = r.aim;
@@ -448,7 +525,9 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     uncompensable = r.residual !== null && Math.abs(r.residual) > geo.window.halfRad;
   } else if (geo.makeable && geo.frozen) {
     const au = angleOf(geo.aimDir);
-    let r = frozenSearch(au, (a) => probe(fromAngle(a), geo.window.dir));
+    const search = () => frozenSearch(au, (a) => probe(fromAngle(a), geo.window.dir));
+    const misses = (x: SearchResult) => x.residual !== null && Math.abs(x.residual) > geo.window.halfRad;
+    let r = search();
     // The stroke angle sets the OB's share of the CB's speed (cos of the offset), so the minimum
     // power changes, and with it the default stroke: re-search once at that power.
     const minFor = (offset: number, criterion: 'capture' | 'pace') => minimumPower({ ...geo, cut: Math.abs(offset) }, { vert: powerVert }, params, criterion);
@@ -457,11 +536,31 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       if (again.power !== stroke.power) {
         stroke = again;
         speed = powerToSpeed(stroke.power);
-        r = frozenSearch(au, (a) => probe(fromAngle(a), geo.window.dir));
+        r = search();
+      }
+      // Softer gives more throw (μ falls with sliding speed, TP A.14): if no stroke angle gets it in
+      // at the default pace, try the "with pace" minimum, then halfway down to the capture minimum.
+      if (misses(r)) {
+        const pace = minFor(r.aim - au, 'pace');
+        const cap = minFor(r.aim - au, 'capture');
+        for (const p of [pace, (pace + cap) / 2]) {
+          const power = Math.min(10, Math.max(1, Math.ceil(p * 10) / 10));
+          if (!(power < stroke.power) || p > 10) continue;
+          const keep = { stroke, speed };
+          stroke = { power, side: 0, vert: 0 };
+          speed = powerToSpeed(power);
+          const r2 = search();
+          if (!misses(r2)) {
+            r = r2;
+            break;
+          }
+          ({ stroke, speed } = keep);
+        }
       }
     }
-    minPower = minFor(r.aim - au, 'capture');
-    minPowerSafe = minFor(r.aim - au, 'pace');
+    minPower = minFor(r.aim - au, 'pace');
+    minPowerCapture = minFor(r.aim - au, 'capture');
+    if (r.residual !== null && Math.abs(r.residual) > geo.window.halfRad) frozenMiss = Math.abs(r.residual) - geo.window.halfRad;
     strokeOffset = r.aim - au;
     // Same meaning as for any shot: OB departure − aim line (here the line of centres), signed CCW.
     throwRad = r.residual === null ? 0 : r.throwRad - angleBetween(geo.window.dir, geo.aimDir);
@@ -523,11 +622,11 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   const contact = straightLineState(speed, 2.5 * speed * stroke.vert, geo.cbDistance, params);
   const geoP = geo.frozen ? { ...geo, cut: Math.abs(strokeOffset) } : geo;
   const arrival = arrivalAt(stroke.power, geoP, stroke.vert, params);
-  // Power to advise: minPowerSafe, because the analytic minPower is optimistic (see ShotPlan.minPower).
-  const advise = minPowerSafe > 10 ? 'Use full power.' : `Use power ${minPowerSafe.toFixed(1)}+.`;
+  // Power to advise: minPower (with pace), because the bare capture minimum is optimistic.
+  const advise = minPower > 10 ? 'Use full power.' : `Use power ${minPower.toFixed(1)}+.`;
   if (geo.makeable) {
     let soft: string | null = null;
-    const slow = stroke.power < Math.max(minPower, minPowerSafe) - 1e-6;
+    const slow = stroke.power < Math.max(minPower, minPowerCapture) - 1e-6;
     if (!obPocketed) {
       const cbWontReach = contact.stopped && !cuePath.events.some((e) => e.kind === 'ball' && e.otherId === target.id);
       // The simulated OB was hit and rolled to a stop on its line: no rail, jaw or ball on the way.
@@ -536,17 +635,22 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
         const k = objectPath.events.findIndex((e) => e.kind === 'ball');
         obStoppedShort = !objectPath.events.some((e, i) => i > k && (e.kind === 'cushion' || e.kind === 'jaw' || e.kind === 'ball'));
       }
-      if (minPower > 10) soft = 'Too far: even full power may not reach the pocket.';
+      if (minPowerCapture > 10) soft = 'Too far: even full power may not reach the pocket.';
       else if (cbWontReach && slow) soft = `Too soft — the cue ball won't reach the object ball. ${advise}`;
       else if (obStoppedShort && slow) soft = `Too soft — object ball stops short. ${advise}`;
-    } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPowerSafe - 1e-6 && minPowerSafe <= 10)
-      soft = `Very soft — the object ball only just drops; any roll-off will miss. Power ${minPowerSafe.toFixed(1)}+ gives some pace.`;
+    } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10)
+      soft = `Very soft — the object ball only just drops; any roll-off will miss. Power ${minPower.toFixed(1)}+ gives some pace.`;
     if (soft) warnings.splice(softAt + (geo.frozen ? 1 : 0), 0, { code: 'too-soft', message: soft });
   }
   const softWarned = warnings.some((w) => w.code === 'too-soft');
   if (geo.makeable && !obPocketed && !softWarned && geo.blockersObject.length === 0 && blockersCue.length === 0) {
-    // The probes found no clean aim that cancels the throw: that, not speed, is why it misses.
-    if (uncompensable)
+    // The probes found no clean aim (or stroke angle) that cancels the throw: that, not speed, is why it misses.
+    if (frozenMiss !== null)
+      warnings.push({
+        code: 'throw-uncompensable',
+        message: `Frozen: no stroke angle throws the object ball into the ${nameOf(geo.pocket.id)} at this speed — the best still misses by ${deg(frozenMiss).toFixed(1)}°. A softer centre-ball stroke gives the most throw.`,
+      });
+    else if (uncompensable)
       warnings.push({ code: 'throw-uncompensable', message: 'Throw pushes the ball into the rail at this speed and spin — use more pace or different spin.' });
     else
       warnings.push({
@@ -585,7 +689,8 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     stroke,
     strokeSource,
     minPower,
-    minPowerSafe,
+    minPowerCapture,
+    minPowerSafe: minPower,
     cuePath,
     objectPath,
     otherPaths,
@@ -613,7 +718,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     blocked,
     makeable: geo.makeable,
     cbReachesOb: !contact.stopped,
-    minPower: minPowerSafe, // the power to advise (minPower itself is optimistic)
+    minPower, // the power to advise (with pace)
     cbDistance: geo.cbDistance,
     ...(throwShiftDir ? { shiftDir: throwShiftDir } : {}),
     ...(alternatives[0] ? { altPocketName: nameOf(alternatives[0].pocketId) } : {}),
@@ -632,8 +737,11 @@ function notMakeableText(geo: ShotGeometry, cutDeg: number, nameOf: (id: PocketI
       return "the cue ball can't get to the contact spot (it would be inside the cushion)";
     case 'frozen-line': {
       const off = Math.abs(angleBetween(geo.aimDir, geo.window.dir));
-      return `the balls are frozen together, so the object ball can only go along the line of centres (±${deg(FROZEN_MAX_THROW).toFixed(0)}° of throw), and that line is ${deg(off).toFixed(0)}° off the ${nameOf(geo.pocket.id)}`;
+      const t = deg(geo.frozenMaxThrow ?? FROZEN_MAX_THROW);
+      return `the balls are frozen together, so the object ball can only go along the line of centres (±${t.toFixed(t < 10 ? 1 : 0)}° of throw at most), and that line is ${deg(off).toFixed(0)}° off the ${nameOf(geo.pocket.id)}`;
     }
+    case 'touching-ball':
+      return `the cue ball is touching it (or within ${(FROZEN_EPS * 1000).toFixed(0)} mm, too close to tell apart): in snooker you must play away from a touching ball — moving it is a push stroke, a foul`;
     default:
       return `the cut is too thin (${cutDeg.toFixed(0)}°)`;
   }
@@ -710,34 +818,84 @@ function throwSearch(geo: ShotGeometry, errAt: (a: number) => number): SearchRes
 
 /**
  * Frozen CB: stroke angle that throws the OB into the window. err(a) = OB departure − window
- * direction; stroking to one side of the line of centres throws the OB toward that side. Secant from
- * the line of centres and ±20° toward the pocket side, within ±60° of it, at most FROZEN_PROBES.
+ * direction. Stroking to one side of the line of centres throws the OB toward that side, but only
+ * up to a peak (≈ 25–30° of stroke angle in this model: the stick limit tanθ/7 meets the friction
+ * limit μ(U)), after which the throw falls again, so err is not monotonic and a secant from the
+ * line of centres overshoots. Instead: scan the pocket side every FROZEN_SCAN_STEP up to
+ * FROZEN_MAX_STROKE; if err changes sign, bisect the first such bracket (the smallest stroke angle,
+ * where throw is set by the stick limit and hardly depends on speed); otherwise golden-section
+ * |err| around the best sample. Already inside the window the scan still runs, so a small offset
+ * can centre the ball. ≤ 1 + 24 + FROZEN_REFINE probes (each stops at the first contact, which for
+ * touching balls is immediate).
  */
 function frozenSearch(au: number, errAt: (a: number) => number): SearchResult {
-  const lo = au - FROZEN_MAX_STROKE;
-  const hi = au + FROZEN_MAX_STROKE;
   const e0 = errAt(au);
   if (Number.isNaN(e0)) return { aim: au, throwRad: 0, residual: null };
-  let best = { a: au, e: e0 };
   if (Math.abs(e0) < 1e-5) return { aim: au, throwRad: e0, residual: e0 };
-  let prev = { a: au, e: e0 };
-  let a = au + (e0 < 0 ? FROZEN_FIRST_STEP : -FROZEN_FIRST_STEP);
-  for (let k = 1; k < FROZEN_PROBES; k++) {
-    const e = errAt(a);
+  const s = e0 < 0 ? 1 : -1; // stroke toward the side the OB has to be thrown to
+  let best = { t: 0, e: e0 };
+  let prevT = 0;
+  let prevE = e0;
+  const n = Math.round(FROZEN_MAX_STROKE / FROZEN_SCAN_STEP);
+  for (let k = 1; k <= n; k++) {
+    const t = k * FROZEN_SCAN_STEP;
+    const e = errAt(au + s * t);
     if (Number.isNaN(e)) {
-      a = (a + best.a) / 2;
+      prevE = NaN;
       continue;
     }
-    if (Math.abs(e) < Math.abs(best.e)) best = { a, e };
-    if (Math.abs(e) < 1e-5) break;
-    const s = (e - prev.e) / (a - prev.a);
-    const next = Number.isFinite(s) && Math.abs(s) > 1e-6 ? a - e / s : a + (e < 0 ? FROZEN_FIRST_STEP : -FROZEN_FIRST_STEP) / 2;
-    prev = { a, e };
-    const clamped = Math.min(hi, Math.max(lo, next));
-    if (Math.abs(clamped - a) < 1e-9) break;
-    a = clamped;
+    if (Math.abs(e) < Math.abs(best.e)) best = { t, e };
+    if (!Number.isNaN(prevE) && Math.sign(e) !== Math.sign(prevE)) {
+      // First zero crossing: bisect [prevT, t].
+      let lo = prevT;
+      let hi = t;
+      let eLo = prevE;
+      for (let i = 0; i < FROZEN_REFINE; i++) {
+        const m = (lo + hi) / 2;
+        const em = errAt(au + s * m);
+        if (Number.isNaN(em)) break;
+        if (Math.abs(em) < Math.abs(best.e)) best = { t: m, e: em };
+        if (Math.sign(em) === Math.sign(eLo)) {
+          lo = m;
+          eLo = em;
+        } else hi = m;
+      }
+      return { aim: au + s * best.t, throwRad: e0, residual: best.e };
+    }
+    prevT = t;
+    prevE = e;
   }
-  return { aim: best.a, throwRad: e0, residual: best.e };
+  // No crossing: the throw peaks short of the window (or just reaches it). Golden-section |err|
+  // between the neighbours of the best sample.
+  const at = (t: number): number => {
+    const e = errAt(au + s * t);
+    if (Number.isNaN(e)) return Infinity;
+    if (Math.abs(e) < Math.abs(best.e)) best = { t, e };
+    return Math.abs(e);
+  };
+  const g = (Math.sqrt(5) - 1) / 2;
+  let a = Math.max(0, best.t - FROZEN_SCAN_STEP);
+  let b = Math.min(FROZEN_MAX_STROKE, best.t + FROZEN_SCAN_STEP);
+  let c = b - g * (b - a);
+  let d = a + g * (b - a);
+  let fc = at(c);
+  let fd = at(d);
+  for (let i = 2; i < FROZEN_REFINE; i++) {
+    if (fc < fd) {
+      b = d;
+      d = c;
+      fd = fc;
+      c = b - g * (b - a);
+      fc = at(c);
+    } else {
+      a = c;
+      c = d;
+      fc = fd;
+      d = a + g * (b - a);
+      fd = at(d);
+    }
+  }
+  return { aim: au + s * best.t, throwRad: e0, residual: best.e };
 }
 
 /**

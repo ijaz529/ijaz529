@@ -4,18 +4,23 @@
  * (default) where the easiest next shot is, judged on the table as it will be after the shot (balls
  * the shot moves at their rest spots, pocketed ones gone).
  *
- * Candidates are scored by the worst of the nominal and the ±6 %/±12 % speed outcomes; any scratch
- * or miss at those speeds disqualifies, which favours forgiving strokes as a coach would.
+ * Candidates are scored by the worst of the nominal and the ±6 %/±12 % speed outcomes: the same cue
+ * line mis-hit at the true speed (no re-aim; underhits below power 1 are simulated at their real
+ * speed, not clamped to the power scale). Any scratch or miss at those speeds disqualifies, which
+ * favours forgiving strokes as a coach would. Overhits past full power can't be played, so they
+ * aren't tested; a stroke that would need them is used only when no fully tested one survives.
  *
  * Deterministic (Constitution III): the search is budgeted by evaluation count, coarse to fine, so a
  * smaller budget thins every power evenly instead of dropping the hard ones. The core never reads
  * the clock unless the caller sets the optional `timeCapMs` safety net, and the result reports when
  * that cap cut the search short.
  */
-import type { Ball, PhysicsParams, Recommendation, ShotPlan, ShotRequest, Stroke, TableLayout, Vec2 } from '../types';
+import { simulate } from '../physics/simulate';
+import { strikeBall } from '../physics/strike';
+import type { Ball, PhysicsParams, Recommendation, ShotPlan, ShotRequest, Stroke, TableLayout, Trajectory, Vec2 } from '../types';
 import { deg } from '../vec';
 import { planShot, shotGeometry } from './planner';
-import { POWER_SPEEDS, powerToSpeed, speedToPower } from './power';
+import { POWER_SPEEDS, powerToSpeed } from './power';
 
 const VERTS = [-0.4, -0.25, -0.1, 0.1, 0.25, 0.4];
 const SIDES = [-0.2, 0, 0.2];
@@ -45,9 +50,9 @@ export function toleranceQuality(tolDeg: number): number {
 /**
  * Quality (0..1) of the best next shot with the cue ball at `cuePos`. With `onlyBallId`, only that
  * ball counts (0 if it isn't an eligible object ball). With no object ball left at all, finishing
- * near the middle of the table scores best.
+ * near the middle of the table scores best. `params` only matters for a frozen cue ball (throw bound).
  */
-export function nextShotQuality(layout: TableLayout, cuePos: Vec2, excludeIds: string[], onlyBallId?: string): number {
+export function nextShotQuality(layout: TableLayout, cuePos: Vec2, excludeIds: string[], onlyBallId?: string, params?: PhysicsParams): number {
   const cue: Ball = { id: '__cue', kind: 'cue', pos: cuePos };
   const others = layout.balls.filter((b) => b.kind !== 'cue' && !excludeIds.includes(b.id));
   const all = [cue, ...others];
@@ -57,7 +62,7 @@ export function nextShotQuality(layout: TableLayout, cuePos: Vec2, excludeIds: s
     if (onlyBallId !== undefined && t.id !== onlyBallId) continue;
     any = true;
     for (const p of layout.table.pockets) {
-      const g = shotGeometry(layout.table, all, cue, t, p);
+      const g = shotGeometry(layout.table, all, cue, t, p, params);
       if (!g.makeable || g.blockersCue.length || g.blockersObject.length) continue;
       best = Math.max(best, toleranceQuality(deg(g.toleranceRad)));
     }
@@ -89,7 +94,7 @@ export function postShotLayout(layout: TableLayout, plan: Pick<ShotPlan, 'target
 
 export interface RecommendOptions {
   landing?: Vec2;
-  /** planShot simulations allowed (default FULL_EVALUATIONS). The result is a function of it. */
+  /** Simulations allowed, grid plans plus speed variants (default FULL_EVALUATIONS). The result is a function of it. */
   maxEvaluations?: number;
   /**
    * Optional wall-clock safety net (ms). Unset by default, so the core never reads the clock. When
@@ -98,7 +103,7 @@ export interface RecommendOptions {
   timeCapMs?: number;
   /** @deprecated Old wall-clock budget; now treated as `timeCapMs` (a reported safety net). */
   budgetMs?: number;
-  /** Test/debug hook: every simulated stroke and its score (null = scratch or miss). */
+  /** Test/debug hook: every planned grid stroke and its score (null = scratch or miss); not the speed variants. */
   onEvaluate?: (stroke: Stroke, score: number | null) => void;
 }
 
@@ -111,6 +116,8 @@ interface Scored {
   rest: Vec2;
   restError: number;
   nextQuality?: number;
+  /** The plan's cue-ball travel direction, so the speed variants keep the same cue line. */
+  aimDir: Vec2;
 }
 
 export function recommendStroke(layout: TableLayout, request: ShotRequest, params: PhysicsParams, opts: RecommendOptions = {}): Recommendation {
@@ -122,16 +129,32 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const pocketId = base.pocketId;
   const landing = opts.landing ?? request.landing;
   let evaluated = 0;
-  const lo = Math.max(1, Math.floor(base.minPower));
+  // From the bare capture minimum: between it and minPower the ball only just drops, which can still
+  // be the stroke that leaves the cue ball best.
+  const lo = Math.max(1, Math.floor(base.minPowerCapture ?? base.minPower));
   const powers: number[] = [];
   for (let p = lo; p <= 10; p++) powers.push(p);
   if (!powers.length || !base.makeable) return { stroke: base.stroke, score: -Infinity, reachable: false, evaluated: 0, rest: base.cueRest };
+  /** Reported at every return, so a cap that fires in any phase is never silent. */
+  const capped = (): { timedOut?: true } => (timedOut ? { timedOut: true } : {});
+  const cueId = layout.balls.find((b) => b.kind === 'cue')!.id;
+  const R = layout.table.ballRadius;
 
   /** Room for `n` more simulations? */
   const room = (n: number): boolean => {
     if (evaluated + n > maxEvaluations) return false;
     if (cap !== undefined && !timedOut && performance.now() - t0 > cap) timedOut = true;
     return !timedOut;
+  };
+
+  /** Outcome part of the score for a cue-ball rest spot and the other balls' paths. */
+  const outcome = (rest: Vec2, otherPaths: Trajectory[]): { objective: number; restError: number; nextQuality?: number } => {
+    if (landing) {
+      const restError = Math.hypot(rest.x - landing.x, rest.y - landing.y);
+      return { objective: -restError / LANDING_RADIUS, restError };
+    }
+    const nextQuality = nextShotQuality(postShotLayout(layout, { targetId: request.targetId, otherPaths }), rest, [request.targetId], undefined, params);
+    return { objective: 3 * nextQuality, restError: 0, nextQuality };
   };
 
   const evaluate = (stroke: Stroke): Scored | null => {
@@ -145,16 +168,7 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
     // Any cue-ball contact with another ball moves the layout in ways a player can't control (R-11).
     const contact = plan.cuePath.events.some((e) => e.kind === 'ball' && e.otherId !== request.targetId);
     const rest = plan.cueRest;
-    let objective: number;
-    let restError = 0;
-    let nextQuality: number | undefined;
-    if (landing) {
-      restError = Math.hypot(rest.x - landing.x, rest.y - landing.y);
-      objective = -restError / LANDING_RADIUS;
-    } else {
-      nextQuality = nextShotQuality(postShotLayout(layout, plan), rest, [request.targetId]);
-      objective = 3 * nextQuality;
-    }
+    const { objective, restError, nextQuality } = outcome(rest, plan.otherPaths);
     // Coach's bias: controllable speed, minimal spin. Hard strokes cost quadratically above 6.
     const penalty =
       0.06 * stroke.power +
@@ -165,7 +179,22 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
       (contact ? 0.5 : 0);
     const score = objective - penalty;
     opts.onEvaluate?.(stroke, score);
-    return { stroke, score, objective, penalty, rest, restError, ...(nextQuality !== undefined ? { nextQuality } : {}) };
+    return { stroke, score, objective, penalty, rest, restError, aimDir: plan.aimDir, ...(nextQuality !== undefined ? { nextQuality } : {}) };
+  };
+
+  /**
+   * The candidate mis-hit to cue-ball `speed`: its planned cue line (aimDir, squirt-compensated as
+   * planned), the same tip offset, no re-aim — what a player who misjudges the pace does. Returns
+   * the outcome objective, or null on a scratch or miss.
+   */
+  const misHit = (r: Scored, speed: number): number | null => {
+    evaluated++;
+    const st = strikeBall(r.aimDir, speed, r.stroke.side, r.stroke.vert, R, params.squirtMassRatio);
+    const init = layout.balls.map((b) => (b.id === cueId ? { id: b.id, pos: b.pos, vel: st.vel, omega: st.omega } : { id: b.id, pos: b.pos }));
+    const sim = simulate(layout.table, init, params, { record: false });
+    if (sim.final[request.targetId]?.pocket !== pocketId || sim.final[cueId]!.pocket !== null) return null;
+    const others = sim.trajectories.filter((t) => t.ballId !== cueId && t.ballId !== request.targetId && t.events.length > 0);
+    return outcome(sim.final[cueId]!.pos, others).objective;
   };
 
   // Coarse to fine: centre ball at three heights for every power first, then the rest of the grid.
@@ -180,8 +209,7 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
     const r = evaluate(s);
     if (r) results.push(r);
   }
-  const extra = timedOut ? { timedOut: true } : {};
-  if (!results.length) return { stroke: base.stroke, score: -Infinity, reachable: false, evaluated, rest: base.cueRest, ...extra };
+  if (!results.length) return { stroke: base.stroke, score: -Infinity, reachable: false, evaluated, rest: base.cueRest, ...capped() };
   results.sort((a, b) => b.score - a.score); // stable: ties keep evaluation order
 
   // A landing spot is reachable if any potting stroke ends near it; then only those strokes compete.
@@ -203,12 +231,12 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
         untestable = true; // an overhit past full power: can't be tested here
         continue;
       }
-      const v = evaluate({ ...r.stroke, power: speedToPower(v0 * k) });
-      if (!v) {
+      const objective = misHit(r, v0 * k);
+      if (objective === null) {
         failed = true;
         break;
       }
-      worst = Math.min(worst, v.objective);
+      worst = Math.min(worst, objective);
     }
     if (failed) continue;
     // Worst outcome, charged the nominal stroke's penalty (the variants are the same stroke, mis-hit).
@@ -233,7 +261,7 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
     evaluated,
     ...(fragile ? { fragile: true } : {}),
     ...(pick.nextQuality !== undefined ? { nextQuality: pick.nextQuality } : {}),
-    ...extra,
+    ...capped(),
   };
 }
 
@@ -242,7 +270,7 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
  * next ball. All zeros when `nextBallId` is not an object ball that is still to be played (the cue
  * ball, the current target in `excludeIds`, or unknown): there is no next shot to map.
  */
-export function positionHeatmap(layout: TableLayout, nextBallId: string, cols: number, rows: number, excludeIds: string[] = []): Float32Array {
+export function positionHeatmap(layout: TableLayout, nextBallId: string, cols: number, rows: number, excludeIds: string[] = [], params?: PhysicsParams): Float32Array {
   const out = new Float32Array(cols * rows);
   const next = layout.balls.find((b) => b.id === nextBallId);
   if (!next || next.kind === 'cue' || excludeIds.includes(nextBallId)) return out;
@@ -260,7 +288,7 @@ export function positionHeatmap(layout: TableLayout, nextBallId: string, cols: n
       let free = true;
       for (const b of occupied) if (Math.hypot(b.pos.x - p.x, b.pos.y - p.y) < 2 * R) free = false;
       if (!free) continue;
-      out[j * cols + i] = nextShotQuality(layout, p, exclude, nextBallId);
+      out[j * cols + i] = nextShotQuality(layout, p, exclude, nextBallId, params);
     }
   return out;
 }

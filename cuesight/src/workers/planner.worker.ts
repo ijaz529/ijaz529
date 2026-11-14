@@ -11,16 +11,22 @@ const ctx = self as unknown as DedicatedWorkerGlobalScope;
 const RECOMMEND_BUDGET_MS = 1200;
 /** Never search fewer strokes than this (every power at three tip heights, plus some robustness). */
 const MIN_EVALUATIONS = 60;
-/** Safety net only: stop a search that runs far over budget (reported as `timedOut`). */
-const RECOMMEND_TIME_CAP_MS = 4000;
+/**
+ * Safety net only, at the device budget for a position search (< 1.5 s, Constitution IV): stops a
+ * search the calibration under-estimated (reported as `timedOut`, so the app can say it is partial).
+ */
+const RECOMMEND_TIME_CAP_MS = 1500;
 
 /**
- * Cost of one planShot on this device, measured once (best of 3 after the first call warms the JIT),
- * so the evaluation budget is fixed per device and the core search stays deterministic for it.
+ * Cost of one planShot on this device, measured once per number of balls on the table (best of 3
+ * after the first call warms the JIT): simulation cost grows with the ball count, so one figure
+ * from the first, perhaps sparse, layout would over-budget a full rack. The evaluation budget is
+ * then fixed per device and ball count, and the core search stays deterministic for it.
  */
-let perEvalMs: number | null = null;
+const perEvalMs = new Map<number, number>();
 function evaluationBudget(layout: TableLayout, request: ShotRequest, params: PhysicsParams): number {
-  if (perEvalMs === null) {
+  const n = layout.balls.length;
+  if (!perEvalMs.has(n)) {
     let best = Infinity;
     try {
       const req = { targetId: request.targetId, ...(request.pocketId ? { pocketId: request.pocketId } : {}) };
@@ -32,10 +38,11 @@ function evaluationBudget(layout: TableLayout, request: ShotRequest, params: Phy
     } catch {
       // recommendStroke reports the error itself.
     }
-    if (Number.isFinite(best)) perEvalMs = Math.max(0.05, best);
+    if (Number.isFinite(best)) perEvalMs.set(n, Math.max(0.05, best));
   }
-  if (perEvalMs === null) return FULL_EVALUATIONS;
-  return Math.max(MIN_EVALUATIONS, Math.min(FULL_EVALUATIONS, Math.floor(RECOMMEND_BUDGET_MS / perEvalMs)));
+  const ms = perEvalMs.get(n);
+  if (ms === undefined) return FULL_EVALUATIONS;
+  return Math.max(MIN_EVALUATIONS, Math.min(FULL_EVALUATIONS, Math.floor(RECOMMEND_BUDGET_MS / ms)));
 }
 
 ctx.onmessage = (ev: MessageEvent<PlannerIn>) => {
@@ -61,7 +68,7 @@ ctx.onmessage = (ev: MessageEvent<PlannerIn>) => {
         post({ v: PROTOCOL_VERSION, type: 'suggestions', id: msg.id, items: suggestShots(msg.layout, msg.params, msg.max) });
         break;
       case 'heatmap': {
-        const values = positionHeatmap(msg.layout, msg.nextBallId, msg.cols, msg.rows, msg.excludeIds);
+        const values = positionHeatmap(msg.layout, msg.nextBallId, msg.cols, msg.rows, msg.excludeIds, msg.params);
         post({ v: PROTOCOL_VERSION, type: 'heatmap', id: msg.id, cols: msg.cols, rows: msg.rows, values }, [values.buffer]);
         break;
       }

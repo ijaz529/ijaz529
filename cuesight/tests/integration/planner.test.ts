@@ -140,13 +140,85 @@ describe('planShot', () => {
     expect(plan.minPower).toBeGreaterThan(1);
     expect(plan.obPocketed).toBe(false);
     expect(has(plan, 'too-soft')).toBe(true);
-    // Updated to the split messages: power 1 does not get the cue ball there or the object ball in.
+    // Split messages: power 1 does not get the cue ball there or the object ball in.
     expect(plan.warnings.find((w) => w.code === 'too-soft')!.message).toMatch(/won't reach the object ball|stops short/);
-    // minPowerSafe is the old "arrives with pace" minimum (≥ the bare minimum); above it nothing warns.
-    expect(plan.minPowerSafe!).toBeGreaterThanOrEqual(plan.minPower);
-    const ok = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: Math.ceil(plan.minPowerSafe!) + 1, side: 0, vert: 0 } }, P);
+    // minPower is the "arrives with pace" minimum; the bare capture minimum is at most that.
+    expect(plan.minPowerCapture!).toBeLessThanOrEqual(plan.minPower);
+    expect(plan.minPowerSafe).toBe(plan.minPower); // deprecated alias
+    const ok = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: Math.ceil(plan.minPower) + 1, side: 0, vert: 0 } }, P);
     expect(has(ok, 'too-soft')).toBe(false);
     expect(ok.obPocketed).toBe(true);
+  });
+
+  it('minPower is the minimum the app shows: played at it the ball drops and nothing says "too soft" (minPower backward compatible)', () => {
+    let seed = 99;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    let n = 0;
+    for (let tries = 0; n < 40 && tries < 2000; tries++) {
+      const ob = v2((rnd() * 2 - 1) * 1.1, (rnd() * 2 - 1) * 0.5);
+      const cue = v2((rnd() * 2 - 1) * 1.1, (rnd() * 2 - 1) * 0.5);
+      if (Math.hypot(ob.x - cue.x, ob.y - cue.y) < 0.2) continue;
+      const lay = layout({ cue, ob });
+      const base = planShot(lay, { targetId: 'ob' }, P, { record: false });
+      if (!base.makeable || base.minPower > 9.5 || base.minPower <= 1.05) continue;
+      n++;
+      const where = JSON.stringify({ cue, ob, pocket: base.pocketId, minPower: base.minPower });
+      expect(base.minPowerCapture!, where).toBeLessThanOrEqual(base.minPower);
+      const atMin = planShot(lay, { targetId: 'ob', pocketId: base.pocketId, stroke: { power: base.minPower, side: 0, vert: 0 } }, P, { record: false });
+      expect(atMin.obPocketed, where).toBe(true);
+      expect(has(atMin, 'too-soft'), where).toBe(false);
+      // Below it the advice quotes the same number the power meter shows.
+      const below = planShot(lay, { targetId: 'ob', pocketId: base.pocketId, stroke: { power: Math.max(1, base.minPower - 0.5), side: 0, vert: 0 } }, P, { record: false });
+      const soft = below.warnings.find((w) => w.code === 'too-soft');
+      if (soft && /Use power|Power \d/.test(soft.message)) expect(soft.message, where).toContain(base.minPower.toFixed(1));
+    }
+    expect(n).toBe(40);
+  });
+
+  it('a ball that only blocks the throw-corrected ghost is reported (blocker re-check after throw correction)', () => {
+    const ob = v2(0.4, 0.15);
+    const { lay } = cutLayout(ob, 'TR', 30, 0.7);
+    const stroke = { power: 3, side: 0, vert: 0 };
+    const open = planShot(lay, { targetId: 'ob', pocketId: 'TR', stroke }, P);
+    expect(open.throwShiftMm).toBeGreaterThan(1);
+    // Just inside the clearance (2R − 0.5 mm) of the corrected ghost, on the side it moved to, so
+    // the geometric ghost (and the cue-ball path to it) is clear of it.
+    const away = norm(sub(open.ghost, open.ghostUncorrected));
+    const blk = add(open.ghost, scale(away, 2 * R - 0.001));
+    expect(Math.hypot(blk.x - open.ghostUncorrected.x, blk.y - open.ghostUncorrected.y)).toBeGreaterThan(2 * R - 0.0005);
+    const cue = lay.balls.find((b) => b.id === 'cue')!.pos;
+    const plan = planShot(layout({ cue, ob, blk }), { targetId: 'ob', pocketId: 'TR', stroke }, P);
+    expect(plan.makeable).toBe(false);
+    const w = plan.warnings.find((x) => x.code === 'blocked-cue');
+    expect(w?.ballId).toBe('blk');
+    expect(w?.message).toMatch(/once the aim is corrected for throw/);
+  });
+
+  it('with no pocket makeable, auto mode falls back to the pocket with the widest open window (ranking tie-breaks)', () => {
+    // Cue ball frozen above the ball: the line of centres points straight at the bottom rail, so no
+    // pocket is makeable and every tolerance is 0. The fallback is the clearest view (TR), not the
+    // first pocket in table order (BL).
+    const ob = v2(0.9, 0.3);
+    const lay = layout({ cue: v2(0.9, 0.3 + 2 * R), ob });
+    const plan = planShot(lay, { targetId: 'ob' }, P);
+    expect(plan.makeable).toBe(false);
+    let widest = { id: '', half: -1 };
+    for (const pk of T.pockets) {
+      const w = pocketWindow(ob, pk, R);
+      if (w.ok && w.halfRad > widest.half) widest = { id: pk.id, half: w.halfRad };
+    }
+    expect(plan.pocketId).toBe(widest.id);
+    expect(plan.windowHalfDeg).toBeGreaterThan(0);
+  });
+
+  it('a cue ball that touches a jaw before the object ball gives no throw correction (probe checks ball-first contact)', () => {
+    // Cue ball pressed 1 mm into the top cushion next to the side pocket (vision noise): leaving
+    // toward the ball it clips the jaw first, so the probe's hit is not a clean ball-first contact.
+    const lay = layout({ cue: v2(-0.0772, 0.6074), ob: v2(0.1467, 0.5581) });
+    const plan = planShot(lay, { targetId: 'ob', pocketId: 'BR' }, P);
+    expect(plan.cuePath.events.find((e) => e.kind !== 'roll')?.kind).toBe('jaw');
+    expect(plan.throwDeg).toBe(0);
+    expect(plan.ghost).toEqual(plan.ghostUncorrected);
   });
 
   it("never says 'stops short' for a stroke the simulation pots (50 seeded layouts near the minimum)", () => {
@@ -163,11 +235,11 @@ describe('planShot', () => {
       if (Math.hypot(ob.x - cue.x, ob.y - cue.y) < 4 * R) continue;
       const lay = layout({ cue, ob });
       const probe = planShot(lay, { targetId: 'ob' }, P, { record: false });
-      if (!probe.makeable || probe.minPowerSafe! > 10 || probe.minPower - 0.2 < 1) continue;
+      if (!probe.makeable || probe.minPower > 10 || probe.minPowerCapture! - 0.2 < 1) continue;
       n++;
-      // Just below the bare minimum, and just below the "with pace" minimum (the old planner's
-      // minimum, where it said "stops short" for balls that drop).
-      const powers = { below: probe.minPower - 0.2, safe: probe.minPowerSafe! - 0.2 };
+      // Just below the bare capture minimum, and just below the "with pace" minimum (where the old
+      // planner said "stops short" for balls that drop).
+      const powers = { below: probe.minPowerCapture! - 0.2, safe: probe.minPower - 0.2 };
       for (const k of ['below', 'safe'] as const) {
         const plan = planShot(lay, { targetId: 'ob', pocketId: probe.pocketId, stroke: { power: powers[k], side: 0, vert: 0 } }, P, { record: false });
         const saysShort = plan.warnings.some((w) => /stops short/.test(w.message));
@@ -179,7 +251,7 @@ describe('planShot', () => {
       }
     }
     expect(n).toBe(50);
-    console.log(`of 50: potted at minPower − 0.2 ${potted.below}, at minPowerSafe − 0.2 ${potted.safe}; "stops short" ${short.below} / ${short.safe}`);
+    console.log(`of 50: potted at minPowerCapture − 0.2 ${potted.below}, at minPower − 0.2 ${potted.safe}; "stops short" ${short.below} / ${short.safe}`);
     // Not vacuous: balls do drop below the old minimum, and below the bare minimum they stop short.
     expect(potted.safe).toBeGreaterThan(25);
     expect(short.below).toBeGreaterThan(25);
@@ -191,7 +263,7 @@ describe('planShot', () => {
     const plan = planShot(lay, { targetId: 'ob', pocketId: 'TR', stroke: { power: 1.5, side: 0, vert: 0 } }, P);
     expect(plan.obPocketed).toBe(true);
     expect(plan.warnings.some((w) => /stops short/.test(w.message))).toBe(false);
-    expect(plan.minPower).toBeLessThanOrEqual(1.5);
+    expect(plan.minPowerCapture!).toBeLessThanOrEqual(1.5);
   });
 
   it("says the cue ball won't reach when it stops before the object ball", () => {

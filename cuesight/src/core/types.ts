@@ -178,17 +178,21 @@ export interface ShotPlan {
   stroke: Stroke;
   strokeSource: 'player' | 'recommended' | 'default';
   /**
-   * Lowest power (analytic chain) at which the cue ball reaches the object ball and the object ball
-   * just crosses the pocket's capture line (> 10: not even at full power). Below it the ball stops
-   * short. It is optimistic: the chain ignores the backspin a rolling cue ball gives the object
-   * ball, and the simulation needs ≈6 % more cue-ball speed (median of 50 random pool9 layouts,
-   * up to 12 %). Advice uses minPowerSafe.
+   * Lowest power (analytic chain) at which the object ball reaches the pocket mouth with some pace
+   * (≥ params.pocketArrivalSpeed); > 10: not even at full power. The minimum the app shows and the
+   * figure the "too soft" advice quotes (unchanged meaning).
    */
   minPower: number;
   /**
-   * Lowest power at which the object ball reaches the mouth with some pace (≥ pocketArrivalSpeed):
-   * the figure "too soft" advice quotes. Always set by planShot.
+   * Lowest power (analytic chain) at which the cue ball reaches the object ball and the object ball
+   * just crosses the pocket's capture line (≤ minPower; > 10: not even at full power). Below it the
+   * ball stops short; between it and minPower it only just drops. Optimistic: the chain ignores the
+   * backspin a rolling cue ball gives the object ball, and the simulation needs ≈6 % more cue-ball
+   * speed (median of 50 random pool9 layouts, up to 12 %). The position search starts here.
+   * Always set by planShot.
    */
+  minPowerCapture?: number;
+  /** @deprecated Same as minPower (kept for consumers of an earlier draft). */
   minPowerSafe?: number;
   cuePath: Trajectory;
   objectPath: Trajectory;
@@ -218,17 +222,21 @@ export interface ShotSuggestion {
 
 export interface Recommendation {
   stroke: Stroke;
-  /** Robust score (worst of nominal and ±6/±12 % speed); −Infinity only when no stroke pots the ball. */
+  /**
+   * Robust score (worst of the nominal stroke and the same cue line mis-hit at ±6/±12 % of its true
+   * speed); −Infinity only when no stroke pots the ball.
+   */
   score: number;
   reachable: boolean;
   restError?: number;
   rest?: Vec2 | null;
-  /** planShot simulations run (deterministic for a given layout, request and budget). */
+  /** Simulations run: grid plans plus speed variants (deterministic for a given layout, request and budget). */
   evaluated: number;
   /**
    * True when no stroke was verified against ±6/±12 % speed errors (every candidate checked scratched
    * or missed at some speed, or the evaluation budget ran out first): treat the stroke as possibly
-   * speed-sensitive and say so.
+   * speed-sensitive and say so. Overhits past full power can't be played and are never tested, so a
+   * stroke near full power is verified against its underhits only.
    */
   fragile?: boolean;
   /** Next-shot quality (0..1) of the chosen stroke on the post-shot table (default objective only). */
