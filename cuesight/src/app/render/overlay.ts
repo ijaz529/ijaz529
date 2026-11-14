@@ -7,7 +7,7 @@
 import type { Ball, PocketId, ShotPlan, TableSpec, Vec2 } from '../../core/types';
 import type { Calibration } from '../../vision/calibration';
 import { applyH, invert3 } from '../../vision/homography';
-import { DASH, PALETTE, UI } from './palette';
+import { DASH, HIT_RADIUS_PX, PALETTE, UI } from './palette';
 
 export interface FrameMapping {
   /** Processing-frame px → CSS px in the overlay canvas. */
@@ -258,7 +258,8 @@ export class Overlay {
     for (const b of d.balls) {
       const q = onR(b.pos);
       const e = onR({ x: b.pos.x + R, y: b.pos.y });
-      const rpx = Math.max(14, 2.2 * Math.hypot(e.x - q.x, e.y - q.y));
+      // At least a 44 CSS px target (22 px radius) for small, far balls; the nearest ball wins.
+      const rpx = Math.max(HIT_RADIUS_PX, 2.2 * Math.hypot(e.x - q.x, e.y - q.y));
       const dd = Math.hypot(q.x - tap.x, q.y - tap.y);
       if (dd < rpx && dd < bd) {
         bd = dd;

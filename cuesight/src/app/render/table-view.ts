@@ -8,7 +8,7 @@
  * static table is cached in an offscreen canvas and only redrawn when the size or table changes.
  */
 import type { Ball, PocketId, ShotPlan, TableSpec, Trajectory, Vec2 } from '../../core/types';
-import { DASH, PALETTE, UI } from './palette';
+import { DASH, HIT_RADIUS_PX, PALETTE, UI } from './palette';
 
 export interface TableViewData {
   table: TableSpec;
@@ -100,7 +100,8 @@ export class TableView {
     if (!this.table) return null;
     const p = this.toTable(q);
     let best: Ball | null = null;
-    let bd = this.table.ballRadius * slop + 12 / this.s;
+    // At least a 44 CSS px target (22 px radius) even on the small mini-map; the nearest ball wins.
+    let bd = Math.max(this.table.ballRadius * slop + 12 / this.s, HIT_RADIUS_PX / this.s);
     for (const b of balls) {
       const d = Math.hypot(b.pos.x - p.x, b.pos.y - p.y);
       if (d < bd) {

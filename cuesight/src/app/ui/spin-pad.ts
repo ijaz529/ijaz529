@@ -2,6 +2,7 @@
  * Tip-position control: tap or drag on the cue-ball face (FR-018). The dashed ring is the miscue
  * limit (½ R); the hollow ring shows the recommended tip.
  */
+import { MISCUE_LIMIT } from '../../core/physics/analytic';
 import { clampTip } from '../../core/physics/strike';
 import { describeSpin } from '../../core/shot/power';
 import { sphereBody, sphereDefs } from './spin-ball';
@@ -13,6 +14,11 @@ export interface SpinPad {
 
 const NS = 'http://www.w3.org/2000/svg';
 let padId = 0;
+
+/** The slider's value for assistive tech: tip offset from centre in % of the ball radius (0 … 50, the miscue limit), and its words. */
+export function padValue(side: number, vert: number): { now: number; text: string } {
+  return { now: Math.round(Math.min(MISCUE_LIMIT, Math.hypot(side, vert)) * 100), text: describeSpin({ side, vert }) };
+}
 
 export function createSpinPad(onChange: (side: number, vert: number) => void): SpinPad {
   const size = 132;
@@ -26,6 +32,10 @@ export function createSpinPad(onChange: (side: number, vert: number) => void): S
   svg.setAttribute('height', String(size));
   svg.setAttribute('role', 'slider');
   svg.setAttribute('aria-label', 'Cue tip position: drag to set spin');
+  // ARIA 1.2 requires a slider's value: the offset magnitude in % of R; the words say where.
+  svg.setAttribute('aria-valuemin', '0');
+  svg.setAttribute('aria-valuemax', String(Math.round(MISCUE_LIMIT * 100)));
+  svg.setAttribute('aria-valuenow', '0');
   svg.setAttribute('aria-valuetext', 'centre ball');
   svg.setAttribute('tabindex', '0');
   const id = `pad${++padId}`;
@@ -44,7 +54,9 @@ export function createSpinPad(onChange: (side: number, vert: number) => void): S
     if (node === tip) {
       tipShadow.setAttribute('cx', String(c + side * r));
       tipShadow.setAttribute('cy', String(c - vert * r + 2));
-      svg.setAttribute('aria-valuetext', describeSpin({ side, vert }));
+      const v = padValue(side, vert);
+      svg.setAttribute('aria-valuenow', String(v.now));
+      svg.setAttribute('aria-valuetext', v.text);
     }
   };
   const fromEvent = (e: PointerEvent) => {

@@ -45,6 +45,12 @@ export const DASH = {
   other: [8, 4, 2, 4],
 };
 
+/**
+ * Smallest ball pick radius in CSS px on the 2D table, the mini-map and the camera overlay: a 44 px
+ * touch target (Constitution: ≥ 44 CSS px targets) even where a ball is drawn a few px wide.
+ */
+export const HIT_RADIUS_PX = 22;
+
 export function rgbCss(rgb: [number, number, number] | undefined, fallback = '#ddd'): string {
   if (!rgb) return fallback;
   return `rgb(${Math.round(rgb[0])},${Math.round(rgb[1])},${Math.round(rgb[2])})`;

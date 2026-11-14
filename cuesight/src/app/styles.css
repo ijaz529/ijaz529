@@ -904,7 +904,8 @@ body[data-mode='snap'] .toolbar {
   transform: none;
 }
 .sheet-handle::after {
-  /* ≥ 44 px tall hit area without a taller visual */
+  /* ≥ 44 px tall hit area without a taller visual: the 8 px gap above the sheet, the handle, and the
+     top 10 px of the sheet body (padding and headings, no controls at rest). */
   content: '';
   position: absolute;
   left: 0;
@@ -914,6 +915,9 @@ body[data-mode='snap'] .toolbar {
 }
 .sheet-handle {
   position: relative;
+  /* Above the sheet body: at the peek its fade mask makes it a stacking context that would otherwise
+     paint over (and take taps from) the lower 10 px of the handle's hit area. */
+  z-index: 1;
 }
 .grabber {
   width: 38px;
@@ -1710,7 +1714,7 @@ dialog::backdrop {
 }
 .settings select,
 .settings input[type='number'] {
-  min-height: 40px;
+  min-height: 44px;
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid var(--border);

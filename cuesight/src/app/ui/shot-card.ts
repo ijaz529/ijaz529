@@ -8,6 +8,7 @@ import { squirtOffsetText, throwSentence } from '../../core/shot/coach';
 import type { ShotPlan, WarningCode } from '../../core/types';
 import { fractionGlyphSvg, type CutSide } from './fraction-glyph';
 import { iconMarkup } from './icons';
+import { writeHtml } from './patch';
 import { powerMeterSvg, powerText } from './power-meter';
 import { spinBallSvg, spinText } from './spin-ball';
 
@@ -118,13 +119,45 @@ export function ballChip(label: string, color?: string, stripe?: boolean): strin
 
 const cutSideOf = (s: ShotPlan['cutSide']): CutSide => (s > 0 ? 'left' : s < 0 ? 'right' : 'straight');
 
+/** Key of a card control, to keep keyboard focus on it across a re-render (same pocket, same ball). */
+const cardFocusKey = (e: Element): string | null => {
+  const d = (e as HTMLElement).dataset;
+  return d?.cardAct ? `${d.cardAct}:${d.pocket ?? d.id ?? ''}` : null;
+};
+
+/** Where to strike in millimetres from the centre ("11 mm below centre, 7 mm right"), or null. */
+export function tipOffsetMm(stroke: { side: number; vert: number }, ballRadius: number): string | null {
+  if (!(ballRadius > 0)) return null;
+  const mm = (f: number) => Math.round(Math.abs(f) * ballRadius * 1000);
+  const parts: string[] = [];
+  if (mm(stroke.vert) >= 1) parts.push(`${mm(stroke.vert)} mm ${stroke.vert > 0 ? 'above' : 'below'} centre`);
+  if (mm(stroke.side) >= 1) parts.push(`${mm(stroke.side)} mm ${stroke.side > 0 ? 'right' : 'left'}`);
+  return parts.length ? parts.join(', ') : 'centre';
+}
+
+/** Last plan and context drawn into each card element (the store re-renders on every flush). */
+const drawn = new WeakMap<HTMLElement, { plan: ShotPlan | null; ctx: string }>();
+
+/**
+ * Draws the shot card. Runs on every store flush, so it returns early when the plan (same object)
+ * and the context are unchanged: rebuilding the markup would drop keyboard focus and a screen
+ * reader's place. When it does redraw, focus stays on the same pocket or ball button.
+ */
 export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: CardContext): void {
+  const ctxKey = JSON.stringify(ctx);
+  const last = drawn.get(el);
+  if (last && last.plan === plan && last.ctx === ctxKey) return;
+  drawn.set(el, { plan, ctx: ctxKey });
   if (!plan) {
     delete el.dataset.shot;
-    el.innerHTML = `<div class="card empty">
+    writeHtml(
+      el,
+      `<div class="card empty">
       <span class="empty-icon">${iconMarkup('hand', 26)}</span>
       <div class="empty-text"><p class="hint">${esc(ctx.hint)}</p>${ctx.status ? `<p class="sub">${esc(ctx.status)}</p>` : ''}</div>
-    </div>${ctx.pockets?.length ? pocketPicker(ctx.pockets) : ballPicker(ctx.balls ?? [])}`;
+    </div>${ctx.pockets?.length ? pocketPicker(ctx.pockets) : ballPicker(ctx.balls ?? [])}`,
+      cardFocusKey,
+    );
     return;
   }
   const p = plan.stroke;
@@ -143,7 +176,12 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
   const riskChips = (ctx.risks ?? []).map((r) => `<li class="warn-chip warn-risk">${iconMarkup('alert', 18)}<span>Scratch risk: ${esc(RISK_HOW[r.scratchIf].toLowerCase())} and the cue ball goes in the ${esc(r.pocketName)}.</span></li>`).join('');
   // A shot that cannot happen as planned gets no stroke instructions (no power, no spin, no aim fixes).
   const noStroke = !plan.makeable || plan.warnings.some((w) => w.code === 'cb-short');
-  const warn = plan.makeable ? chips(shown) + riskChips : '';
+  // Makeable: the headline warning is already shown above the hero (.head-warn); the list below has
+  // the others, so no warning appears twice.
+  const warn = plan.makeable ? chips(shown.filter((w) => !head || w.message !== head.message)) + riskChips : '';
+  // A margin exists only for a shot that can be made (the planner's value goes negative past 90°).
+  const margin = plan.makeable && plan.toleranceMm > 0;
+  const tipMm = ctx.ballRadius ? tipOffsetMm(p, ctx.ballRadius) : null;
   const src =
     plan.strokeSource === 'player'
       ? `<span class="badge">${iconMarkup('hand', 14)}your stroke</span>`
@@ -190,7 +228,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
       <div class="blocked-acts">${ctx.altPocket ? `<button type="button" class="btn primary" data-card-act="alt" data-pocket="${esc(ctx.altPocket.id)}">${iconMarkup('target', 18)}<span>Try the ${esc(ctx.altPocket.name)}</span></button>` : ''}<button type="button" class="btn secondary" data-card-act="suggest">${iconMarkup('sparkles', 18)}<span>Suggest a shot</span></button></div>
       <span class="sr-only">Cut <span data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>, ${esc(phrase)}. No stroke: this shot is not makeable.<span hidden data-testid="power">${powerStr}<small>/10</small></span><span hidden data-testid="spin">${esc(spinWords)}</span></span>
     </div>`;
-  el.innerHTML = `
+  const html = `
   <article class="card shot${plan.makeable ? '' : ' not-makeable'}${head && plan.makeable ? ' has-warn' : ''}" data-testid="shot-card" aria-label="Shot plan">
     <header class="shot-head">
       <h2 class="title">${ballChip(ctx.targetLabel, ctx.targetColor, ctx.targetStripe)}<span class="sr-only">Ball </span><span class="target-label${/^\d+$/.test(ctx.targetLabel) ? ' sr-only' : ''}">${esc(ctx.targetLabel)}</span>${iconMarkup('arrow-right', 18, 'arrow')}<span class="pocket-name">${esc(ctx.pocketName)}</span></h2>
@@ -208,8 +246,9 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     ${
       ctx.showDetails
         ? `<dl class="details">
-      <div><dt>Contact tolerance</dt><dd>±${plan.toleranceMm.toFixed(1)} mm</dd></div>
-      <div><dt>Aim tolerance</dt><dd>±${plan.toleranceDeg.toFixed(2)}°</dd></div>
+      <div><dt>Contact tolerance</dt><dd>${margin ? `±${plan.toleranceMm.toFixed(1)} mm` : '—'}</dd></div>
+      <div><dt>Aim tolerance</dt><dd>${margin && plan.toleranceDeg > 0 ? `±${plan.toleranceDeg.toFixed(2)}°` : '—'}</dd></div>
+      ${tipMm && !noStroke ? `<div><dt>Tip offset</dt><dd>${esc(tipMm)}</dd></div>` : ''}
       <div><dt>Pocket window</dt><dd>±${plan.windowHalfDeg.toFixed(2)}°</dd></div>
       <div><dt>CB speed</dt><dd>${powerToSpeed(power).toFixed(1)} m/s</dd></div>
       <div><dt>CB speed at contact</dt><dd>${plan.cbSpeedAtContact.toFixed(2)} m/s</dd></div>
@@ -219,6 +258,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
         : ''
     }
   </article>`;
+  writeHtml(el, html, cardFocusKey);
   // A new target or pocket: bring the headline back into view inside the sheet/panel.
   const key = `${plan.targetId}>${plan.pocketId}`;
   if (el.dataset.shot !== key) {
