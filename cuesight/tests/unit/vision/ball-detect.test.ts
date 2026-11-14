@@ -47,6 +47,12 @@ describe('ball detection on video-like (4:2:0) frames', () => {
     const balls = detectBalls(frame, cal, sc.table, det.cloth);
     expect(balls.length).toBe(sc.balls.length);
     expect(balls.filter((b) => b.isCue)).toHaveLength(1);
+    // The flagged ball must BE the cue ball (up to the table's 180° symmetry), not just any ball.
+    const truth = sc.balls.map((b) => b.pos);
+    const sumErr = (sign: number) => truth.reduce((a, t) => a + Math.min(...balls.map((b) => Math.hypot(b.pos.x - sign * t.x, b.pos.y - sign * t.y))), 0);
+    const sign = sumErr(1) <= sumErr(-1) ? 1 : -1;
+    const cue = balls.find((b) => b.isCue)!;
+    expect(Math.hypot(cue.pos.x - sign * truth[0]!.x, cue.pos.y - sign * truth[0]!.y)).toBeLessThan(0.03);
   });
 });
 
