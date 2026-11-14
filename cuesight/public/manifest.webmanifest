@@ -1,0 +1,12 @@
+{
+  "name": "CueSight — pool & snooker shot trainer",
+  "short_name": "CueSight",
+  "description": "Point your camera at the table: aim line, power, spin and cue-ball path for any shot. On-device.",
+  "start_url": "./?mode=camera",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f1a14",
+  "theme_color": "#0f1a14",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

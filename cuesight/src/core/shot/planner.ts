@@ -120,11 +120,14 @@ export interface PlanOptions {
   recommended?: Stroke;
   /** Skip recording trajectories (searches). */
   record?: boolean;
+  /** View-relative pocket names for messages (e.g. "far-left corner"). */
+  names?: Partial<Record<PocketId, string>>;
 }
 
 export function planShot(layout: TableLayout, request: ShotRequest, params: PhysicsParams, opts: PlanOptions = {}): ShotPlan {
   const { table, balls } = layout;
   const R = table.ballRadius;
+  const nameOf = (id: PocketId) => opts.names?.[id] ?? POCKET_NAMES[id];
   const cue = balls.find((b) => b.kind === 'cue');
   const target = balls.find((b) => b.id === request.targetId);
   if (!cue) throw new Error('No cue ball on the table');
@@ -149,14 +152,14 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
 
   if (!geo.makeable) {
     const why = !geo.window.ok
-      ? `the ${POCKET_NAMES[geo.pocket.id]} isn't reachable from where the ball sits`
+      ? `the ${nameOf(geo.pocket.id)} isn't reachable from where the ball sits`
       : !geo.ghostOnTable
         ? 'the cue ball can\'t get to the contact spot (it would be inside the cushion)'
         : `the cut is too thin (${cutDeg.toFixed(0)}°)`;
     const alt = alternatives[0];
     warnings.push({
       code: 'not-makeable',
-      message: `Not makeable: ${why}.${alt ? ` Try the ${POCKET_NAMES[alt.pocketId]}.` : ''}`,
+      message: `Not makeable: ${why}.${alt ? ` Try the ${nameOf(alt.pocketId)}.` : ''}`,
     });
   }
   for (const b of geo.blockersCue) warnings.push({ code: 'blocked-cue', message: `Cue-ball path blocked by ${b.label ?? b.id}.`, ballId: b.id });
@@ -214,7 +217,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   const cueFirst = sim.firstHits[cue.id];
   const obHit = sim.firstHits[target.id];
 
-  if (scratch) warnings.push({ code: 'scratch', message: `Scratch: the cue ball goes in the ${POCKET_NAMES[sim.final[cue.id]!.pocket!]}.` });
+  if (scratch) warnings.push({ code: 'scratch', message: `Scratch: the cue ball goes in the ${nameOf(sim.final[cue.id]!.pocket!)}.` });
   if (geo.makeable && geo.blockersCue.length === 0 && cueFirst && cueFirst.other !== target.id) {
     const b = balls.find((x) => x.id === cueFirst.other);
     warnings.push({ code: 'kiss', message: `Cue ball contacts ${b?.label ?? cueFirst.other} first.`, ballId: cueFirst.other });
@@ -231,7 +234,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   if (geo.makeable && !obPocketed && !softWarned && geo.blockersObject.length === 0 && geo.blockersCue.length === 0) {
     warnings.push({
       code: 'ob-missed',
-      message: obPocket ? `Simulated object ball drops in the ${POCKET_NAMES[obPocket]} instead.` : 'Simulated object ball misses — adjust speed or spin.',
+      message: obPocket ? `Simulated object ball drops in the ${nameOf(obPocket)} instead.` : 'Simulated object ball misses — adjust speed or spin.',
     });
   }
 

@@ -23,8 +23,15 @@ export interface DetectedBall {
   score: number;
   rgb: [number, number, number];
   label: string;
-  /** Fraction of white pixels (diagnostic). */
+  /** Cue-ball likelihood score (diagnostic). */
   white: number;
+  /** Pixel count of the ball's blob in the rectified image. */
+  px: number;
+}
+
+function meanSat(r: number, g: number, b: number): number {
+  const mx = Math.max(r, g, b);
+  return mx > 0 ? (mx - Math.min(r, g, b)) / mx : 0;
 }
 
 export interface BallDetectOptions {
@@ -219,7 +226,20 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
       px[q * 2] = kk % w;
       px[q * 2 + 1] = Math.floor(kk / w);
     }
-    const centres = kmeans(px, tail, k);
+    let centres = kmeans(px, tail, k);
+    // Two real balls can't be closer than 2R: merge over-splits (e.g. chroma bleed in 4:2:0 video).
+    while (k >= 2) {
+      let close = false;
+      for (let a = 0; a < k && !close; a++)
+        for (let b = a + 1; b < k; b++)
+          if (Math.hypot(centres[a * 2]! - centres[b * 2]!, centres[a * 2 + 1]! - centres[b * 2 + 1]!) < 1.7 * rp) {
+            close = true;
+            break;
+          }
+      if (!close) break;
+      k--;
+      centres = kmeans(px, tail, k);
+    }
     const assign = new Int32Array(tail);
     for (let q = 0; q < tail; q++) {
       let best = 0;
@@ -306,25 +326,49 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
       if (Math.abs(pos.x) > table.length / 2 || Math.abs(pos.y) > table.width / 2) continue;
       pos.x = Math.max(-(table.length / 2 - R), Math.min(table.length / 2 - R, pos.x));
       pos.y = Math.max(-(table.width / 2 - R), Math.min(table.width / 2 - R, pos.y));
-      let hue = (Math.atan2(hsy, hsx) * 180) / Math.PI;
-      if (hue < 0) hue += 360;
-      const meanV = vSum / n;
+      void hsx;
+      void hsy;
+      // Name from the MEAN colour (robust to chroma subsampling); stripes show lots of white too.
+      const mr = r / n;
+      const mg = g / n;
+      const mb = b / n;
+      const mhsv = [0, 0, 0];
+      rgbToHsv(mr, mg, mb, mhsv);
       const whiteFrac = white / n;
       const colFrac = colored / n;
-      const label = whiteFrac > 0.55 && colFrac < 0.12 ? 'white' : colFrac < 0.15 ? colourName(0, 0, meanV < 0.3 ? 0.1 : 0.9) : colourName(hue, 0.6, meanV < 0.3 ? 0.3 : meanV + 0.2);
+      const ms = mhsv[1]!;
+      const base = vSum / n < 0.25 ? 'black' : ms < 0.12 ? 'white' : colourName(mhsv[0]!, 0.6, Math.max(0.3, mhsv[2]!));
+      const label = base !== 'white' && base !== 'black' && whiteFrac > 0.25 ? `${base} stripe` : base;
       balls.push({
         pos,
         image: applyH(calib.HR, pos.x, pos.y),
         isCue: false,
         score: Math.min(1, n / a1),
         rgb: [r / n, g / n, b / n],
-        label: label === 'white' ? 'cue' : `${label}${whiteFrac > 0.25 && colFrac > 0.15 ? ' stripe' : ''}`,
-        // Cue-ball likelihood: lots of white, almost no saturated pixels, low mean saturation.
-        white: whiteFrac - 2.5 * colFrac - satSum / n,
+        label,
+        // Cue-ball likelihood: lots of white, almost no saturated pixels, and a neutral MEAN colour
+        // (the saturation of the mean RGB survives video chroma subsampling, unlike per-pixel S).
+        white: whiteFrac - 2.5 * colFrac - 2 * meanSat(r / n, g / n, b / n) - 0.25 * (satSum / n),
+        px: n,
       });
     }
     void comp;
   }
+  // De-duplicate: two real balls can't be closer than ~2R (a blob cut in two by the opening, or
+  // chroma bleed). Keep the larger piece, nudged toward the pixel-weighted mean.
+  balls.sort((a, b) => b.px - a.px);
+  for (let i = 0; i < balls.length; i++)
+    for (let j = balls.length - 1; j > i; j--) {
+      const a = balls[i]!;
+      const b = balls[j]!;
+      if (Math.hypot(a.pos.x - b.pos.x, a.pos.y - b.pos.y) < 1.7 * R) {
+        const w = a.px + b.px;
+        a.pos = { x: (a.pos.x * a.px + b.pos.x * b.px) / w, y: (a.pos.y * a.px + b.pos.y * b.px) / w };
+        a.image = applyH(calib.HR, a.pos.x, a.pos.y);
+        a.px = w;
+        balls.splice(j, 1);
+      }
+    }
   // Cue ball: the whitest, least coloured ball.
   let cue = -1;
   for (let i = 0; i < balls.length; i++) if (balls[i]!.white > 0.0 && (cue < 0 || balls[i]!.white > balls[cue]!.white)) cue = i;
@@ -332,7 +376,7 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
     balls[cue]!.isCue = true;
     balls[cue]!.label = 'cue';
   }
-  for (const b of balls) if (!b.isCue && b.label === 'cue') b.label = 'white?';
+  for (const b of balls) if (!b.isCue && b.label === 'white') b.label = 'white?';
   return balls;
 }
 

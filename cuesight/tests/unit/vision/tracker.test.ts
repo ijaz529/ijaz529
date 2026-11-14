@@ -17,6 +17,7 @@ const det = (x: number, y: number, isCue = false): DetectedBall => ({
   rgb: [255, 255, 255],
   label: isCue ? 'cue' : 'red',
   white: isCue ? 0.8 : -1,
+  px: 100,
 });
 
 describe('tracker', () => {

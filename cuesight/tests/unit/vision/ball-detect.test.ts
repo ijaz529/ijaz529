@@ -3,7 +3,52 @@ import { detectBalls } from '../../../src/vision/ball-detect';
 import { calibrationFromCorners } from '../../../src/vision/calibration';
 import { renderSyntheticTable } from '../../../src/vision/synth/render';
 import { detectTable } from '../../../src/vision/table-detect';
+import type { Frame } from '../../../src/vision/image';
 import { POSES, scene } from '../../helpers/scenes';
+
+/** Simulate video chroma subsampling (YUV 4:2:0): full-res luma, 2×2-averaged chroma. */
+function chroma420(f: Frame): Frame {
+  const { width: w, height: h, data } = f;
+  const out = new Uint8ClampedArray(data.length);
+  for (let j = 0; j < h; j += 2)
+    for (let i = 0; i < w; i += 2) {
+      let cb = 0;
+      let cr = 0;
+      const ys: number[] = [];
+      for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
+        const k = ((j + dy) * w + i + dx) * 4;
+        const r = data[k]!;
+        const g = data[k + 1]!;
+        const b = data[k + 2]!;
+        ys.push(0.299 * r + 0.587 * g + 0.114 * b);
+        cb += -0.168736 * r - 0.331264 * g + 0.5 * b;
+        cr += 0.5 * r - 0.418688 * g - 0.081312 * b;
+      }
+      cb /= 4;
+      cr /= 4;
+      [[0, 0], [1, 0], [0, 1], [1, 1]].forEach(([dx, dy], q) => {
+        const k = ((j + dy!) * w + i + dx!) * 4;
+        const y = ys[q]!;
+        out[k] = y + 1.402 * cr;
+        out[k + 1] = y - 0.344136 * cb - 0.714136 * cr;
+        out[k + 2] = y + 1.772 * cb;
+        out[k + 3] = 255;
+      });
+    }
+  return { width: w, height: h, data: out };
+}
+
+describe('ball detection on video-like (4:2:0) frames', () => {
+  it.each(['corner', 'end'] as const)('%s view: no over-splitting, cue found', (pose) => {
+    const sc = scene(pose);
+    const frame = chroma420(renderSyntheticTable(sc));
+    const det = detectTable(frame)!;
+    const cal = calibrationFromCorners(det.corners, sc.table, frame.width, frame.height)!;
+    const balls = detectBalls(frame, cal, sc.table, det.cloth);
+    expect(balls.length).toBe(sc.balls.length);
+    expect(balls.filter((b) => b.isCue)).toHaveLength(1);
+  });
+});
 
 describe.each(['end', 'side', 'corner', 'overhead'] as const)('ball detection (%s view)', (pose) => {
   const sc = scene(pose);
