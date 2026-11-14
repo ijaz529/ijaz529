@@ -2,7 +2,7 @@
  * Tiny observable store: a single mutable state object; `update()` mutates and schedules one
  * render per animation frame for all subscribers.
  */
-import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, TableLayout, TableSpec, PhysicsParams, Vec2 } from '../core/types';
+import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, StrokeRisk, TableLayout, TableSpec, PhysicsParams, Vec2 } from '../core/types';
 import type { Calibration } from '../vision/calibration';
 import type { LockStatus } from '../vision/tracker';
 import type { Settings } from './settings';
@@ -33,7 +33,7 @@ export interface AppState {
   pocketId: PocketId | null;
   strokeMode: 'recommended' | 'mine';
   myStroke: Stroke;
-  recommended: { key: string; stroke: Stroke | null; pending: boolean; reachable: boolean; evaluated: number } | null;
+  recommended: { key: string; stroke: Stroke | null; pending: boolean; reachable: boolean; evaluated: number; risks?: StrokeRisk[] } | null;
   landing: Vec2 | null;
   interaction: Interaction;
   calibTaps: Vec2[];

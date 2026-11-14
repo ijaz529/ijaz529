@@ -13,20 +13,20 @@
  *
  * Photos are kept in memory only for this session and released on Start over / leaving Snap (FR-122).
  */
-import { describeSpin, powerToSpeed, speedWord } from '../../core/shot/power';
+import { powerToSpeed, speedReference, speedWord } from '../../core/shot/power';
 import type { Ball, PocketId, Vec2 } from '../../core/types';
 import type { VisionResult } from '../../vision/pipeline';
 import type { KnownBall, PlayerViewInput, PlayerViewResult } from '../../vision/player-view';
 import { PROTOCOL_VERSION, type VisionOut } from '../../workers/protocol';
 import { startCamera, stopCamera } from '../camera';
-import { Overlay, containMapping, type OverlayData } from '../render/overlay';
+import { Overlay, type OverlayData } from '../render/overlay';
 import { rgbCss } from '../render/palette';
 import type { AppState } from '../store';
 import { iconMarkup, type IconName } from '../ui/icons';
 import { powerMeterSvg, powerText } from '../ui/power-meter';
 import { spinBallSvg, spinText } from '../ui/spin-ball';
-import { PhotoCanvas, drawGuide, drawInset, drawTaps } from './draw';
-import { buildPlayerGuide, confidenceLabel, scaleFocal, strikeHeadline, type PlayerGuide } from './guide';
+import { PhotoCanvas, drawGuide, drawTaps } from './draw';
+import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
 import { decodePhoto, frameOf, loadSample, photoFromVideo, type Photo } from './photo';
 import { SNAP_MESSAGES, snapStage, type SnapEvent, type SnapSession } from './session';
 
@@ -50,6 +50,10 @@ export interface SnapHost {
   layoutChanged(): void;
   /** Schedule a re-render (UI-only change). */
   refresh(): void;
+  /** The pocket's name as the player sees it ("far right corner"). */
+  pocketName?(id: PocketId): string;
+  /** Pockets the shown stroke risks scratching in (from the recommendation's robustness probes). */
+  riskPockets?(): PocketId[];
 }
 
 type Which = 'table' | 'player';
@@ -92,6 +96,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
         <div class="snap-top-actions" id="snap-top-actions"></div>
       </div>
       <p class="snap-instr" id="snap-instr" role="status" aria-live="polite"></p>
+      <button type="button" class="snap-notes" id="snap-notes" data-act="notes" aria-expanded="false" aria-controls="snap-warn" hidden></button>
       <ul class="snap-warn" id="snap-warn" hidden></ul>
       <div class="snap-cta" id="snap-cta"></div>
     </header>
@@ -101,13 +106,16 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       <span class="snap-fit" id="snap-fit" hidden></span>
       <div class="snap-busy" id="snap-busy" hidden><span class="spinner big" aria-hidden="true"></span><p></p></div>
       <button type="button" class="icon-btn snap-close" data-act="close-inspect" aria-label="Back to the table">${iconMarkup('close', 20)}</button>
+      <button type="button" class="snap-zoom" data-act="zoom" aria-pressed="true" hidden>${iconMarkup('image', 16)}<span>Whole photo</span></button>
     </div>
-    <section class="snap-hud glass" id="snap-hud" aria-label="How to play it">
-      <div class="hud-inset"><canvas id="snap-inset" aria-hidden="true"></canvas><div class="hud-spin" id="hud-spin"></div><span class="hud-tag">Cue ball</span></div>
+    <div class="snap-cta-bar" id="snap-cta-bar"></div>
+    <section class="snap-hud" id="snap-hud" aria-label="How to play it">
+      <div class="hud-inset" data-mode="spin"><div class="hud-spin" id="hud-spin"></div></div>
       <div class="hud-body">
         <p class="hud-strike" id="hud-strike"></p>
         <div class="hud-power"><div class="power-meter" id="hud-meter" role="img"></div><div class="hud-power-txt"><span class="num" id="hud-power"></span><span id="hud-speed"></span></div></div>
         <p class="hud-aim" id="hud-aim"></p>
+        <div class="hud-acts" id="hud-acts"></div>
       </div>
     </section>
     <div class="snap-dock" id="snap-dock" role="toolbar" aria-label="Fix the layout">
@@ -126,7 +134,6 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   const photoCanvas = new PhotoCanvas($<HTMLCanvasElement>('#snap-canvas'));
   const overlayCanvas = $<HTMLCanvasElement>('#snap-overlay');
   const overlay = new Overlay(overlayCanvas);
-  const insetCanvas = $<HTMLCanvasElement>('#snap-inset');
   const thumbCanvas = $<HTMLCanvasElement>('#snap-thumb');
   const busy = $<HTMLElement>('#snap-busy');
   const fitEl = $<HTMLElement>('#snap-fit');
@@ -134,7 +141,13 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   const chip = $<HTMLElement>('#snap-chip');
   const instr = $<HTMLElement>('#snap-instr');
   const warnEl = $<HTMLElement>('#snap-warn');
-  const cta = $<HTMLElement>('#snap-cta');
+  const notesBtn = $<HTMLButtonElement>('#snap-notes');
+  let notesOpen = false;
+  // The next action (Take photo / Choose…) lives at the bottom of the screen, in thumb reach while
+  // crouched one-handed; the old slot in the top card stays empty.
+  const cta = $<HTMLElement>('#snap-cta-bar');
+  const zoomBtn = $<HTMLButtonElement>('.snap-zoom');
+  let zoomed = true;
   const topActions = $<HTMLElement>('#snap-top-actions');
   const hudStrike = $<HTMLElement>('#hud-strike');
   const hudMeter = $<HTMLElement>('#hud-meter');
@@ -142,6 +155,15 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   const hudSpeed = $<HTMLElement>('#hud-speed');
   const hudAim = $<HTMLElement>('#hud-aim');
   const hudSpin = $<HTMLElement>('#hud-spin');
+  const hudActs = $<HTMLElement>('#hud-acts');
+  // The guide's "how to play it" lives at the top of the shot sheet (its peek on a phone, the top of
+  // the side panel in landscape), so the photo gets the rest of the screen.
+  const hudEl = $<HTMLElement>('#snap-hud');
+  document.getElementById('sheet-body')?.prepend(hudEl);
+  hudEl.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-hud-pocket]');
+    if (b?.dataset.hudPocket) host.selectPocket(b.dataset.hudPocket as PocketId);
+  });
   const files: Record<string, HTMLInputElement> = {
     'table': $('#snap-file-table'),
     'table-cam': $('#snap-file-table-cam'),
@@ -371,8 +393,9 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     host.dispatch({ type: 'overview-result', vision: r, balls });
     host.resetSelection();
     if (snap().step === 'review') {
-      const n = balls.length;
-      host.toast(n ? `Found the table and ${n} ball${n === 1 ? '' : 's'}. Tap the one you want to pocket.` : SNAP_MESSAGES.noBalls, 3200);
+      // The top card already says what to do next (and the chip how many balls were found): a toast
+      // repeating it covered the bottom rail and pockets.
+      if (!balls.length) host.toast(SNAP_MESSAGES.noBalls, 3200);
       host.layoutChanged();
     }
   }
@@ -442,6 +465,13 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
         return host.removeBall();
       case 'show-card':
         return host.expandSheet();
+      case 'zoom':
+        zoomed = !zoomed;
+        lastDrawKey = '';
+        return host.refresh();
+      case 'notes':
+        notesOpen = !notesOpen;
+        return host.refresh();
     }
   });
 
@@ -533,7 +563,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
    */
   let heights = '';
   function syncHeights(): boolean {
-    const hud = root.querySelector<HTMLElement>('#snap-hud')!;
+    const hud = hudEl;
     const th = Math.round(top.getBoundingClientRect().height);
     const hh = Math.round(hud.getBoundingClientRect().height);
     const key = `${th},${hh}`;
@@ -620,18 +650,21 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
         const r = sn.player?.result;
         setChip(null);
         fit = confidenceLabel(r?.confidence ?? 0);
-        setInstr(s.plan ? 'Aim the cue ball at the ghost ball. Strike the blue dot.' : 'Pick a target ball to see the guide.', 'target');
+        // The how-to (strike, power, aim) is in the sheet's peek right under the photo: the top card
+        // is one row, so the photo gets the screen.
+        setInstr(s.plan ? (playable(s.plan) ? `Aim at the ghost ball. Strike ${strikeWords(s.plan.stroke)} (the blue dot on the ball's face).` : 'This shot cannot be played as planned.') : 'Pick a target ball to see the guide.', 'target');
         if (r?.reason) warnings.push(r.reason);
         if (guide) warnings.push(...guide.messages);
-        if (!s.plan?.makeable && s.plan) warnings.push('This shot is not makeable as planned. See the shot card for why.');
         actions = iconBtn('take-player', 'New player photo', 'camera') + iconBtn('edit-layout', 'Edit the layout', 'layers') + iconBtn('start-over', 'Start over', 'refresh');
         break;
       }
       case 'manual-taps': {
         setChip(null);
-        const tapText = !sn.taps.cue ? 'Tap the centre of the cue ball in your photo.' : 'Now tap the centre of the target ball.';
+        const tl = s.targetId ? (sn.layout?.find((b) => b.id === s.targetId)?.label ?? '') : '';
+        const tname = !tl ? 'target ball' : /^\d+$/.test(tl) ? `${tl}-ball (your target)` : `${tl} ball (your target)`;
+        const tapText = !sn.taps.cue ? 'Tap the centre of the cue ball in your photo.' : `Now tap the centre of the ${tname}.`;
         setInstr(tapText, 'hand');
-        if (sn.error) warnings.push(sn.error);
+        if (sn.error) warnings.push(`${sn.error} Next time, include a rail or a pocket and the target ball in the photo.`);
         actions = iconBtn('take-player', 'Retake the player-view photo', 'camera') + iconBtn('pick-player', 'Choose another player-view photo', 'image') + iconBtn('edit-layout', 'Edit the layout', 'layers') + iconBtn('start-over', 'Start over', 'refresh');
         break;
       }
@@ -640,7 +673,15 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     setHtml(cta, ctaHtml);
     syncHeights();
     setHtml(warnEl, warnings.map((w) => `<li class="warn-chip">${iconMarkup('alert', 16)}<span>${esc(w)}</span></li>`).join(''));
-    warnEl.hidden = warnings.length === 0;
+    // In the guide, notes about the photo fold into one banner (tap to read), so they never squeeze it.
+    const fold = step === 'guide' && warnings.length > 0;
+    if (!fold) notesOpen = false;
+    notesBtn.hidden = !fold;
+    if (fold) {
+      setHtml(notesBtn, `${iconMarkup('alert', 16)}<span>${warnings.length} note${warnings.length === 1 ? '' : 's'} about this photo</span>${iconMarkup(notesOpen ? 'chevron-up' : 'chevron-down', 16, 'chev')}`);
+      notesBtn.setAttribute('aria-expanded', String(notesOpen));
+    }
+    warnEl.hidden = warnings.length === 0 || (fold && !notesOpen);
     busy.hidden = !busyText;
     if (busyText) busy.querySelector('p')!.textContent = busyText;
     // Dock state.
@@ -658,6 +699,18 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       fitEl.style.left = `${Math.round(pr.x + 8)}px`;
       fitEl.style.top = `${Math.round(pr.y + 8)}px`;
     }
+    // The photo check's close button sits on the photo's own corner, not above the letterbox.
+    const closeBtn = root.querySelector<HTMLElement>('.snap-close')!;
+    const cr = inspect && step === 'review' ? photoCanvas.photoRect() : null;
+    if (cr) {
+      closeBtn.style.top = `${Math.round(cr.y + 8)}px`;
+      closeBtn.style.left = `${Math.round(cr.x + cr.w - 52)}px`;
+      closeBtn.style.right = 'auto';
+    } else {
+      closeBtn.style.removeProperty('top');
+      closeBtn.style.removeProperty('left');
+      closeBtn.style.removeProperty('right');
+    }
   }
 
   function photoFor(step: SnapSession['step']): Photo | null {
@@ -670,13 +723,13 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     const sn = s.snap;
     const photo = photoFor(sn.step);
     const r = photoCanvas.canvas.getBoundingClientRect();
-    const key = [sn.step, inspect, photo ? `${photo.width}x${photo.height}:${photo === playerPhoto ? 'p' : 'o'}` : '-', Math.round(r.width), Math.round(r.height), s.plan ? `${s.plan.targetId}>${s.plan.pocketId}:${s.plan.stroke.side},${s.plan.stroke.vert},${s.plan.stroke.power}:${s.plan.ghost.x.toFixed(4)},${s.plan.ghost.y.toFixed(4)}` : 'noplan', s.targetId, s.pocketId, sn.cornerTaps.length, JSON.stringify(sn.taps), sn.player?.result?.ms ?? 0, layoutKey(sn.layout)].join('|');
+    const key = [sn.step, inspect, zoomed, photo ? `${photo.width}x${photo.height}:${photo === playerPhoto ? 'p' : 'o'}` : '-', Math.round(r.width), Math.round(r.height), s.plan ? `${s.plan.targetId}>${s.plan.pocketId}:${s.plan.stroke.side},${s.plan.stroke.vert},${s.plan.stroke.power}:${s.plan.ghost.x.toFixed(4)},${s.plan.ghost.y.toFixed(4)}` : 'noplan', s.targetId, s.pocketId, sn.cornerTaps.length, JSON.stringify(sn.taps), sn.player?.result?.ms ?? 0, layoutKey(sn.layout)].join('|');
     if (key === lastDrawKey) return;
     lastDrawKey = key;
     photoCanvas.photo = photo;
     guide = null;
     const processing = sn.step === 'overview-processing' || sn.step === 'player-processing';
-    if (!photo || r.width < 2) {
+    if (!photo || r.width < 2 || r.height < 2) {
       photoCanvas.draw();
       clearOverlay();
       return;
@@ -685,13 +738,37 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       const cue = sn.layout.find((b) => b.kind === 'cue');
       const tgt = sn.layout.find((b) => b.id === s.plan!.targetId);
       if (cue) {
-        guide = buildPlayerGuide({ pose: sn.player.result.pose, table: s.table, plan: s.plan, cue: cue.pos, target: tgt?.pos ?? null, stroke: s.plan.stroke });
+        guide = buildPlayerGuide({ pose: sn.player.result.pose, table: s.table, plan: s.plan, cue: cue.pos, target: tgt?.pos ?? null, stroke: s.plan.stroke, riskPockets: host.riskPockets?.() ?? [] });
       }
     }
     const g = guide;
+    // Zoom onto the shot (cue ball, ghost, target, pocket) so the balls are big enough to read.
+    photoCanvas.focus = g && zoomed && photo ? guideFocus(g, photo.width, photo.height) : null;
+    // The table photo check: zoom onto the detected table (its corners), not the room around it.
+    const corners = sn.overview?.vision?.calibration?.corners;
+    if (!g && photo === overviewPhoto && sn.step === 'review' && inspect && corners?.length) {
+      const xs = corners.map((p) => p.x);
+      const ys = corners.map((p) => p.y);
+      photoCanvas.focus = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+    }
+    zoomBtn.hidden = !g;
+    zoomBtn.setAttribute('aria-pressed', String(zoomed));
+    zoomBtn.querySelector('span')!.textContent = zoomed ? 'Whole photo' : 'Zoom to shot';
+    zoomBtn.setAttribute('aria-label', zoomed ? 'Show the whole photo' : 'Zoom to the shot');
+    const st = s.plan?.stroke;
+    const note = st ? `${st.power.toFixed(st.power % 1 ? 1 : 0)}/10 ${speedWord(st.power)}` : undefined;
+    // Labels keep clear of the zoom button floating over the photo.
+    const zb = zoomBtn.getBoundingClientRect();
+    const avoidRects = g && zb.width > 0 ? [{ left: zb.left - r.left - 4, top: zb.top - r.top - 4, right: zb.right - r.left + 4, bottom: zb.bottom - r.top + 4 }] : [];
+    // ... and of the fit-confidence pill in the photo's top-left corner.
+    if (g) {
+      const fr = fitEl.hidden ? null : fitEl.getBoundingClientRect();
+      avoidRects.push(fr && fr.width > 0 ? { left: fr.left - r.left - 4, top: fr.top - r.top - 4, right: fr.right - r.left + 4, bottom: fr.bottom - r.top + 4 } : { left: 0, top: 0, right: 176, bottom: 50 });
+    }
+    renderHud(s, g);
     photoCanvas.draw(
       g
-        ? (c, m) => drawGuide(c, m, g, { showCuePath: true, makeable: s.plan?.makeable ?? true, clip: photoCanvas.photoRect() })
+        ? (c, m) => drawGuide(c, m, g, { showCuePath: true, makeable: s.plan ? playable(s.plan) : true, clip: photoCanvas.photoRect(), avoidRects, ...(note ? { strikeNote: note } : {}) })
         : sn.step === 'manual-taps'
           ? (c, m) => drawTaps(c, m, sn.taps)
           : undefined,
@@ -699,10 +776,12 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     );
     // The overview photo gets the 001 AR overlay (outline, pockets, balls, plan).
     const showOverlay = photo === overviewPhoto && !processing;
+    // Detection rings stay on the photo (never over the letterbox).
+    const pr = photoCanvas.photoRect();
+    overlayCanvas.style.clipPath = pr ? `inset(${Math.max(0, pr.y)}px ${Math.max(0, r.width - pr.x - pr.w)}px ${Math.max(0, r.height - pr.y - pr.h)}px ${Math.max(0, pr.x)}px round 14px)` : '';
     if (showOverlay) {
-      overlay.draw(overlayData(), containMapping(photo.width, photo.height, Math.max(1, Math.round(r.width)), Math.max(1, Math.round(r.height))));
+      overlay.draw(overlayData(), photoCanvas.map);
     } else clearOverlay();
-    renderHud(s, g);
   }
 
   function clearOverlay(): void {
@@ -715,21 +794,36 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     const plan = s.plan;
     if (!plan || s.snap.step !== 'guide') return;
     const st = plan.stroke;
-    hudStrike.textContent = strikeHeadline(st, describeSpin);
+    hudEl.classList.toggle('unplayable', !playable(plan));
+    if (!playable(plan)) {
+      // No strike point, no power: the reason, and what to try instead.
+      const u = unplayableHeadline(plan);
+      hudStrike.textContent = u.title;
+      hudAim.textContent = u.reason;
+      setHtml(hudMeter, '');
+      hudPower.textContent = '';
+      hudSpeed.textContent = '';
+      setHtml(hudSpin, `<span class="hud-no">${iconMarkup('alert', 40)}</span>`);
+      hudSpin.setAttribute('aria-label', u.title);
+      const alt = u.altPocketId;
+      setHtml(hudActs, alt ? `<button type="button" class="btn primary" data-hud-pocket="${esc(alt)}">${iconMarkup('target', 18)}<span>Try the ${esc(host.pocketName?.(alt) ?? alt)}</span></button>` : '');
+      return;
+    }
+    setHtml(hudActs, '');
+    hudStrike.textContent = strikeHeadline(st, strikeWords);
     const minPower = Number.isFinite(plan.minPower) ? plan.minPower : null;
     hudMeter.setAttribute('aria-label', powerText(st.power, minPower));
     setHtml(hudMeter, powerMeterSvg(st.power, minPower));
     hudPower.innerHTML = `${esc(st.power.toFixed(st.power % 1 ? 1 : 0))}<small>/10</small>`;
-    hudSpeed.textContent = `${speedWord(st.power)} · ${powerToSpeed(st.power).toFixed(1)} m/s`;
-    hudAim.textContent = plan.makeable ? `Aim at the ghost ball · ${plan.cutAngleDeg.toFixed(0)}° cut, ${plan.fractionLabel}-ball` : 'Not makeable as planned';
-    const showInset = !!(g && playerPhoto && g.inFrame.cue && g.strike?.visible && g.strike.inFrame);
-    root.querySelector<HTMLElement>('.hud-inset')!.dataset.mode = showInset ? 'photo' : 'spin';
-    if (showInset && g && playerPhoto) drawInset(insetCanvas, playerPhoto, g);
-    else {
-      hudSpin.setAttribute('role', 'img');
-      hudSpin.setAttribute('aria-label', spinText(st.side, st.vert));
-      setHtml(hudSpin, spinBallSvg(st.side, st.vert, 92, 'hud'));
-    }
+    const ref = speedReference(plan.obPocketSpeed, s.table.length, s.params);
+    hudSpeed.textContent = ref ? `${speedWord(st.power)} · ${ref}` : `${speedWord(st.power)} · ${powerToSpeed(st.power).toFixed(1)} m/s`;
+    hudAim.textContent = `Aim at the ghost ball · ${plan.cutAngleDeg.toFixed(0)}° cut, ${plan.fractionPhrase.replace(/\u002D/g, '\u2011')}`;
+    // The cue ball's face, drawn flat as coaches do (never a photo crop: from a raised camera a
+    // high strike point lands below the visible centre and reads as the opposite instruction).
+    void g;
+    hudSpin.setAttribute('role', 'img');
+    hudSpin.setAttribute('aria-label', spinText(st.side, st.vert));
+    setHtml(hudSpin, spinBallSvg(st.side, st.vert, 72, 'hud'));
   }
 
   function drawThumb(s: AppState): void {
@@ -753,7 +847,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   }
 
   // Keep the stage measurements fresh (the 3D table frames itself between the top card and the dock).
-  const hud = root.querySelector<HTMLElement>('#snap-hud')!;
+  const hud = hudEl;
   const measure = () => {
     if (syncHeights()) host.refresh();
   };
@@ -761,6 +855,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     const ro = new ResizeObserver(measure);
     ro.observe(top);
     ro.observe(hud);
+    ro.observe(cta);
   }
 
   return {
@@ -780,8 +875,11 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       const dock = root.querySelector<HTMLElement>('#snap-dock')!;
       const t = top.getBoundingClientRect();
       const d = dock.getBoundingClientRect();
+      const b = cta.getBoundingClientRect();
       if (t.height < 1 && d.height < 1) return null;
-      return { top: t.bottom, bottom: d.height > 0 ? d.top : root.getBoundingClientRect().bottom };
+      let bottom = d.height > 0 ? d.top : root.getBoundingClientRect().bottom;
+      if (b.height > 0) bottom = Math.min(bottom, b.top);
+      return { top: t.bottom, bottom };
     },
   };
 }

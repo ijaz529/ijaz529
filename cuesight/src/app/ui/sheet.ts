@@ -1,8 +1,11 @@
 /**
  * Bottom sheet for the shot card on portrait phones (FR-126): a peek height that shows the headline
- * (target → pocket, cut, power, spin), and an expanded height just below the top bar. Drag the handle
- * (or swipe the peeked content up) to expand; tap the handle or press Escape to collapse. In landscape
- * or at ≥ 900 px wide the same element is a static side panel and the handle is hidden.
+ * (target → pocket, cut, power, spin), a medium detent (about half the screen: the headline and the
+ * stroke controls, with the table re-framed above it so the path can be watched while power and spin
+ * change), and an expanded height just below the top bar. Drag the handle (or swipe the peeked
+ * content up) between them; tap the handle to step peek → medium → expanded → peek; Escape
+ * collapses. In landscape or at ≥ 900 px wide the same element is a static side panel and the
+ * handle is hidden. The state is mirrored on <body data-sheet> so the stage can follow it.
  *
  * The sheet changes its *height* (not a transform), so its content is a normal scroll container that
  * stays inside the viewport: anything in it can always be scrolled into view.
@@ -10,13 +13,25 @@
 
 export interface Sheet {
   expand(): void;
+  /** The medium detent (headline + stroke controls). */
+  medium(): void;
   collapse(): void;
+  /** Fully expanded, or a static side panel. */
   isExpanded(): boolean;
+  state(): 'peek' | 'medium' | 'expanded' | 'static';
+  /** Called after every state change. */
+  onChange?: (s: 'peek' | 'medium' | 'expanded' | 'static') => void;
 }
 
 export const SIDE_PANEL_QUERY = '(orientation: landscape), (min-width: 900px)';
 
-type State = 'peek' | 'expanded' | 'static';
+type State = 'peek' | 'medium' | 'expanded' | 'static';
+
+const LABELS: Record<Exclude<State, 'static'>, string> = {
+  peek: 'Expand shot details',
+  medium: 'Show all shot details',
+  expanded: 'Collapse shot details',
+};
 
 export function createSheet(el: HTMLElement, opts: { peek?: number } = {}): Sheet {
   const root = document.documentElement;
@@ -43,29 +58,33 @@ export function createSheet(el: HTMLElement, opts: { peek?: number } = {}): Shee
   handle.setAttribute('aria-controls', body.id);
 
   const mq = typeof matchMedia === 'function' ? matchMedia(SIDE_PANEL_QUERY) : null;
-  let state: State = mq?.matches ? 'static' : 'peek';
+  let state: State | null = null;
 
+  let api: Sheet;
   const apply = (next: State) => {
+    const changed = next !== state;
     state = next;
     el.dataset.sheet = next;
+    document.body.dataset.sheet = next;
     el.style.removeProperty('height');
     const expanded = next !== 'peek';
     handle!.setAttribute('aria-expanded', String(expanded));
-    handle!.setAttribute('aria-label', expanded ? 'Collapse shot details' : 'Expand shot details');
+    handle!.setAttribute('aria-label', next === 'static' ? 'Shot details' : LABELS[next]);
     handle!.tabIndex = next === 'static' ? -1 : 0;
-    if (next === 'peek') body!.scrollTop = 0;
+    if (next === 'peek' || next === 'medium') body!.scrollTop = 0;
+    if (changed) api?.onChange?.(next);
   };
-  apply(state);
+  apply(mq?.matches ? 'static' : 'peek');
   mq?.addEventListener?.('change', () => apply(mq.matches ? 'static' : 'peek'));
 
   const toggle = () => {
     if (state === 'static') return;
-    apply(state === 'peek' ? 'expanded' : 'peek');
+    apply(state === 'peek' ? 'medium' : state === 'medium' ? 'expanded' : 'peek');
   };
 
   // --- Dragging -------------------------------------------------------------------------------
   /** Height of the sheet in a given state, measured with transitions off (one forced layout). */
-  const measure = (s: 'peek' | 'expanded'): number => {
+  const measure = (s: 'peek' | 'medium' | 'expanded'): number => {
     const prevState = el.dataset.sheet ?? '';
     const prevH = el.style.height;
     const hadDrag = el.classList.contains('dragging');
@@ -78,12 +97,12 @@ export function createSheet(el: HTMLElement, opts: { peek?: number } = {}): Shee
     if (!hadDrag) el.classList.remove('dragging');
     return h;
   };
-  let drag: { id: number; y0: number; h0: number; t0: number; lo: number; hi: number; active: boolean; fromBody: boolean } | null = null;
+  let drag: { id: number; y0: number; h0: number; t0: number; lo: number; mid: number; hi: number; active: boolean; fromBody: boolean } | null = null;
   let suppressClick = false;
 
   const begin = (e: PointerEvent, fromBody: boolean) => {
     if (state === 'static' || e.button > 0) return;
-    drag = { id: e.pointerId, y0: e.clientY, h0: el.getBoundingClientRect().height, t0: e.timeStamp, lo: 0, hi: 0, active: false, fromBody };
+    drag = { id: e.pointerId, y0: e.clientY, h0: el.getBoundingClientRect().height, t0: e.timeStamp, lo: 0, mid: 0, hi: 0, active: false, fromBody };
   };
   const move = (e: PointerEvent) => {
     if (!drag || e.pointerId !== drag.id) return;
@@ -97,6 +116,7 @@ export function createSheet(el: HTMLElement, opts: { peek?: number } = {}): Shee
       }
       drag.active = true;
       drag.lo = measure('peek');
+      drag.mid = measure('medium');
       drag.hi = measure('expanded');
       el.classList.add('dragging');
       try {
@@ -119,10 +139,17 @@ export function createSheet(el: HTMLElement, opts: { peek?: number } = {}): Shee
     const dt = Math.max(1, e.timeStamp - d.t0);
     const v = (e.clientY - d.y0) / dt; // px/ms, + = down
     const h = el.getBoundingClientRect().height;
-    const mid = (d.lo + d.hi) / 2;
-    if (v < -0.35) apply('expanded');
-    else if (v > 0.35) apply('peek');
-    else apply(h > mid ? 'expanded' : 'peek');
+    // Snap to the nearest detent; a flick goes one detent further in its direction.
+    const stops: [Exclude<State, 'static'>, number][] = [
+      ['peek', d.lo],
+      ['medium', d.mid],
+      ['expanded', d.hi],
+    ];
+    let i = 0;
+    for (let k = 1; k < stops.length; k++) if (Math.abs(stops[k]![1] - h) < Math.abs(stops[i]![1] - h)) i = k;
+    if (v < -0.35 && stops[i]![1] <= h + 4) i = Math.min(2, i + 1);
+    else if (v > 0.35 && stops[i]![1] >= h - 4) i = Math.max(0, i - 1);
+    apply(stops[i]![0]);
   };
 
   handle.addEventListener('pointerdown', (e) => {
@@ -147,15 +174,18 @@ export function createSheet(el: HTMLElement, opts: { peek?: number } = {}): Shee
     toggle();
   });
   el.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && state === 'expanded') {
+    if (e.key === 'Escape' && (state === 'expanded' || state === 'medium')) {
       apply('peek');
       handle!.focus();
     }
   });
 
-  return {
-    expand: () => state !== 'static' && apply('expanded'),
-    collapse: () => state !== 'static' && apply('peek'),
-    isExpanded: () => state !== 'peek',
+  api = {
+    expand: () => void (state !== 'static' && apply('expanded')),
+    medium: () => void (state !== 'static' && apply('medium')),
+    collapse: () => void (state !== 'static' && apply('peek')),
+    isExpanded: () => state === 'expanded' || state === 'static',
+    state: () => state!,
   };
+  return api;
 }

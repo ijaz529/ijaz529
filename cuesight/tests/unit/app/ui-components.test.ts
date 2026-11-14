@@ -78,7 +78,7 @@ describe('spin ball', () => {
   });
   it('describes the tip in coaching words', () => {
     expect(spinText(0, 0)).toBe('Cue tip: centre ball');
-    expect(spinText(-0.25, 0.25)).toContain('high');
+    expect(spinText(-0.25, 0.25)).toContain('1 tip above centre, 1 tip left');
   });
 });
 
@@ -141,7 +141,13 @@ describe('shot card (001 regression contract)', () => {
     const plan = planShot(layoutOf('blocked'), { targetId: 'b1', pocketId: 'TR' }, params);
     const el = stubEl();
     renderShotCard(el, plan, ctx());
-    expect(el.innerHTML).toMatch(/<ul class="warnings" role="alert">.*blocked by 5/s);
+    // Not role="alert": that re-announced every warning on each re-plan (e.g. while dragging the
+    // power slider). Warnings are announced once, when they first appear, by main.ts's live region.
+    expect(el.innerHTML).toMatch(/<ul class="warnings"[^>]*>.*blocked by 5/s);
+    expect(el.innerHTML).not.toContain('role="alert"');
+    // Not makeable: the reason and what to do instead lead the card (shown at the sheet's peek).
+    expect(el.innerHTML).toMatch(/class="hero blocked">.*blocked by 5/s);
+    expect(el.innerHTML).toContain('data-card-act="suggest"');
   });
 
   it('shows the hint (and the status) when there is no plan', () => {

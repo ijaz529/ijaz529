@@ -160,7 +160,7 @@ export class TableView {
       if (pk) {
         const q = this.toCanvas({ x: pk.mouthCenter.x - pk.inward.x * 0.02, y: pk.mouthCenter.y - pk.inward.y * 0.02 });
         const r = ((pk.kind === 'corner' ? t.cornerMouth : t.sideMouth) / 2) * this.s * 1.05;
-        this.ring(q, r + 3, PALETTE.target, 3, 10);
+        this.ring(q, r + 3, PALETTE.pocket, 3, 10);
       }
     }
     // Heatmap of good cue-ball zones (smoothly upscaled).

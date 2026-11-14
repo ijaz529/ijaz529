@@ -44,11 +44,14 @@ export function mountOnboarding(host: HTMLElement): HTMLElement | null {
     </ul>
     <button type="button" class="onboard-ok">Got it</button>`;
   host.appendChild(card);
+  // While the hint shows, the sheet (which would say the same thing) stays out of the way.
+  document.body.classList.add('onboarding');
   let gone = false;
   const dismiss = () => {
     if (gone) return;
     gone = true;
     remember();
+    document.body.classList.remove('onboarding');
     window.removeEventListener('pointerdown', onDown, true);
     card.classList.add('leaving');
     const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;

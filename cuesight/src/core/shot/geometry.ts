@@ -25,19 +25,43 @@ export function cutSide(cue: Vec2, ghost: Vec2, obDir: Vec2): 1 | -1 | 0 {
   return Math.abs(c) < 1e-9 ? 0 : c > 0 ? 1 : -1;
 }
 
+/**
+ * Coaching aim labels, every ⅛ of overlap. The ⅞, ⅝ and ⅜ steps matter: without them a 38° cut reads
+ * "½-ball" (30°), which undercuts it by 8° and misses.
+ */
 const FRACTIONS: [number, string][] = [
   [1, 'full'],
+  [0.875, '⅞'],
   [0.75, '¾'],
+  [0.625, '⅝'],
   [0.5, '½'],
+  [0.375, '⅜'],
   [0.25, '¼'],
   [0.125, '⅛'],
   [0.03, 'thin'],
 ];
 
-/** Ball-overlap fraction (1 = full, 0.5 = half-ball at 30°) and the nearest coaching label. */
-export function fractionOf(cut: number): { fraction: number; label: string } {
+/** Cut angle (rad) at which a hit has overlap `fraction` (inverse of fraction = 1 − sin cut). */
+export function cutOfFraction(fraction: number): number {
+  return Math.asin(Math.max(0, Math.min(1, 1 - fraction)));
+}
+
+/** Within this many degrees of a label's own angle the label is said plainly; further away it is qualified. */
+export const FRACTION_EXACT_DEG = 1.5;
+
+/**
+ * Ball-overlap fraction (1 = full, 0.5 = half-ball at 30°), the nearest coaching label, and a phrase
+ * that says which way the cut differs from that label when it is more than 1.5° away
+ * ("a touch thinner than ½-ball"), so a player aiming by the label does not over- or undercut.
+ */
+export function fractionOf(cut: number): { fraction: number; label: string; phrase: string } {
   const fraction = Math.max(0, 1 - Math.sin(Math.min(cut, Math.PI / 2)));
   let best = FRACTIONS[0]!;
   for (const f of FRACTIONS) if (Math.abs(f[0] - fraction) < Math.abs(best[0] - fraction)) best = f;
-  return { fraction, label: best[1] };
+  const label = best[1];
+  const name = label === 'thin' ? 'a thin hit' : `${label}-ball`;
+  const offDeg = ((cut - cutOfFraction(best[0])) * 180) / Math.PI;
+  let phrase = name;
+  if (label !== 'thin' && Math.abs(offDeg) > FRACTION_EXACT_DEG) phrase = `a touch ${offDeg > 0 ? 'thinner' : 'thicker'} than ${name}`;
+  return { fraction, label, phrase };
 }

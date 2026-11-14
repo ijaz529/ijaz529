@@ -12,6 +12,7 @@ import {
   cameraMatrices,
   clampUserOrbit,
   insetShift,
+  landscapeFrame,
   lerpOrbit,
   overviewOrbit,
   pixelAtUnit,
@@ -26,7 +27,7 @@ import { easeInOutCubic, easeOutCubic, mat4, mat4FromBasis, project, quatMultipl
 import { pickRay, type Pick3D } from './picking';
 import { buildTrack, playbackTimeline, sampleTrack, type BallPose, type PlaybackTrack, type Timeline } from './playback';
 import { Renderer, type BallDraw, type DotDraw, type FrameState } from './scene';
-import { ballLook, contactPoint3, cuePose, hexRGBA, planRibbons, restOrientation, type BallLook } from './scene-data';
+import { ADDRESS_GAP, ballLook, contactPoint3, cuePose, hexRGBA, planRibbons, practiceStroke, restOrientation, type BallLook } from './scene-data';
 
 export type { Pick3D } from './picking';
 
@@ -42,12 +43,37 @@ export interface Scene3DData {
   heatmap: { cols: number; rows: number; values: Float32Array } | null;
   stroke: Stroke | null;
   clothRgb?: [number, number, number];
+  /** Pockets at risk of a scratch under a small error (dashed rings). */
+  riskPockets?: PocketId[];
+}
+
+/** Where things are on screen after a frame is drawn (client CSS px), for HTML labels in the scene. */
+export interface FrameInfo {
+  /** Cue ball centre and on-screen radius, or null when it is off screen / behind the camera. */
+  cue: { x: number; y: number; r: number } | null;
+  /**
+   * Screen points along the plan's lines (aim, object-ball path, cue-ball path), balls and the cue
+   * stick to keep clear; `w` weights a point (the stick counts triple: a label must never hide it).
+   */
+  avoid: { x: number; y: number; w?: number }[];
+  /** The free part of the canvas (not under floating controls), client px. */
+  free: { left: number; top: number; right: number; bottom: number };
+  preset: CameraPreset | 'custom';
+  /** Camera elevation (rad): π/2 = straight down. */
+  pitch: number;
+  playing: boolean;
+  /** Every ball's centre and on-screen radius (client px), for number tags; off-screen balls are left out. */
+  balls?: { id: string; x: number; y: number; r: number }[];
+  /** The camera is moving (a transition, or the player orbiting/panning/zooming) or a ball is being dragged. */
+  moving?: boolean;
 }
 
 export interface Table3DEvents {
   onTap?(p: Pick3D, ev: PointerEvent): void;
   onBallDrag?(id: string, pos: Vec2, phase: 'start' | 'move' | 'end'): void;
   onCameraChange?(preset: CameraPreset | 'custom'): void;
+  /** After each drawn frame (camera moves, transitions, replays). */
+  onFrame?(info: FrameInfo): void;
 }
 
 export interface Table3D {
@@ -56,8 +82,8 @@ export interface Table3D {
   setData(d: Scene3DData): void;
   setCamera(preset: CameraPreset, animate?: boolean): void;
   getCamera(): CameraPreset | 'custom';
-  /** Replays the plan's simulated trajectories in real time (×1, capped at 4 s, tap to skip). */
-  playShot(plan: ShotPlan): Promise<void>;
+  /** Replays the plan's simulated trajectories in real time (×1, capped at 4 s, tap to skip); `slow` at half speed. */
+  playShot(plan: ShotPlan, opts?: { slow?: boolean }): Promise<void>;
   stopPlayback(): void;
   isPlaying(): boolean;
   pick(clientX: number, clientY: number): Pick3D;
@@ -85,7 +111,12 @@ const DOUBLE_TAP_MS = 320;
 const TRANSITION_MS = 720;
 const ORBIT_RAD_PER_PX = 0.0065;
 const STRIKE_PRE_S = 0.5;
-const HOLD_S = 0.9;
+const HOLD_S = 3.5;
+/** Idle practice strokes in Player view: this many, this long each, then the cue rests at address. */
+const PRACTICE_STROKES = 3;
+const PRACTICE_STROKE_S = 1.8;
+/** Above this camera elevation the cue stick is hidden: from overhead it reads as a stray line. */
+const CUE_MAX_PITCH = (70 * Math.PI) / 180;
 
 interface DragState {
   id: string;
@@ -147,6 +178,20 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   let play: PlaybackState | null = null;
   let lastHeat: Scene3DData['heatmap'] = null;
   let lastCloth: string | undefined;
+  /** Idle practice-stroke loop (Player view): when it started and for which stroke/cue position. */
+  let loop: { t0: number; key: string } | null = null;
+  let loopKey = '';
+  /** Restarts the practice strokes when the stroke, the cue ball or the view changes. */
+  function syncLoop(): void {
+    const d0 = data;
+    const st = d0?.stroke ?? d0?.plan?.stroke;
+    const c = d0?.balls.find((b) => b.kind === 'cue');
+    const key = preset === 'player' && st && c && d0?.plan ? `${st.power}|${st.side}|${st.vert}|${c.pos.x.toFixed(3)},${c.pos.y.toFixed(3)}|${d0.plan.targetId}>${d0.plan.pocketId}` : '';
+    if (key === loopKey) return;
+    loopKey = key;
+    loop = key && !reduced ? { t0: now() + TRANSITION_MS, key } : null;
+  }
+  const looping = (t: number) => !!loop && t - loop.t0 < PRACTICE_STROKES * PRACTICE_STROKE_S * 1000;
 
   const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
   const aspect = () => cssW / Math.max(1, cssH);
@@ -154,11 +199,8 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     cssW > 1 && cssH > 1
       ? { top: insetsPx.top / cssH, bottom: insetsPx.bottom / cssH, left: insetsPx.left / cssW, right: insetsPx.right / cssW }
       : NO_INSETS;
-  const overviewUp = (): Vec2 => {
-    const ins = insetsFrac();
-    const eff = (aspect() * (1 - ins.left - ins.right)) / Math.max(0.05, 1 - ins.top - ins.bottom);
-    return eff >= 1 ? { x: 0, y: 1 } : { x: 1, y: 0 };
-  };
+  const overviewUp = (): Vec2 => (landscapeFrame(aspect(), insetsFrac()) ? { x: 0, y: 1 } : { x: 1, y: 0 });
+
 
   function schedule(): void {
     if (raf || lost || destroyed) return;
@@ -172,19 +214,43 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   // -------------------------------------------------------------------------------------------
   // Camera
   // -------------------------------------------------------------------------------------------
-  function cueAndAim(): { cue: Vec2; aim: Vec2; ghost: Vec2 | null } | null {
+  /** Cue ball, the cue-ball path direction (aim), the cue's own direction (squirt-corrected) and the ghost ball. */
+  function cueAndAim(): { cue: Vec2; aim: Vec2; cueDir: Vec2; ghost: Vec2 | null } | null {
     const d0 = data;
     if (!d0) return null;
     const cue = d0.balls.find((b) => b.kind === 'cue');
     if (!cue) return null;
-    if (d0.plan) return { cue: cue.pos, aim: d0.plan.aimDir, ghost: d0.plan.ghost };
+    if (d0.plan) return { cue: cue.pos, aim: d0.plan.aimDir, cueDir: d0.plan.cueDir ?? d0.plan.aimDir, ghost: d0.plan.ghost };
     const t = d0.targetId ? d0.balls.find((b) => b.id === d0.targetId) : undefined;
     if (t) {
       const d = { x: t.pos.x - cue.pos.x, y: t.pos.y - cue.pos.y };
-      if (Math.hypot(d.x, d.y) > 1e-6) return { cue: cue.pos, aim: d, ghost: t.pos };
+      if (Math.hypot(d.x, d.y) > 1e-6) return { cue: cue.pos, aim: d, cueDir: d, ghost: t.pos };
     }
     const d = Math.hypot(cue.pos.x, cue.pos.y) > 0.05 ? { x: -cue.pos.x, y: -cue.pos.y } : { x: 1, y: 0 };
-    return { cue: cue.pos, aim: d, ghost: null };
+    return { cue: cue.pos, aim: d, cueDir: d, ghost: null };
+  }
+
+  /** What the Player view must keep in frame: the pocket, where the object ball goes, the ghost ball. */
+  function playerKeep(): V3[] {
+    const d0 = data;
+    if (!d0 || !g) return [];
+    const keep: V3[] = [];
+    const plan = d0.plan;
+    const pocketId = plan?.pocketId ?? d0.pocketId;
+    const hole = pocketId ? g.holes.find((h) => h.id === pocketId) : undefined;
+    if (hole) keep.push([hole.x, hole.y, 0]);
+    if (plan) {
+      keep.push([plan.ghost.x, plan.ghost.y, g.R]);
+      const pts = plan.objectPath.points;
+      if (pts.length) {
+        const e = pts[pts.length - 1]!;
+        keep.push([Math.max(-g.hx, Math.min(g.hx, e.x)), Math.max(-g.hy, Math.min(g.hy, e.y)), g.R]);
+      }
+    } else if (d0.targetId) {
+      const t = d0.balls.find((b) => b.id === d0.targetId);
+      if (t) keep.push([t.pos.x, t.pos.y, g.R]);
+    }
+    return keep;
   }
 
   function presetOrbit(p: CameraPreset): Orbit | null {
@@ -193,7 +259,10 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     if (p === 'overview') return overviewOrbit(g, aspect(), ins);
     if (p === 'broadcast') return broadcastOrbit(g, aspect(), ins);
     const ca = cueAndAim();
-    return ca ? playerOrbit(g, ca.cue, ca.aim, ca.ghost, aspect()) : broadcastOrbit(g, aspect(), ins);
+    if (!ca) return broadcastOrbit(g, aspect(), ins);
+    const st = data?.stroke ?? data?.plan?.stroke ?? { power: 4, side: 0, vert: 0 };
+    const elevation = cuePose(g, ca.cue, ca.cueDir, st).elevation;
+    return playerOrbit(g, ca.cue, ca.aim, ca.ghost, aspect(), { keep: playerKeep(), insets: ins, cueElevation: elevation });
   }
 
   function goTo(target: Orbit, animate: boolean): void {
@@ -296,7 +365,8 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       if (!orient.has(b.id)) orient.set(b.id, restOrientation(b.id, up));
     }
     looks = nl;
-    renderer.setRibbons(planRibbons(d, g!));
+    uploadRibbons(true);
+    syncLoop();
     // Camera follow-ups.
     if (!orbit || tableChanged) {
       if (preset === 'custom') {
@@ -313,6 +383,18 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       }
     }
     markDirty();
+  }
+
+  /** Ribbons depend on the data and on whether the target ring is wanted (not in Player view). */
+  let ribbonsKey: string | null = null;
+  function uploadRibbons(force = false): void {
+    if (!data || !g) return;
+    const ring = preset !== 'player';
+    const ghostSolid = preset === 'overview';
+    const key = `${ring}|${ghostSolid}`;
+    if (!force && key === ribbonsKey) return;
+    ribbonsKey = key;
+    renderer.setRibbons(planRibbons(data, g, { targetRing: ring, ghostSolid }));
   }
 
   function cuePos(d: Scene3DData): Vec2 | undefined {
@@ -375,37 +457,53 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
           q = quatMultiply(pose.q, play.startQ.get(b.id) ?? q);
         }
       }
-      balls.push({ id: b.id, x, y, z, q, color: look.color, stripe: look.stripe, slot: look.slot, cueDots: look.cueDots, highlight: !playing && b.id === d.targetId, visible: true });
+      balls.push({ id: b.id, x, y, z, q, color: look.color, stripe: look.stripe, slot: look.slot, cueDots: look.cueDots, highlight: !playing && b.id === d.targetId && preset !== 'player', visible: true });
     }
     const showPlan = !playing;
     const dots: DotDraw[] = [];
     let cueModel: ReturnType<typeof mat4> | null = null;
     const plan = d.plan;
-    if (showPlan && plan) dots.push({ p: contactPoint3(plan, R), size: 11, color: hexRGBA(PALETTE.warn), ring: [1, 1, 1, 0.95], pull: 0.008 });
-    // Cue stick: along the plan's aim (or toward the target) with the stroke's tip offset/power.
+    if (showPlan && plan) {
+      // Sized to the object ball on screen (half its diameter, at most 11 px): a fixed 11 px dot hid
+      // half of a 10 px ball in the top view. Too small to read below a 6 px ball.
+      const tb = d.balls.find((b) => b.id === plan.targetId);
+      const diam = tb ? 2 * ballScreenRadius(cam, tb.pos, R) : 20;
+      if (diam >= 6) dots.push({ p: contactPoint3(plan, R), size: Math.min(11, Math.max(4, 0.55 * diam)), color: hexRGBA(PALETTE.warn), ring: [1, 1, 1, 0.95], pull: 0.008 });
+    }
+    // Cue stick: along the cue's own direction (the squirt-corrected line, not the cue-ball path)
+    // with the stroke's tip offset and pulled back by power. Hidden from overhead, where it would
+    // read as a stray line; there the in-scene label carries power and spin instead. The strike
+    // point is shown face-on in that label (a dot projected onto the back of the ball from a
+    // raised eye lands below centre for a high hit, which reads as the opposite instruction).
     const ca = cueAndAim();
     const stroke = d.stroke ?? plan?.stroke ?? null;
     const cueBall = d.balls.find((b) => b.kind === 'cue');
-    if (ca && cueBall && (plan || d.targetId) && (phase === 'idle' || phase === 'pre' || (phase === 'run' && simT < 0.25 * (play?.tl.rate ?? 1)))) {
+    const overhead = preset === 'overview' || currentOrbit().pitch > CUE_MAX_PITCH;
+    if (!overhead && ca && cueBall && (plan || d.targetId) && (phase === 'idle' || phase === 'pre' || (phase === 'run' && simT < 0.25 * (play?.tl.rate ?? 1)))) {
       const st: Stroke = stroke ?? { power: 4, side: 0, vert: 0 };
       // During playback the stick strikes from where the replayed shot starts.
       const pp = playing && play ? play.plan : null;
       const cpos = pp && pp.cuePath.points.length ? pp.cuePath.points[0]! : drag && drag.id === cueBall.id ? drag.pos : ca.cue;
-      const cp = cuePose(geo, cpos, pp ? pp.aimDir : ca.aim, pp ? (d.stroke ?? pp.stroke) : st);
-      let gap = cp.gap;
+      const cp = cuePose(geo, cpos, pp ? (pp.cueDir ?? pp.aimDir) : ca.cueDir, pp ? (d.stroke ?? pp.stroke) : st);
+      // At rest the cue addresses the ball (tip ADDRESS_GAP behind the strike point); power shows as
+      // the length of a few idle practice strokes, and of the back-swing (cp.gap) before a replay.
+      let gap = ADDRESS_GAP;
       if (phase === 'pre') {
         const back = 0.3;
-        if (preT < back) gap = cp.gap + 0.07 * easeOutCubic(preT / back);
+        if (preT < back) gap = ADDRESS_GAP + (cp.gap - ADDRESS_GAP) * easeOutCubic(preT / back);
         else {
           const u = Math.min(1, (preT - back) / (STRIKE_PRE_S - back));
-          gap = (cp.gap + 0.07) * (1 - u * u);
+          gap = cp.gap * (1 - u * u);
         }
       } else if (phase === 'run') gap = -0.03;
+      else if (loop && looping(t) && t >= loop.t0) {
+        const u = ((t - loop.t0) / 1000 / PRACTICE_STROKE_S) % 1;
+        gap = ADDRESS_GAP + practiceStroke(st.power) * (0.5 - 0.5 * Math.cos(2 * Math.PI * u));
+      }
       const tip: V3 = [cp.strike[0] + cp.back[0] * gap, cp.strike[1] + cp.back[1] * gap, cp.strike[2] + cp.back[2] * gap];
       const side = v3norm(v3cross([0, 0, 1], cp.back));
       const up = v3cross(cp.back, side);
       cueModel = mat4FromBasis(mat4(), cp.back, side, up, tip);
-      if (showPlan) dots.push({ p: cp.strike, size: 8, color: hexRGBA(PALETTE.cue), ring: [0.03, 0.05, 0.08, 0.9], pull: 0.0025 });
     }
     const pocketId = plan?.pocketId ?? d.pocketId;
     const hole = pocketId && showPlan ? geo.holes.find((h) => h.id === pocketId) : undefined;
@@ -418,8 +516,11 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       ghost: showPlan && plan ? plan.ghost : null,
       dots,
       cue: cueModel,
-      glow: hole ? { x: hole.x, y: hole.y, r: hole.r * 1.6, color: [0.94, 0.89, 0.26, 0.22] } : null,
-      ribbons: showPlan,
+      glow: hole ? { x: hole.x, y: hole.y, r: hole.r * 1.6, color: [0.91, 0.77, 0.42, 0.2] } : null,
+      // During the replay the planned lines come back faint once the balls run (the strike itself shows
+      // the bare table), so the run can be compared with the plan.
+      ribbons: showPlan || (playing && phase !== 'pre'),
+      ribbonsFaint: playing,
       heat: showPlan && !!d.heatmap,
     };
   }
@@ -430,6 +531,8 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     const t = now();
     let animating = false;
     if (anim) animating = true;
+    if (loop && looping(t)) animating = true;
+    else if (loop) loop = null;
     if (play) {
       const pt = playbackTime(t);
       if (pt.phase === 'done') finishPlayback();
@@ -438,19 +541,104 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     if (dirty || animating) {
       dirty = false;
       const cam = matrices();
-      if (data && g && cam && cssW > 1 && cssH > 1) renderer.draw(buildFrame(cam, t));
-      else {
+      if (data && g && cam && cssW > 1 && cssH > 1) {
+        uploadRibbons();
+        renderer.draw(buildFrame(cam, t));
+        if (events.onFrame) events.onFrame(frameInfo(cam));
+      } else {
         GL.clearColor(0.027, 0.043, 0.078, 1);
         GL.clear(GL.COLOR_BUFFER_BIT);
       }
     }
-    if (anim || play) schedule();
+    if (anim || play || loop) schedule();
+  }
+
+  /** On-screen radius (CSS px) of a ball at p. */
+  function ballScreenRadius(cam: CameraMatrices, p: Vec2, R: number): number {
+    const W = Math.max(1, cssW);
+    const H = Math.max(1, cssH);
+    const c = project(cam.vp, [p.x, p.y, R], W, H);
+    const e = project(cam.vp, [p.x + cam.right[0] * R, p.y + cam.right[1] * R, R + cam.right[2] * R], W, H);
+    return c && e ? Math.hypot(e.x - c.x, e.y - c.y) : 0;
+  }
+
+  /** Screen positions for HTML labels anchored in the scene. */
+  function frameInfo(cam: CameraMatrices): FrameInfo {
+    const r = canvas.getBoundingClientRect();
+    const d = data!;
+    const geo = g!;
+    const W = Math.max(1, r.width);
+    const H = Math.max(1, r.height);
+    const scr = (x: number, y: number, z: number) => {
+      const q = project(cam.vp, [x, y, z], W, H);
+      return q ? { x: r.left + q.x, y: r.top + q.y } : null;
+    };
+    const cueB = d.balls.find((b) => b.kind === 'cue');
+    let cue: FrameInfo['cue'] = null;
+    if (cueB) {
+      const p = drag && drag.id === cueB.id ? drag.pos : cueB.pos;
+      const c = scr(p.x, p.y, geo.R);
+      const e = scr(p.x + cam.right[0] * geo.R, p.y + cam.right[1] * geo.R, geo.R + cam.right[2] * geo.R);
+      if (c && e) cue = { x: c.x, y: c.y, r: Math.hypot(e.x - c.x, e.y - c.y) };
+    }
+    const avoid: { x: number; y: number; w?: number }[] = [];
+    const push = (x: number, y: number, z = 0) => {
+      const q = scr(x, y, z);
+      if (q) avoid.push(q);
+    };
+    const plan = d.plan;
+    if (plan && cueB) {
+      // Aim line (sampled), ghost, object-ball and cue-ball paths (decimated).
+      for (let k = 0; k <= 8; k++) push(cueB.pos.x + (plan.ghost.x - cueB.pos.x) * (k / 8), cueB.pos.y + (plan.ghost.y - cueB.pos.y) * (k / 8));
+      push(plan.ghost.x, plan.ghost.y, geo.R);
+      for (const tr of [plan.objectPath, plan.cuePath]) {
+        const pts = tr.points;
+        const step = Math.max(1, Math.floor(pts.length / 16));
+        for (let i = 0; i < pts.length; i += step) push(pts[i]!.x, pts[i]!.y);
+        if (pts.length) push(pts[pts.length - 1]!.x, pts[pts.length - 1]!.y);
+      }
+    }
+    // Balls weigh as much as the stick: a label must not hide a ball.
+    for (const b of d.balls)
+      if (b !== cueB) {
+        const q = scr(b.pos.x, b.pos.y, geo.R);
+        if (q) avoid.push({ x: q.x, y: q.y, w: 3 });
+      }
+    for (const h of geo.holes) push(h.x, h.y, 0);
+    // The cue stick (tip at address → 1 m up the butt, including the practice strokes' reach), weighted
+    // so a label never sits on it: it shows where the tip meets the ball.
+    const ca = cueAndAim();
+    if (ca && cueB && preset !== 'overview') {
+      const st = d.stroke ?? plan?.stroke ?? { power: 4, side: 0, vert: 0 };
+      const cp = cuePose(geo, ca.cue, ca.cueDir, st);
+      for (let k = ADDRESS_GAP; k <= 1.0 + practiceStroke(st.power); k += 0.06) {
+        const q = scr(cp.strike[0] + cp.back[0] * k, cp.strike[1] + cp.back[1] * k, cp.strike[2] + cp.back[2] * k);
+        if (q) avoid.push({ x: q.x, y: q.y, w: 3 });
+      }
+    }
+    const ballsOut: NonNullable<FrameInfo['balls']> = [];
+    for (const b of d.balls) {
+      const p = drag && drag.id === b.id ? drag.pos : b.pos;
+      const c = scr(p.x, p.y, geo.R);
+      const e = scr(p.x + cam.right[0] * geo.R, p.y + cam.right[1] * geo.R, geo.R + cam.right[2] * geo.R);
+      if (c && e) ballsOut.push({ id: b.id, x: c.x, y: c.y, r: Math.hypot(e.x - c.x, e.y - c.y) });
+    }
+    return {
+      cue,
+      avoid,
+      balls: ballsOut,
+      free: { left: r.left + insetsPx.left, top: r.top + insetsPx.top, right: r.right - insetsPx.right, bottom: r.bottom - insetsPx.bottom },
+      preset,
+      pitch: currentOrbit().pitch,
+      playing: play !== null,
+      moving: anim !== null || drag !== null || mode === 'orbit' || mode === 'pan' || mode === 'pinch',
+    };
   }
 
   // -------------------------------------------------------------------------------------------
   // Playback
   // -------------------------------------------------------------------------------------------
-  function playShot(plan: ShotPlan): Promise<void> {
+  function playShot(plan: ShotPlan, popts: { slow?: boolean } = {}): Promise<void> {
     if (play) finishPlayback();
     if (!g || !data) return Promise.resolve();
     const geo = g;
@@ -460,7 +648,9 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     for (const tr of [plan.cuePath, plan.objectPath, ...plan.otherPaths]) if (tr.points.length > 0) tracks.set(tr.ballId, buildTrack(tr, geo.R, { holes, pocketDepth: 0.09 }));
     const startQ = new Map<string, Quat>();
     for (const b of data.balls) startQ.set(b.id, orient.get(b.id) ?? [0, 0, 0, 1]);
-    const tl = playbackTimeline([...tracks.values()], 4);
+    const tl0 = playbackTimeline([...tracks.values()], 4);
+    // Half speed: the same frames over twice the time (to watch the spin take, the contact, the bend).
+    const tl = popts.slow ? { simEnd: tl0.simEnd, rate: tl0.rate / 2, duration: tl0.duration * 2 } : tl0;
     return new Promise<void>((resolve) => {
       play = { plan, tracks, startQ, tl, t0: now(), pre: reduced ? 0 : STRIKE_PRE_S, holdUntil: null, resolve };
       if (reduced) {
@@ -712,7 +902,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       if (data) {
         renderer.setCloth(data.clothRgb);
         renderer.setHeatmap(data.heatmap);
-        renderer.setRibbons(planRibbons(data, g!));
+        uploadRibbons(true);
       }
     } catch (err) {
       console.warn('CueSight 3D: context restore failed', err);
@@ -738,6 +928,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     lastPreset = p;
     const o = presetOrbit(p);
     if (o) goTo(o, animate);
+    syncLoop();
     if (changed) events.onCameraChange?.(p);
   }
 
@@ -771,7 +962,8 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     },
     setInsets(ins): void {
       insetsPx = { top: ins.top ?? 0, right: ins.right ?? 0, bottom: ins.bottom ?? 0, left: ins.left ?? 0 };
-      if (preset !== 'custom' && preset !== 'player') {
+      // Every preset frames itself in the free area (the Player view keeps the pocket clear of the controls).
+      if (preset !== 'custom') {
         const o = presetOrbit(preset);
         if (o) goTo(o, true);
       }

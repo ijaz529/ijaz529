@@ -25,8 +25,12 @@ async function screenOf(page: Page, what: { ball?: string; pocket?: string }) {
   }, what);
 }
 /** Two frames later and no camera transition running (insets are applied on the next frame). */
-const settled = (page: Page) =>
-  page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(!(window as unknown as { __cuesight: Hook }).__cuesight.view3d?.isAnimating?.())))));
+const settled = async (page: Page) => {
+  // Playwright's waitForFunction treats a returned Promise as truthy (it does not await it), so the
+  // camera wait is a plain predicate, then two frames so the final camera pose has been drawn.
+  await page.waitForFunction(() => !(window as unknown as { __cuesight: Hook }).__cuesight.view3d?.isAnimating?.());
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
+};
 
 /** Taps ball b1 then the top-right pocket: the 30° cut of the default practice layout. */
 async function planB1(page: Page) {
@@ -71,6 +75,10 @@ test.describe('3D practice table (feature 002 US1)', () => {
     await expect(play).toBeDisabled();
     await planB1(page);
     await expect(page.getByTestId('power')).toContainText('/10');
+    // The provisional stroke is replaced by the recommended one a moment later (its label and cue-ball
+    // path change): compare pictures of the final plan only.
+    await expect(page.getByTestId('shot-card')).toContainText('recommended for position', { timeout: 20_000 });
+    await settled(page);
     expect(await camera(page)).toBe('overview');
     const box = { x: 0, y: 0, width: page.viewportSize()!.width, height: Math.round(page.viewportSize()!.height * 0.6) };
     const top = await regionStats(page, box);

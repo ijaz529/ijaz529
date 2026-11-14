@@ -40,7 +40,11 @@ export type IconName =
   | 'list'
   | 'grid'
   | 'swap'
-  | 'flag';
+  | 'flag'
+  | 'gauge'
+  | 'more'
+  | 'skip'
+  | 'width';
 
 /** A gear outline: 8 rounded teeth, computed once (still hand-made geometry, no package). */
 function gearPath(): string {
@@ -111,6 +115,10 @@ const PATHS: Record<IconName, string> = {
   grid: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/>',
   swap: '<path d="M4 8.5h15l-3.5-3.5"/><path d="M20 15.5H5l3.5 3.5"/>',
   flag: '<path d="M5.5 21V4"/><path d="M5.5 4.5h11l-2.2 4 2.2 4h-11"/>',
+  gauge: '<path d="M3.8 16.5a8.5 8.5 0 1 1 16.4 0"/><path d="M12 13.5l4.2-4.2"/><circle cx="12" cy="14" r="1.3"/>',
+  more: '<circle cx="5.5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="18.5" cy="12" r="1.3"/>',
+  skip: '<path d="M5.5 6.2v11.6a.8.8 0 0 0 1.25.66l8.2-5.8a.8.8 0 0 0 0-1.32l-8.2-5.8A.8.8 0 0 0 5.5 6.2z"/><path d="M18.5 5.5v13"/>',
+  width: '<path d="M4 5v14M20 5v14"/><path d="M7.5 12h9M10 9.5L7.5 12l2.5 2.5M14 9.5l2.5 2.5-2.5 2.5"/>',
 };
 
 export const ICON_NAMES = Object.keys(PATHS) as IconName[];

@@ -141,23 +141,69 @@ export function fitDistance(base: Omit<Orbit, 'dist'>, pts: V3[], aspect: number
  * Top-down view with the table's long axis along the viewport's long axis. Landscape: +x to the
  * right, +y up (like the 2D TableView). Portrait: +x up, +y to the left.
  */
-export function overviewOrbit(g: TableGeom, aspect: number, ins: Insets = NO_INSETS): Orbit {
+/**
+ * Whether presets lay the table's long axis across the screen. The free area's shape decides, with
+ * a bias toward the screen's own orientation, so a sheet or a bar appearing on a portrait phone does
+ * not turn the table sideways (it used to flip and shrink when the shot card appeared).
+ */
+export function landscapeFrame(aspect: number, ins: Insets = NO_INSETS): boolean {
   const effAspect = (aspect * (1 - ins.left - ins.right)) / Math.max(0.05, 1 - ins.top - ins.bottom);
-  const yaw = effAspect >= 1 ? -Math.PI / 2 : Math.PI;
+  return aspect >= 1 ? effAspect >= 0.77 : effAspect >= 1.3;
+}
+
+export function overviewOrbit(g: TableGeom, aspect: number, ins: Insets = NO_INSETS): Orbit {
+  const yaw = landscapeFrame(aspect, ins) ? -Math.PI / 2 : Math.PI;
   const base = { target: [0, 0, 0] as V3, yaw, pitch: Math.PI / 2, fovY: 30 * DEG };
   return { ...base, dist: fitDistance(base, tableFramePoints(g), aspect, ins, 0.035) };
 }
 
 /** Elevated three-quarter view from a corner side (TV broadcast style). */
 export function broadcastOrbit(g: TableGeom, aspect: number, ins: Insets = NO_INSETS): Orbit {
-  const effAspect = (aspect * (1 - ins.left - ins.right)) / Math.max(0.05, 1 - ins.top - ins.bottom);
-  const landscape = effAspect >= 1;
+  const landscape = landscapeFrame(aspect, ins);
   // Landscape: from the bottom long rail, turned toward the bottom-left corner. Portrait: from
   // behind the left short rail, slightly off-axis, so the long axis recedes into the screen.
   const yaw = landscape ? -112 * DEG : 186 * DEG;
   const pitch = landscape ? 34 * DEG : 58 * DEG;
   const base = { target: [0, 0, 0] as V3, yaw, pitch, fovY: (landscape ? 38 : 46) * DEG };
-  return { ...base, dist: fitDistance(base, tableFramePoints(g), aspect, ins, 0.04) };
+  return centreFrame(base, tableFramePoints(g), aspect, ins, 0.04);
+}
+
+/**
+ * Fits the points (fitDistance) and then moves the look-at target so their projection is centred
+ * in the free rectangle: an oblique view otherwise sits low (the near end is bigger), leaving a void
+ * above the table on tall screens.
+ */
+export function centreFrame(base: Omit<Orbit, 'dist'>, pts: V3[], aspect: number, ins: Insets = NO_INSETS, margin = 0.04): Orbit {
+  let o: Orbit = { ...base, dist: fitDistance(base, pts, aspect, ins, margin) };
+  const shift = insetShift(ins);
+  const cxFree = ins.left - ins.right;
+  const cyFree = ins.bottom - ins.top;
+  for (let k = 0; k < 4; k++) {
+    const m = cameraMatrices(o, aspect, shift);
+    let x0 = Infinity;
+    let x1 = -Infinity;
+    let y0 = Infinity;
+    let y1 = -Infinity;
+    for (const p of pts) {
+      const q = project(m.vp, p, 2, 2);
+      if (!q) return o;
+      x0 = Math.min(x0, q.x - 1);
+      x1 = Math.max(x1, q.x - 1);
+      y0 = Math.min(y0, 1 - q.y);
+      y1 = Math.max(y1, 1 - q.y);
+    }
+    const dx = (x0 + x1) / 2 - cxFree;
+    const dy = (y0 + y1) / 2 - cyFree;
+    if (Math.abs(dx) < 0.004 && Math.abs(dy) < 0.004) break;
+    const b = orbitBasis(o);
+    const t = Math.tan(o.fovY / 2) * o.dist;
+    const sx = dx * t * aspect;
+    const sy = dy * t;
+    const target: V3 = [o.target[0] + b.right[0] * sx + b.up[0] * sy, o.target[1] + b.right[1] * sx + b.up[1] * sy, o.target[2] + b.right[2] * sx + b.up[2] * sy];
+    const nb = { ...base, target };
+    o = { ...nb, dist: fitDistance(nb, pts, aspect, ins, margin) };
+  }
+  return o;
 }
 
 export interface PlayerViewOpts {
@@ -165,36 +211,118 @@ export interface PlayerViewOpts {
   eyeHeight?: number;
   /** Eye distance behind the cue ball (m). */
   back?: number;
+  /**
+   * World points that must stay in frame (the pocket mouth, the end of the object-ball path): the
+   * eye backs off, then the view widens, then it turns a little toward them until they fit inside
+   * the inset rectangle (the part of the canvas no floating control covers).
+   */
+  keep?: V3[];
+  insets?: Insets;
+  /** Free margin kept around the keep points (fraction of the half-extent). */
+  margin?: number;
+  /** Elevation of the cue (rad): the eye stays above the cue's line, as a player's chin does. */
+  cueElevation?: number;
 }
+
+/** Eye low over the cue, as a player down on the shot sees it. ASSUMPTION (chin ~15–20 cm over the cue). */
+export const PLAYER_EYE_HEIGHT = 0.21;
+export const PLAYER_BACK = 0.5;
+/** Fit search (m, rad): backing off, widening, and turning toward the pocket are traded off by cost. */
+const FIT_BACKS = [0, 0.1, 0.22, 0.38];
+const FIT_FOVS = [0, 8 * DEG, 17 * DEG];
+const FIT_TURN_STEP = 0.035;
+const FIT_TURN_MAX = 0.55;
 
 /**
  * The player's eye: low behind the cue ball, opposite the aim direction, looking down the aim
  * line toward the ghost ball. The look point is lowered toward the cue ball when needed so the cue
- * ball stays in the lower part of the frame.
+ * ball stays in the lower part of the frame. With `keep` points, the framing is widened just
+ * enough to keep them (and the cue ball) inside the free part of the screen.
  */
 export function playerOrbit(g: TableGeom, cue: Vec2, aimDir: Vec2, ghost: Vec2 | null, aspect: number, opts: PlayerViewOpts = {}): Orbit {
-  const h = opts.eyeHeight ?? 0.3;
-  const back = opts.back ?? 0.55;
+  const h0 = opts.eyeHeight ?? PLAYER_EYE_HEIGHT;
+  const back0 = opts.back ?? PLAYER_BACK;
   const al = Math.hypot(aimDir.x, aimDir.y) || 1;
   const ax = aimDir.x / al;
   const ay = aimDir.y / al;
-  const fovY = (aspect >= 1 ? 50 : 58) * DEG;
-  const eye: V3 = [cue.x - ax * back, cue.y - ay * back, h];
+  const fov0 = (aspect >= 1 ? 50 : 58) * DEG;
   const dGhost = ghost ? Math.max(0.15, (ghost.x - cue.x) * ax + (ghost.y - cue.y) * ay) : 0.9;
-  // Angles below the horizon to the cue ball's centre and to the ghost ball's centre.
-  const toCue = Math.atan2(h - g.R, back);
-  const toGhost = Math.atan2(h - g.R, back + dGhost);
-  const half = fovY / 2;
-  // Use the frame for the table, not the room: put the horizon near the top edge, but keep the
-  // cue ball no higher than just above the centre and the ghost ball inside the frame.
-  let look = 0.78 * half;
-  look = Math.min(look, toCue + 0.1 * half);
-  look = Math.max(look, toCue - 0.8 * half, toGhost - 0.85 * half);
-  // Look point on the plane z = R along the aim line at depression `look`.
-  const run = (h - g.R) / Math.tan(Math.max(look, 1e-3));
-  const target: V3 = [eye[0] + ax * run, eye[1] + ay * run, g.R];
-  const dist = Math.hypot(run, h - g.R);
-  return { target, yaw: Math.atan2(-ay, -ax), pitch: Math.atan2(h - g.R, run), dist, fovY };
+
+  /** Orbit for an eye `back` behind the cue ball at height `h`, turned by `turn` rad from the aim. */
+  const minEye = (back: number) => g.R + Math.tan(opts.cueElevation ?? 0) * back + 0.07;
+  const build = (back: number, fovY: number, h0: number, turn: number): Orbit => {
+    const h = Math.max(h0, minEye(back));
+    const eye: V3 = [cue.x - ax * back, cue.y - ay * back, h];
+    // Angles below the horizon to the cue ball's centre and to the ghost ball's centre.
+    const toCue = Math.atan2(h - g.R, back);
+    const toGhost = Math.atan2(h - g.R, back + dGhost);
+    const half = fovY / 2;
+    // Use the frame for the table, not the room: put the horizon near the top edge, but keep the
+    // cue ball no higher than just above the centre and the ghost ball inside the frame.
+    let look = 0.78 * half;
+    look = Math.min(look, toCue + 0.1 * half);
+    look = Math.max(look, toCue - 0.8 * half, toGhost - 0.85 * half);
+    const c = Math.cos(turn);
+    const sn = Math.sin(turn);
+    const lx = ax * c - ay * sn;
+    const ly = ax * sn + ay * c;
+    // Look point on the plane z = R along the (turned) aim line at depression `look`.
+    const run = (h - g.R) / Math.tan(Math.max(look, 1e-3));
+    const target: V3 = [eye[0] + lx * run, eye[1] + ly * run, g.R];
+    const dist = Math.hypot(run, h - g.R);
+    return { target, yaw: Math.atan2(-ly, -lx), pitch: Math.atan2(h - g.R, run), dist, fovY };
+  };
+  const base = build(back0, fov0, h0, 0);
+  const keep = opts.keep ?? [];
+  if (!keep.length) return base;
+
+  const ins = opts.insets ?? NO_INSETS;
+  const margin = opts.margin ?? 0.06;
+  const shift = insetShift(ins);
+  const x0 = -1 + 2 * ins.left + margin;
+  const x1 = 1 - 2 * ins.right - margin;
+  const y0 = -1 + 2 * ins.bottom + margin;
+  const y1 = 1 - 2 * ins.top - margin;
+  const must: V3[] = [[cue.x, cue.y, g.R], ...keep];
+  /** How far outside the free rectangle the worst point is (≤ 0 = everything fits). */
+  const overflow = (o: Orbit): number => {
+    const m = cameraMatrices(o, aspect, shift);
+    let worst = -Infinity;
+    for (const p of must) {
+      const q = project(m.vp, p, 2, 2);
+      if (!q) return Infinity;
+      const nx = q.x - 1;
+      const ny = 1 - q.y;
+      worst = Math.max(worst, x0 - nx, nx - x1, y0 - ny, ny - y1);
+    }
+    return worst;
+  };
+  if (overflow(base) <= 0) return base;
+  // Turn toward the side the keep points are on (the pocket of a cut): look between the aim line
+  // and the pocket, as a player's eyes do; widen and back off only as much as still needed.
+  let side = 0;
+  for (const p of keep) side += Math.sign(ax * (p[1] - cue.y) - ay * (p[0] - cue.x));
+  const turnDir = side >= 0 ? 1 : -1;
+  let best = base;
+  let bestOver = overflow(base);
+  let bestCost = Infinity;
+  for (const db of FIT_BACKS)
+    for (const df of FIT_FOVS)
+      for (let t = 0; t <= FIT_TURN_MAX + 1e-9; t += FIT_TURN_STEP) {
+        const cost = t * 1.0 + df * 2.2 + db * 1.6;
+        if (cost >= bestCost) continue;
+        const o = build(back0 + db, fov0 + df, h0 + db * 0.3, turnDir * t);
+        const v = overflow(o);
+        if (v <= 0) {
+          best = o;
+          bestCost = cost;
+          bestOver = v;
+        } else if (bestCost === Infinity && v < bestOver) {
+          best = o;
+          bestOver = v;
+        }
+      }
+  return best;
 }
 
 export function lerpOrbit(a: Orbit, b: Orbit, t: number): Orbit {

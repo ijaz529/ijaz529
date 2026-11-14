@@ -8,7 +8,7 @@ import type { Settings } from '../settings';
 import type { AppState } from '../store';
 import { DRILLS } from '../drills';
 import { iconMarkup, type IconName } from './icons';
-import { ballChip } from './shot-card';
+import { ballChip, marginText } from './shot-card';
 import { createSpinPad } from './spin-pad';
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -32,25 +32,43 @@ function button(label: string, action: string, title: string, ic: IconName): str
 }
 
 export function buildToolbar(el: HTMLElement, actions: ToolbarActions) {
+  // Phones show the primary tools and a More menu (the rest); wider screens show everything inline.
   el.innerHTML = `
     <div class="tools camera-only" role="group" aria-label="Camera tools">
       ${button('Freeze', 'freeze', 'Freeze the detected layout', 'snowflake')}
-      ${button('Calibrate', 'calibrate', 'Tap the four corners of the cloth', 'crosshair')}
-      ${button('Rotate', 'swap', 'Swap long and short rails', 'swap')}
-      ${button('Cue ball', 'mark-cue', 'Tap the cue ball if it was not found', 'ball')}
     </div>
     <div class="tools practice-only" role="group" aria-label="Practice table tools">
-      <label class="drill">${iconMarkup('list', 20)}<span class="sr-only">Drill</span>
-        <select data-action="drill" aria-label="Practice layout">${DRILLS.map((d) => `<option value="${d.id}">${d.name}</option>`).join('')}</select>${iconMarkup('chevron-down', 16, 'drill-chev')}</label>
-      ${button('Add', 'add', 'Add a ball', 'plus')}
-      ${button('Remove', 'remove', 'Remove the selected ball', 'minus')}
+      <label class="drill tool" title="Practice layout">${iconMarkup('list', 22)}<span class="tool-label">Drill</span>
+        <select data-action="drill" aria-label="Practice layout">${DRILLS.map((d) => `<option value="${d.id}">${d.name}</option>`).join('')}</select></label>
     </div>
     <div class="tools shared" role="group" aria-label="Shot tools">
       ${button('Suggest', 'suggest', 'Suggest the best shots', 'sparkles')}
       ${button('Position', 'position', 'Tap where the cue ball should stop', 'target')}
+    </div>
+    <button type="button" class="tool tool-more" aria-expanded="false" aria-controls="tools-more" title="More tools" aria-label="More tools">${iconMarkup('more', 22)}<span class="tool-label">More</span></button>
+    <div class="tools more" id="tools-more" role="group" aria-label="More tools">
+      <span class="camera-only">${button('Calibrate', 'calibrate', 'Tap the four corners of the cloth', 'crosshair')}${button('Rotate', 'swap', 'Swap long and short rails', 'swap')}${button('Cue ball', 'mark-cue', 'Tap the cue ball if it was not found', 'ball')}</span>
+      <span class="practice-only">${button('Add', 'add', 'Add a ball', 'plus')}${button('Remove', 'remove', 'Remove the selected ball', 'minus')}</span>
       ${button('Zones', 'zones', 'Show good cue-ball zones for a next ball', 'grid')}
       ${button('Clear', 'clear', 'Clear the selection', 'close')}
     </div>`;
+  const moreBtn = el.querySelector<HTMLButtonElement>('.tool-more')!;
+  const setMore = (open: boolean) => {
+    el.dataset.more = open ? 'open' : 'closed';
+    moreBtn.setAttribute('aria-expanded', String(open));
+  };
+  setMore(false);
+  moreBtn.addEventListener('click', () => setMore(el.dataset.more !== 'open'));
+  document.addEventListener('pointerdown', (e) => {
+    if (el.dataset.more === 'open' && !el.contains(e.target as Node)) setMore(false);
+  });
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && el.dataset.more === 'open') {
+      setMore(false);
+      moreBtn.focus();
+      e.stopPropagation();
+    }
+  });
   const map: Record<string, () => void> = {
     freeze: actions.freeze,
     calibrate: actions.calibrate,
@@ -65,7 +83,9 @@ export function buildToolbar(el: HTMLElement, actions: ToolbarActions) {
   };
   el.addEventListener('click', (e) => {
     const b = (e.target as HTMLElement).closest('button[data-action]') as HTMLButtonElement | null;
-    if (b) map[b.dataset.action!]?.();
+    if (!b) return;
+    if (b.closest('.tools.more')) setMore(false);
+    map[b.dataset.action!]?.();
   });
   el.querySelector('select')!.addEventListener('change', (e) => actions.drill((e.target as HTMLSelectElement).value));
   // Fade the edges of the dock only where there is more to scroll to.
@@ -156,7 +176,7 @@ function ballLook(s: AppState, id: string): { color?: string; stripe?: boolean }
   return b ? { ...(b.color ? { color: b.color } : {}), ...(b.stripe ? { stripe: true } : {}) } : {};
 }
 
-export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: string) => string, pocketName: (id: PocketId) => string, pick: (x: ShotSuggestion) => void): void {
+export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: string) => string, pocketName: (id: PocketId, targetId?: string) => string, pick: (x: ShotSuggestion) => void): void {
   if (!s.suggestions) {
     el.innerHTML = '';
     delete el.dataset.revealed;
@@ -175,7 +195,10 @@ export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: st
     .map((x, i) => {
       const look = ballLook(s, x.targetId);
       const label = labelOf(x.targetId);
-      return `<li><button type="button" class="sugg" data-i="${i}"><span class="rank" aria-hidden="true">${i + 1}</span>${ballChip(label, look.color, look.stripe)}<span class="sugg-main"><b>${esc(label)}</b> → ${esc(pocketName(x.pocketId))}</span><span class="chip diff diff-${x.difficulty.replace(' ', '-')}">${x.difficulty} · ±${x.toleranceDeg.toFixed(2)}°</span>${iconMarkup('chevron-right', 18, 'go')}</button></li>`;
+      // The chip already shows a numbered ball's number: the text says it only to screen readers. The
+      // margin is in mm of contact, the shot card's unit.
+      const numbered = /^\d+$/.test(label);
+      return `<li><button type="button" class="sugg" data-i="${i}"><span class="rank" aria-hidden="true">${i + 1}</span>${ballChip(label, look.color, look.stripe)}<span class="sugg-main">${numbered ? `<span class="sr-only">Ball ${esc(label)} </span>` : `<b>${esc(label)}</b> `}→ ${esc(pocketName(x.pocketId, x.targetId))}</span><span class="chip diff diff-${x.difficulty.replace(' ', '-')}">${x.difficulty} · ${esc(marginText(x))}</span>${iconMarkup('chevron-right', 18, 'go')}</button></li>`;
     })
     .join('')}</ol></section>`;
   el.querySelectorAll<HTMLButtonElement>('button[data-i]').forEach((b) => b.addEventListener('click', () => pick(s.suggestions!.items[Number(b.dataset.i)]!)));
@@ -210,7 +233,7 @@ export function buildSettings(dialog: HTMLDialogElement, get: () => Settings, ap
           ${row('Table', sel('table', presetOpts), 'ruler')}
           ${row('Cloth speed', sel('cloth', '<option value="fast">Fast (new cloth)</option><option value="normal">Normal</option><option value="slow">Slow (worn / humid)</option>'), 'layers')}
           ${row('Cushions', sel('cushions', '<option value="dead">Dead</option><option value="normal">Normal</option><option value="lively">Lively</option>'), 'swap')}
-          ${row('Cushion width (cm)', '<input name="cushionWidthCm" type="number" min="2" max="10" step="0.5" inputmode="decimal"/>', 'ruler')}
+          ${row('Cushion width (cm)', '<input name="cushionWidthCm" type="number" min="2" max="10" step="0.5" inputmode="decimal"/>', 'width')}
         </div>
         <p class="group-label">Cue &amp; camera</p>
         <div class="group">

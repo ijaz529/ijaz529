@@ -9,7 +9,7 @@ import { planShot } from '../../../src/core/shot/planner';
 import { makeTable } from '../../../src/core/table';
 import type { Ball, TablePresetId, TableLayout, Vec2 } from '../../../src/core/types';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
-import { buildPlayerGuide, cameraCenter, confidenceLabel, occluded, projectPolyline, scaleFocal, strikeHeadline } from '../../../src/app/snap/guide';
+import { buildPlayerGuide, cameraCenter, confidenceLabel, guideFocus, occluded, projectPolyline, scaleFocal, strikeFace, strikeHeadline, strikeWords } from '../../../src/app/snap/guide';
 import { initialSnap, snapReducer, snapStage, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
 import { describeSpin } from '../../../src/core/shot/power';
 import type { CameraPose, PlayerViewResult } from '../../../src/vision/player-view';
@@ -48,6 +48,64 @@ function inside(poly: Vec2[], q: Vec2): boolean {
   return c;
 }
 const centroid = (pts: Vec2[]) => ({ x: pts.reduce((s, p) => s + p.x, 0) / pts.length, y: pts.reduce((s, p) => s + p.y, 0) / pts.length });
+
+describe('strike point shown face-on (the picture agrees with the words)', () => {
+  it('a high hit is above the face centre, low below, right to the right — on the real fixture photo', () => {
+    for (const vert of [0.1, 0.25, 0.4]) {
+      const f = guide(0, vert).face!;
+      expect(f).not.toBeNull();
+      expect(f.dot.y).toBeLessThan(f.c.y - 0.05 * f.r); // above centre on screen
+      // whereas the projected 3D point on the back of the ball, seen from above, is not
+      void f;
+    }
+    for (const vert of [-0.1, -0.25, -0.4]) {
+      const f = guide(0, vert).face!;
+      expect(f.dot.y).toBeGreaterThan(f.c.y + 0.05 * f.r);
+    }
+    const r = guide(0.25, 0).face!;
+    const l = guide(-0.25, 0).face!;
+    expect(r.dot.x).toBeGreaterThan(r.c.x + 0.1 * r.r);
+    expect(l.dot.x).toBeLessThan(l.c.x - 0.1 * l.r);
+    // The face sits on the photo's cue ball.
+    const g = guide(0, 0.25);
+    expect(inside(g.cueBall, g.face!.c)).toBe(true);
+    expect(Math.abs(g.face!.r - g.cueRadiusPx)).toBeLessThan(1e-9);
+  });
+  it('strikeFace maps tips to the disc and keeps the dot on the face', () => {
+    const f = strikeFace({ x: 100, y: 100 }, 40, 0.25, 0.5);
+    expect(f.dot).toEqual({ x: 110, y: 80 });
+    expect(f.miscueR).toBeCloseTo(20, 9);
+    const far = strikeFace({ x: 0, y: 0 }, 40, 3, 0);
+    expect(Math.hypot(far.dot.x, far.dot.y)).toBeLessThanOrEqual(40);
+  });
+  it('words a player can follow', () => {
+    expect(strikeWords({ side: 0, vert: 0 })).toBe('dead centre');
+    expect(strikeWords({ side: 0, vert: 0.125 })).toBe('½ tip above centre');
+    expect(strikeWords({ side: 0.25, vert: -0.25 })).toBe('1 tip below centre, 1 tip right');
+    expect(strikeWords({ side: -0.0625, vert: 0.375 })).toBe('1½ tips above centre, ¼ tip left');
+  });
+  it('the cue line follows the squirt-corrected cue direction, not the cue-ball path', () => {
+    const straight = guide(0, 0);
+    const side = guide(0.4, 0);
+    const end = (g: ReturnType<typeof guide>) => g.cueAxis.flat().at(-1)!;
+    // With right english the cue is aimed right of the path: its far end swings left on the photo
+    // (the cue points away from the shooter toward the right of the line).
+    expect(Math.abs(end(side).x - end(straight).x)).toBeGreaterThan(1);
+  });
+  it('focus region covers cue ball, ghost, target and pocket inside the photo', () => {
+    const g = guide(0, 0.1);
+    const f = guideFocus(g, ph.width, ph.height)!;
+    expect(f).not.toBeNull();
+    for (const p of [...g.cueBall, ...g.ghost, ...g.target]) {
+      if (p.x < 0 || p.y < 0 || p.x > ph.width || p.y > ph.height) continue;
+      expect(p.x).toBeGreaterThanOrEqual(f.x0 - 1e-9);
+      expect(p.x).toBeLessThanOrEqual(f.x1 + 1e-9);
+      expect(p.y).toBeGreaterThanOrEqual(f.y0 - 1e-9);
+      expect(p.y).toBeLessThanOrEqual(f.y1 + 1e-9);
+    }
+    expect(f.x1 - f.x0).toBeLessThan(ph.width);
+  });
+});
 
 describe('player guide geometry on the fixture pose', () => {
   it('puts the cue ball and the target ball where the photo shows them', () => {
@@ -150,7 +208,7 @@ describe('guide wording and helpers', () => {
   });
   it('strike headline speaks like a coach', () => {
     expect(strikeHeadline({ side: 0, vert: 0 }, describeSpin)).toBe('Strike dead centre');
-    expect(strikeHeadline({ side: 0, vert: -0.125 }, describeSpin)).toBe('Strike ½ tip low');
+    expect(strikeHeadline({ side: 0, vert: -0.125 }, describeSpin)).toBe('Strike ½ tip below centre');
   });
 });
 

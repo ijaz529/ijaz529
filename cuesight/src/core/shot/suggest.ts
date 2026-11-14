@@ -17,7 +17,9 @@ export function suggestShots(layout: TableLayout, params: PhysicsParams, max = 3
       const g = shotGeometry(layout.table, layout.balls, cue, target, pocket);
       if (!g.makeable || g.blockersCue.length || g.blockersObject.length) continue;
       const tol = deg(g.toleranceRad);
-      cands.push({ targetId: target.id, pocketId: pocket.id, toleranceDeg: tol, difficulty: difficultyOf(tol), score: Math.log10(Math.max(tol, 1e-4)) });
+      // Contact margin on the object ball (mm), as the shot card shows it (planner.ts toleranceMm).
+      const toleranceMm = g.window.halfRad * 2 * layout.table.ballRadius * Math.cos(g.cut) * 1000;
+      cands.push({ targetId: target.id, pocketId: pocket.id, toleranceDeg: tol, toleranceMm, difficulty: difficultyOf(tol), score: Math.log10(Math.max(tol, 1e-4)) });
     }
   }
   cands.sort((a, b) => b.score - a.score);

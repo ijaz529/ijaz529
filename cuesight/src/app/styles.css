@@ -16,7 +16,7 @@
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #f4f6fb;
   --text-2: #a9b3c7;
-  --text-3: #6b768c; /* large or decorative text only */
+  --text-3: #8590a6; /* ≥ 4.5:1 on --bg-2 */
   --accent: #56b4e9;
   --accent-2: #0072b2;
   --on-accent: #06121f;
@@ -45,9 +45,12 @@
   --safe-r: env(safe-area-inset-right, 0px);
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-l: env(safe-area-inset-left, 0px);
-  --bar-h: 52px;
-  --dock-h: 60px;
-  --sheet-peek: 226px;
+  --bar-h: 56px;
+  --dock-h: 52px;
+  /* Peek: the headline (ball → pocket, margin) and the cut / power / spin numerals; nothing else. */
+  --sheet-peek: 178px;
+  /* Medium detent: the headline plus the stroke controls; the table re-frames above it. */
+  --sheet-medium: 50dvh;
   --panel-w: clamp(320px, 36vw, 400px);
   /* The free area of the stage, between the floating chrome (used by .view and by the 3D canvas). */
   --stage-top: calc(var(--safe-t) + 8px + var(--bar-h) + 8px);
@@ -278,18 +281,18 @@ button.secondary {
   min-width: 0;
   display: flex;
   gap: 2px;
-  padding: 3px;
+  padding: 2px;
   margin: 0 auto;
   max-width: 340px;
   border-radius: var(--r-pill);
   background: rgba(0, 0, 0, 0.32);
-  border: 1px solid var(--border);
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 .mode-switch button {
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 38px;
-  height: 38px;
+  min-height: 44px;
+  height: 44px;
   padding: 0 8px;
   display: inline-flex;
   align-items: center;
@@ -660,8 +663,8 @@ body[data-mode='snap'] .toolbar {
 }
 .tool {
   flex: 0 0 auto;
-  min-width: 54px;
-  height: 50px;
+  min-width: 56px;
+  height: 46px;
   padding: 4px 6px 3px;
   display: inline-flex;
   flex-direction: column;
@@ -678,7 +681,7 @@ body[data-mode='snap'] .toolbar {
   height: 22px;
 }
 .tool-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.01em;
   line-height: 1.1;
@@ -694,30 +697,20 @@ body[data-mode='snap'] .toolbar {
 }
 .drill {
   position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 44px;
-  padding: 0 10px;
-  margin-right: 2px;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid var(--border);
-  color: var(--text-2);
+  cursor: pointer;
 }
+/* The native picker (a wheel on iOS, a list elsewhere) opens from an invisible select over the tool. */
 .drill select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
   appearance: none;
   -webkit-appearance: none;
-  min-height: 44px;
-  max-width: 150px;
-  padding: 0 18px 0 0;
-  margin-right: -18px;
   border: 0;
-  background: transparent;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-  text-overflow: ellipsis;
+  margin: 0;
+  font-size: 16px;
   cursor: pointer;
 }
 .drill select:focus-visible {
@@ -771,7 +764,7 @@ body[data-mode='snap'] .toolbar {
 /* First-run hint: never blocks the table (pointer-transparent) */
 .onboard {
   position: absolute;
-  z-index: 12;
+  z-index: 16; /* above the view controls and the dock while it shows (first run only) */
   left: 50%;
   bottom: calc(var(--stage-bottom) + 6px);
   transform: translateX(-50%);
@@ -877,7 +870,15 @@ body[data-mode='snap'] .toolbar {
 }
 .panel[data-sheet='expanded'] {
   height: calc(100% - var(--safe-t) - 8px - var(--bar-h) - 10px);
-  background: rgba(14, 20, 34, 0.9);
+}
+.panel[data-sheet='medium'] {
+  height: calc(var(--sheet-medium) + var(--safe-b));
+}
+/* Opened up, the sheet is solid: glass over the dock and the controls bled through as bands. */
+.panel:is([data-sheet='expanded'], [data-sheet='medium'], [data-sheet='static']) {
+  background: var(--surface-solid);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 .panel.dragging {
   transition: none;
@@ -989,15 +990,17 @@ body[data-mode='snap'] .toolbar {
 /* Headline row */
 .shot-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
   min-height: 36px;
 }
 .title {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1 1 180px;
   min-width: 0;
   font-size: 17px;
   font-weight: 700;
@@ -1011,9 +1014,8 @@ body[data-mode='snap'] .toolbar {
 }
 .pocket-name {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .ball-chip {
   position: relative;
@@ -1115,7 +1117,7 @@ body[data-mode='snap'] .toolbar {
 }
 .hero-stat {
   min-width: 0;
-  padding: 10px 10px 10px;
+  padding: 8px 8px 9px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1132,13 +1134,13 @@ body[data-mode='snap'] .toolbar {
   letter-spacing: 0.08em;
 }
 .hero-main {
-  height: 48px;
+  height: 42px;
   display: grid;
   place-items: center;
   width: 100%;
 }
 .hero-stat .v {
-  font-size: 30px;
+  font-size: 29px;
   font-weight: 700;
   line-height: 1;
   letter-spacing: -0.02em;
@@ -1161,24 +1163,24 @@ body[data-mode='snap'] .toolbar {
   flex-wrap: wrap;
 }
 .fraction-glyph {
-  width: 40px;
-  height: 25px;
+  width: 34px;
+  height: 21px;
   flex: 0 0 auto;
 }
 .gauge-wrap {
   position: relative;
 }
 .power-meter {
-  width: 100px;
-  height: 58px;
-  margin-top: -8px;
+  width: 86px;
+  height: 50px;
+  margin-top: -6px;
 }
 .gauge-wrap .v {
   position: absolute;
   left: 0;
   right: 0;
-  bottom: -3px;
-  font-size: 22px;
+  bottom: -4px;
+  font-size: 21px;
 }
 .spin-ball {
   display: grid;
@@ -1233,7 +1235,7 @@ body[data-mode='snap'] .toolbar {
   margin: 12px 0 0;
   padding: 12px 14px;
   border-radius: var(--r-card);
-  background: linear-gradient(135deg, rgba(233, 196, 106, 0.1), rgba(233, 196, 106, 0.03));
+  background: linear-gradient(135deg, #2a2a26, #171c27);
   border: 1px solid rgba(233, 196, 106, 0.22);
 }
 .coach-icon {
@@ -1325,14 +1327,15 @@ body[data-mode='snap'] .toolbar {
   padding: 8px 10px 8px 8px;
   text-align: left;
   border-radius: 14px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.035));
+  background: #182136;
   border: 1px solid var(--border);
+  color: var(--text);
   font-size: 15px;
   font-weight: 500;
 }
 .suggest li button:hover {
   border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.09);
+  background: #1d2840;
 }
 .sugg .ball-chip {
   grid-area: ball;
@@ -1694,7 +1697,11 @@ dialog::backdrop {
   display: inline-flex;
   align-items: center;
   color: var(--text-2);
-  max-width: 55%;
+  flex: 0 0 auto;
+  width: min(190px, 52%);
+}
+.select-wrap select {
+  width: 100%;
 }
 .select-wrap .icon {
   position: absolute;
@@ -1722,7 +1729,8 @@ dialog::backdrop {
   background: var(--surface-solid);
 }
 .settings input[type='number'] {
-  width: 84px;
+  width: min(190px, 52%);
+  flex: 0 0 auto;
   padding: 0 10px;
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -1833,9 +1841,14 @@ body[data-mode='snap']:not(:has(#shot-card [data-testid='shot-card'])) :is(#stro
 /* Short portrait phones (iPhone SE): a slimmer peek */
 @media (max-height: 700px) and (orientation: portrait) {
   :root {
-    --sheet-peek: 204px;
-    --dock-h: 56px;
-    --bar-h: 48px;
+    --sheet-peek: 176px;
+    --dock-h: 50px;
+    --bar-h: 52px;
+    --sheet-medium: 56dvh;
+  }
+  .mode-switch button {
+    min-height: 44px;
+    height: 44px;
   }
   .hero {
     margin-top: 8px;
@@ -1861,7 +1874,7 @@ body[data-mode='snap']:not(:has(#shot-card [data-testid='shot-card'])) :is(#stro
     font-size: 20px;
   }
   .tool {
-    height: 46px;
+    height: 44px;
   }
   .camera-msg {
     gap: 10px;
@@ -2068,9 +2081,9 @@ body[data-mode='snap'] .view-controls {
 }
 .vc-btn,
 .vc-play {
-  width: 52px;
-  min-width: 52px;
-  height: 52px;
+  width: 50px;
+  min-width: 50px;
+  height: 50px;
   padding: 4px 2px 3px;
   display: inline-flex;
   flex-direction: column;
@@ -2081,7 +2094,7 @@ body[data-mode='snap'] .view-controls {
   border-radius: 14px;
   background: transparent;
   color: var(--text-2);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 650;
   letter-spacing: 0.01em;
 }
@@ -2122,9 +2135,11 @@ body[data-mode='snap'] .view-controls {
   transform: none;
 }
 .vc-play.playing {
+  /* Neutral: skipping a replay is not a warning (vermillion is reserved for warnings). */
   color: var(--text);
-  background: rgba(213, 94, 0, 0.85);
-  box-shadow: 0 8px 22px rgba(213, 94, 0, 0.3);
+  background: var(--surface-solid);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-1);
 }
 .vc-custom {
   max-width: 110px;
@@ -2854,4 +2869,942 @@ body[data-mode='snap'][data-snap='review'] .toast {
 /* No camera: the shutter has nothing to shoot. */
 .snap-cam:has(.cam-msg:not([hidden])) .cam-shutter {
   visibility: hidden;
+}
+
+/* =============================================================================================
+   Round-1 polish (design + player review): tool dock with a More menu, the sheet's medium detent,
+   the in-scene power/strike label, the headline warning and the not-makeable card.
+   ============================================================================================= */
+
+/* Tool dock: primary tools + More on phones; everything inline on wider screens. */
+.tools.more > span {
+  display: contents;
+}
+.drill:focus-within {
+  outline: 2.5px solid var(--gold);
+  outline-offset: 2px;
+}
+@media not ((orientation: landscape) or (min-width: 900px)) {
+  .toolbar,
+  .toolbar.more-left,
+  .toolbar.more-right,
+  .toolbar.more-left.more-right {
+    overflow: visible;
+    -webkit-mask-image: none;
+    mask-image: none;
+    padding: 3px 5px;
+  }
+  .tools.more {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    z-index: 2;
+    display: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    min-width: 196px;
+    padding: 6px;
+    border-radius: 18px;
+    background: var(--surface-solid);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-2);
+    animation: toast-in var(--dur-fast) var(--ease);
+  }
+  .toolbar[data-more='open'] .tools.more {
+    display: flex;
+  }
+  .tools.more .tool {
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 12px;
+    width: 100%;
+    height: 46px;
+    padding: 0 14px;
+    color: var(--text);
+  }
+  .tools.more .tool-label {
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .tool-more[aria-expanded='true'] {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.1);
+  }
+}
+@media (orientation: landscape), (min-width: 900px) {
+  .tool-more {
+    display: none;
+  }
+  .tools.more {
+    display: flex;
+    gap: 2px;
+  }
+  .tools.more::before {
+    content: '';
+    width: 1px;
+    height: 28px;
+    margin: 0 4px;
+    align-self: center;
+    background: var(--border-strong);
+  }
+}
+
+/* Sheet detents: the medium one shows the headline and the stroke controls, and the table
+   re-frames above it so the path can be watched while power and spin change. */
+body[data-sheet='medium'] {
+  --stage-bottom: calc(var(--sheet-medium) + var(--safe-b) + 10px);
+}
+.panel[data-sheet='medium'] #shot-card :is(.meta, .warnings, .coach, .details, .picker),
+.panel[data-sheet='medium'] .legend {
+  display: none;
+}
+body:is([data-sheet='medium'], [data-sheet='expanded']) .toolbar,
+body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
+  visibility: hidden;
+}
+
+/* Headline warning: visible at the sheet's resting height (icon + text, never colour alone). */
+.head-warn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: #33190b;
+  border: 1px solid rgba(213, 94, 0, 0.65);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+.head-warn span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.head-warn .icon {
+  flex: 0 0 auto;
+  color: #ff9b66;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero {
+  margin-top: 6px;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat .s {
+  display: none;
+}
+/* Not makeable: the reason and what to do instead replace the numerals. */
+.hero.blocked {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: #24170f;
+  border-color: rgba(213, 94, 0, 0.55);
+}
+.blocked-why {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.blocked-why .icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: #ff9b66;
+}
+.blocked-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.blocked-acts .btn {
+  min-height: 44px;
+  padding: 0 14px;
+  font-size: 14px;
+}
+.pace {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.pace .icon {
+  color: var(--accent);
+}
+.hero-stat .s {
+  min-height: 17px;
+}
+
+/* In-scene label: power and strike next to the cue ball (follows the camera every frame). */
+.scene-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 13;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px 7px 7px;
+  border-radius: 16px;
+  background: rgba(12, 19, 34, 0.9);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-1);
+  color: var(--text);
+  pointer-events: none;
+  will-change: transform;
+}
+.scene-label[hidden] {
+  display: none;
+}
+.sl-ball svg {
+  display: block;
+  filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.45));
+}
+.sl-body {
+  display: grid;
+  gap: 4px;
+}
+.sl-power {
+  display: flex;
+  align-items: baseline;
+  gap: 1px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.sl-power b {
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+}
+.sl-power small {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.sl-word {
+  margin-left: 7px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-2);
+}
+.sl-strike {
+  max-width: 150px;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+.power-bar {
+  display: block;
+}
+.scene-lead {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.scene-lead line {
+  stroke: rgba(244, 246, 251, 0.75);
+  stroke-width: 1.25;
+}
+.scene-lead circle {
+  fill: #f4f6fb;
+}
+
+/* Snap: the next action (Take photo / Choose…) sits at the bottom, in thumb reach while crouched. */
+.snap-view:not([data-step='intro']) .snap-cta-bar:not(:empty) {
+  display: flex;
+}
+.snap-cta-bar {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: min(calc(100% - 20px), 520px);
+  gap: 8px;
+  padding: 6px;
+  border-radius: 20px;
+  background: var(--surface-solid);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-2);
+}
+.snap-view[data-step='review'] .snap-cta-bar {
+  bottom: calc(var(--dock-h) + 10px);
+}
+.snap-cta-bar .btn {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 48px;
+  padding: 0 10px;
+  border-radius: 14px;
+  font-size: 15px;
+  white-space: nowrap;
+}
+.snap-cta-bar .btn.primary {
+  flex: 1.35 1 0;
+}
+.snap-cta-bar .btn.ghost {
+  flex: 0 0 auto;
+}
+/* Whole photo / Zoom to shot */
+.snap-zoom {
+  position: absolute;
+  z-index: 2;
+  bottom: 8px;
+  right: 8px;
+  min-height: 44px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--r-pill);
+  background: rgba(12, 19, 34, 0.88);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+.snap-zoom[hidden] {
+  display: none;
+}
+.hud-inset {
+  display: grid;
+  place-items: center;
+}
+.hud-tag {
+  font-size: 12px;
+}
+
+/* Live without a camera: a title, three ways forward, and no camera tools or stroke controls. */
+.camera-msg .msg-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.camera-msg .row .btn {
+  min-height: 46px;
+}
+body.camera-off :is(.toolbar, #stroke-controls, .legend) {
+  display: none;
+}
+
+/* Pickers: choose a ball or a pocket without tapping the table (keyboard, screen readers, small balls). */
+.picker {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.picker-k {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-2);
+}
+.picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pick-ball,
+.pick-pocket {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 0 8px;
+  border-radius: var(--r-pill);
+  background: #182136;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.pick-pocket {
+  padding: 0 14px;
+}
+.pick-ball .ball-chip {
+  width: 26px;
+  height: 26px;
+}
+.pick-pocket[aria-pressed='true'] {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: transparent;
+}
+/* The ball picker sits below the hint (beyond the peek): the table stays the first way to pick. */
+#shot-card > .picker {
+  margin-top: 14px;
+}
+
+/* Snap's layout-step view controls carry their labels too (same as Practice). */
+body[data-mode='snap'] .vc-btn,
+body[data-mode='snap'] .vc-play {
+  width: 50px;
+  min-width: 50px;
+  height: 48px;
+  min-height: 48px;
+}
+body[data-mode='snap'] :is(.vc-btn, .vc-play) span {
+  display: inline;
+}
+
+/* =============================================================================================
+   Round 2 polish (design + coach review): one-line hero tiles, the stroke line, scratch risks,
+   the in-scene label variants and the strike disc on the 3D cue ball.
+   ============================================================================================= */
+.hero-stat .s {
+  flex-wrap: nowrap;
+  max-width: 100%;
+  min-width: 0;
+  white-space: nowrap;
+}
+.hero-stat .s .t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hero-stat .s .fraction-glyph {
+  width: 26px;
+  height: 16px;
+}
+.panel[data-sheet='peek'] .hero-stat {
+  padding: 6px 6px 7px;
+  gap: 3px;
+}
+.panel[data-sheet='peek'] .hero-main {
+  height: 38px;
+}
+.strike-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 2px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.strike-line b {
+  color: var(--text);
+  font-weight: 700;
+}
+.strike-line .icon {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+.hero.blocked .warnings {
+  margin: 0;
+}
+.hero.blocked .warn-chip {
+  background: rgba(213, 94, 0, 0.16);
+}
+.warn-chip.warn-risk {
+  background: rgba(230, 159, 0, 0.12);
+  border-color: rgba(230, 159, 0, 0.5);
+}
+.warn-chip.warn-risk .icon {
+  color: var(--warn);
+}
+
+/* In-scene label: compact in Player view (the strike point is on the ball itself) and a warning
+   variant for shots that cannot be played as planned (no stroke shown). */
+.scene-label.compact {
+  padding: 8px 12px;
+}
+.scene-label.compact .sl-strike {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.scene-label.warn {
+  padding: 8px 12px 8px 10px;
+  background: rgba(36, 23, 15, 0.94);
+  border-color: rgba(213, 94, 0, 0.6);
+}
+.sl-warn-ic {
+  display: grid;
+  place-items: center;
+  color: #ff9b66;
+}
+.sl-warn {
+  max-width: 190px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.scene-label.warn .sl-strike {
+  color: var(--text-2);
+}
+.strike-face {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 11;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.45));
+  will-change: transform;
+}
+.strike-face[hidden] {
+  display: none;
+}
+.strike-face svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+body[data-sheet='expanded'] .strike-face {
+  visibility: hidden;
+}
+
+/* View controls (round 2): a horizontal segmented pill centred at the top of the stage (Top ·
+   Player · Orbit), and Play as a gold button in thumb reach at the dock's level on the right. The
+   table is framed centred in the free area (no column of controls beside it). */
+.view-controls {
+  inset: 0;
+  top: 0;
+  right: 0;
+  display: none;
+}
+body.has-3d[data-mode='practice'] .view-controls,
+body.has-3d[data-mode='snap'][data-snap='review']:not(:has(#snap[data-inspect='true'])) .view-controls {
+  display: block;
+}
+body[data-mode='snap'] .view-controls {
+  top: 0;
+}
+.vc-presets {
+  position: absolute;
+  top: calc(var(--stage-top) + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  flex-direction: row;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--r-pill);
+}
+body[data-mode='snap'] .vc-presets {
+  top: calc(var(--stage-top) + var(--snap-top-h, 0px) + 8px);
+}
+.vc-btn,
+body[data-mode='snap'] .vc-btn {
+  position: relative;
+  width: auto;
+  min-width: 0;
+  height: 36px;
+  min-height: 36px;
+  padding: 0 13px 0 10px;
+  flex-direction: row;
+  gap: 6px;
+  border-radius: var(--r-pill);
+  font-size: 13px;
+}
+.vc-btn::after {
+  /* 44 px touch target around the 36 px segment. */
+  content: '';
+  position: absolute;
+  inset: -4px 0;
+}
+.vc-btn .icon {
+  width: 18px;
+  height: 18px;
+}
+body[data-mode='snap'] .vc-btn span {
+  display: inline;
+}
+.vc-custom {
+  position: absolute;
+  top: calc(var(--stage-top) + 50px);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: none;
+  white-space: nowrap;
+}
+body[data-mode='snap'] .vc-custom {
+  top: calc(var(--stage-top) + var(--snap-top-h, 0px) + 56px);
+}
+.vc-play,
+body[data-mode='snap'] .vc-play {
+  position: absolute;
+  right: calc(var(--stage-right) + 10px);
+  bottom: calc(var(--sheet-peek) + var(--safe-b) + 8px);
+  width: var(--dock-h);
+  min-width: var(--dock-h);
+  height: var(--dock-h);
+  min-height: var(--dock-h);
+  border-radius: 18px;
+}
+.vc-play span {
+  font-size: 11px;
+}
+/* The dock moves left to make room for Play beside it. */
+body.has-3d[data-mode='practice'] .toolbar {
+  left: calc(50% - (var(--dock-h) + 8px) / 2);
+  max-width: calc(100% - 36px - var(--dock-h) - var(--safe-l) - var(--safe-r));
+}
+body[data-sheet='medium'] .vc-play {
+  bottom: calc(var(--sheet-medium) + var(--safe-b) + 10px);
+}
+/* Snap's layout step: Play sits at the end of the preset pill's row (the bottom holds the CTAs). */
+body[data-mode='snap'] .vc-play {
+  top: calc(var(--stage-top) + var(--snap-top-h, 0px) + 7px);
+  bottom: auto;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  border-radius: 14px;
+}
+body[data-mode='snap'] .vc-play span {
+  display: none;
+}
+@media (max-height: 760px) {
+  body[data-mode='snap'] .vc-play {
+    display: inline-flex;
+  }
+}
+@media (orientation: landscape), (min-width: 900px) {
+  .vc-play {
+    bottom: calc(var(--safe-b) + 8px);
+  }
+  body.has-3d[data-mode='practice'] .toolbar {
+    left: calc(50% - (var(--dock-h) + 8px) / 2);
+  }
+}
+
+/* Snap guide (round 2): a one-row top card, the photo notes folded into one banner, and the how-to
+   (strike, power, aim) at the top of the shot sheet, so the photo gets the screen. */
+.snap-view[data-step='guide'] .snap-instr {
+  display: none;
+}
+.snap-view[data-step='guide'] .snap-top {
+  gap: 6px;
+  padding-bottom: 8px;
+}
+.snap-notes {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 10px 0 12px;
+  border-radius: 12px;
+  background: #2a1709;
+  border: 1px solid rgba(213, 94, 0, 0.6);
+  color: var(--text);
+  font: 650 13px/1.2 var(--font);
+  text-align: left;
+  cursor: pointer;
+}
+.snap-notes[hidden] {
+  display: none;
+}
+.snap-notes > .icon:first-child {
+  flex: 0 0 auto;
+  color: #ff9b66;
+}
+.snap-notes .chev {
+  margin-left: auto;
+  color: var(--text-2);
+}
+#snap-hud {
+  display: none;
+}
+body[data-mode='snap'][data-snap='guide'] #snap-hud {
+  position: static;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  margin: 2px 0 10px;
+  padding: 0;
+  max-width: none;
+  background: none;
+  border: 0;
+  box-shadow: none;
+  border-radius: 0;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+#snap-hud .hud-inset {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: none;
+  box-shadow: none;
+}
+#snap-hud .hud-body {
+  gap: 3px;
+}
+#snap-hud .hud-strike {
+  font-size: 17px;
+}
+#snap-hud .hud-power {
+  gap: 8px;
+}
+#snap-hud .hud-power .power-meter {
+  width: 64px;
+  height: 38px;
+  margin: 0;
+}
+#snap-hud .hud-power-txt .num {
+  font-size: 22px;
+}
+#snap-hud .hud-power-txt span:last-child {
+  font-size: 12px;
+}
+#snap-hud .hud-aim {
+  font-size: 12.5px;
+  line-height: 1.25;
+}
+#snap-hud.unplayable .hud-power {
+  display: none;
+}
+#snap-hud.unplayable .hud-strike {
+  color: #ff9b66;
+}
+.hud-no {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: rgba(213, 94, 0, 0.14);
+  border: 1px solid rgba(213, 94, 0, 0.55);
+  color: #ff9b66;
+}
+.hud-acts:empty {
+  display: none;
+}
+.hud-acts .btn {
+  min-height: 44px;
+  margin-top: 4px;
+  padding: 0 14px;
+  font-size: 14px;
+}
+/* The card under the how-to: no second copy of power and spin. */
+body[data-mode='snap'][data-snap='guide'] #shot-card :is(.hero, .strike-line) {
+  display: none;
+}
+body[data-mode='snap'][data-snap='guide'] .snap-view .snap-photo {
+  bottom: 0;
+  right: 0;
+}
+@media not ((orientation: landscape) or (min-width: 900px)) {
+  body[data-mode='snap'][data-snap='guide'] {
+    --sheet-peek: 168px;
+  }
+}
+@media (orientation: landscape), (min-width: 900px) {
+  body[data-mode='snap'][data-snap='guide'] #snap-hud {
+    grid-template-columns: 72px minmax(0, 1fr);
+    text-align: left;
+    justify-items: stretch;
+  }
+  #snap-hud .hud-power {
+    flex-direction: row;
+  }
+  #snap-hud .hud-power-txt {
+    justify-items: start;
+  }
+}
+/* The step chip ellipsizes on narrow phones instead of being cut mid-word. */
+.snap-chip {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.snap-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.snap-chip .icon {
+  flex: 0 0 auto;
+}
+@media (max-width: 380px) {
+  .sp-step[data-state='done'] .sp-name {
+    display: none;
+  }
+}
+
+/* Empty and error states (round 2): one message at a time. The first-run hint and the camera-off
+   card replace the sheet instead of repeating it underneath. */
+@media not ((orientation: landscape) or (min-width: 900px)) {
+  body.camera-off .panel {
+    display: none;
+  }
+  body.camera-off {
+    --stage-bottom: calc(var(--safe-b) + 12px);
+  }
+  /* First run: the hint takes the sheet's place (same space, so dismissing it moves nothing under the
+     player's finger: the first tap both dismisses it and lands on the table). */
+  body.onboarding .panel {
+    visibility: hidden;
+  }
+  body.onboarding .onboard {
+    bottom: calc(var(--safe-b) + 8px);
+  }
+}
+.camera-msg .row {
+  flex-direction: column;
+  align-items: stretch;
+  width: min(100%, 340px);
+}
+.camera-msg .row .btn {
+  width: 100%;
+  justify-content: center;
+}
+#btn-practice-fallback {
+  order: -1;
+}
+/* iPad: the Snap intro needs no side panel (it held one sentence). */
+@media (min-width: 900px) and (min-height: 600px) {
+  body[data-mode='snap'][data-snap='intro'] .panel {
+    display: none;
+  }
+  body[data-mode='snap'][data-snap='intro'] .stage {
+    right: calc(var(--safe-r) + 0px);
+  }
+}
+@media (orientation: landscape), (min-width: 900px) {
+  body.camera-off .panel {
+    display: none;
+  }
+  body.camera-off .stage {
+    right: var(--safe-r);
+  }
+}
+/* The camera pill is a little slimmer: 30 px segments, still 44 px touch targets. */
+.vc-btn,
+body[data-mode='snap'] .vc-btn {
+  height: 30px;
+  min-height: 30px;
+  padding: 0 12px 0 9px;
+}
+.vc-btn::after {
+  inset: -7px 0;
+}
+.sl-word {
+  white-space: nowrap;
+}
+/* Slow-motion replay toggle, stacked above Play. */
+.vc-slow {
+  position: absolute;
+  right: calc(var(--stage-right) + 10px + (var(--dock-h) - 40px) / 2);
+  bottom: calc(var(--sheet-peek) + var(--safe-b) + 8px + var(--dock-h) + 8px);
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--surface);
+  -webkit-backdrop-filter: var(--blur);
+  backdrop-filter: var(--blur);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font: 700 13px/1 var(--font);
+  font-variant-numeric: tabular-nums;
+  pointer-events: auto;
+}
+.vc-slow::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+}
+.vc-slow[aria-pressed='true'] {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-color: transparent;
+}
+.vc-slow:disabled {
+  opacity: 0;
+  pointer-events: none;
+}
+body[data-sheet='medium'] .vc-slow {
+  bottom: calc(var(--sheet-medium) + var(--safe-b) + 10px + var(--dock-h) + 8px);
+}
+body[data-mode='snap'] .vc-slow {
+  display: none;
+}
+@media (orientation: landscape), (min-width: 900px) {
+  .vc-slow {
+    bottom: calc(var(--safe-b) + 8px + var(--dock-h) + 8px);
+  }
+}
+/* Top-view ball number tags (small glass pills, up-right of each ball). */
+.ball-tags {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  overflow: hidden;
+}
+.ball-tags[hidden],
+.ball-tag[hidden] {
+  display: none;
+}
+.ball-tag {
+  position: absolute;
+  left: 0;
+  top: 0;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-pill);
+  background: rgba(7, 11, 20, 0.78);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font: 700 10.5px/1 var(--font);
+  font-variant-numeric: tabular-nums;
+  will-change: transform;
+}
+body:is([data-sheet='expanded'], [data-sheet='medium']) .ball-tags {
+  visibility: hidden;
+}
+/* Settings on a landscape phone: two columns, so the whole form shows without scrolling 3½ rows. */
+@media (orientation: landscape) and (max-height: 500px) {
+  .settings .dlg-scroll {
+    columns: 2;
+    column-gap: 16px;
+  }
+  .settings .dlg-scroll > * {
+    break-inside: avoid;
+  }
+  .settings .group-label {
+    break-after: avoid;
+  }
+}
+.scene-label.noball {
+  padding: 8px 12px;
+}
+.scene-label.noball .sl-strike {
+  max-width: 130px;
+}
+/* Phones: the next step's name gives way to the status chip (it reads "2" until it is the step). */
+@media (max-width: 430px) {
+  .snap-top-row:has(.snap-chip:not([hidden])) .sp-step[data-state='todo'] .sp-name {
+    display: none;
+  }
+}
+/* The how-to in the sheet / side panel: none of the old floating-HUD sizing applies. */
+body[data-mode='snap'][data-snap='guide'] #snap-hud {
+  width: auto;
+  max-height: none;
+  overflow: visible;
+  inset: auto;
 }

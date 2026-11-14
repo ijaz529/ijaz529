@@ -20,6 +20,9 @@ const ICONS: { file: string; size: number; alpha: boolean }[] = [
   { file: 'public/icons/icon-512.png', size: 512, alpha: true },
   { file: 'public/icons/icon-maskable-512.png', size: 512, alpha: false },
   { file: 'ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png', size: 1024, alpha: false },
+  // iOS 18 appearances: dark keeps a transparent background, tinted is opaque greyscale.
+  { file: 'ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-dark.png', size: 1024, alpha: true },
+  { file: 'ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-tinted.png', size: 1024, alpha: false },
 ];
 
 describe('app icons', () => {
@@ -43,11 +46,20 @@ describe('app icons', () => {
     }
   });
 
-  it('the iOS asset catalog references the single 1024 px universal icon', () => {
+  it('the iOS asset catalog references the 1024 px universal icon and its dark and tinted appearances', () => {
     const c = JSON.parse(readFileSync('ios/App/App/Assets.xcassets/AppIcon.appiconset/Contents.json', 'utf8')) as {
-      images: { filename: string; idiom: string; platform: string; size: string }[];
+      images: { filename: string; idiom: string; platform: string; size: string; appearances?: { appearance: string; value: string }[] }[];
     };
-    expect(c.images).toEqual([{ filename: 'AppIcon-1024.png', idiom: 'universal', platform: 'ios', size: '1024x1024' }]);
+    expect(c.images[0]).toEqual({ filename: 'AppIcon-1024.png', idiom: 'universal', platform: 'ios', size: '1024x1024' });
+    const byLook = (v: string) => c.images.find((i) => i.appearances?.some((a) => a.appearance === 'luminosity' && a.value === v));
+    expect(byLook('dark')).toMatchObject({ filename: 'AppIcon-1024-dark.png', idiom: 'universal', platform: 'ios', size: '1024x1024' });
+    expect(byLook('tinted')).toMatchObject({ filename: 'AppIcon-1024-tinted.png', idiom: 'universal', platform: 'ios', size: '1024x1024' });
+    expect(c.images).toHaveLength(3);
+    for (const i of c.images) expect(existsSync(`ios/App/App/Assets.xcassets/AppIcon.appiconset/${i.filename}`)).toBe(true);
+  });
+  it('the tinted appearance is greyscale', () => {
+    const b = readFileSync('ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-tinted.png');
+    expect(b[25]).toBe(2);
   });
 });
 

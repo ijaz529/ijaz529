@@ -4,9 +4,9 @@
  */
 import './styles.css';
 import { planShot, stunVert } from '../core/shot/planner';
-import { powerToSpeed } from '../core/shot/power';
+import { powerToSpeed, speedReference } from '../core/shot/power';
 import { POCKET_NAMES, clampToTable } from '../core/table';
-import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, TableLayout, Vec2 } from '../core/types';
+import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, StrokeRisk, TableLayout, Vec2 } from '../core/types';
 import { dist } from '../core/vec';
 import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut, type VisionOut } from '../workers/protocol';
 import { FrameGrabber, describeCameraError, startCamera, stopCamera } from './camera';
@@ -15,15 +15,19 @@ import { Overlay, containMapping, type OverlayData } from './render/overlay';
 import { rgbCss } from './render/palette';
 import { TableView } from './render/table-view';
 import { loadSettings, physicsFor, saveSettings, tableFor, type Settings } from './settings';
-import { perspectivePocketNames } from './pocket-names';
+import { createAnnouncer } from './announce';
+import { perspectivePocketNames, shooterPocketNames } from './pocket-names';
 import { createStore, type AppState, type Mode } from './store';
-import { createTable3D, type CameraPreset, type Pick3D, type Scene3DData, type Table3D } from './render3d';
+import { createTable3D, type CameraPreset, type FrameInfo, type Pick3D, type Scene3DData, type Table3D } from './render3d';
+import { landscapeFrame } from './render3d/camera';
 import { createSnapController } from './snap/controller';
 import { initialSnap, snapReducer, type SnapEvent } from './snap/session';
 import { buildSettings, buildStrokeControls, buildToolbar, renderSuggestions } from './ui/controls';
 import { hydrateIcons } from './ui/icons';
 import { mountOnboarding } from './ui/onboarding';
 import { createSheet } from './ui/sheet';
+import { createBallTags } from './ui/ball-tags';
+import { createShotLabel, type LabelContent } from './ui/scene-labels';
 import { renderShotCard } from './ui/shot-card';
 import { hideSplash } from './ui/splash';
 import { buildViewControls } from './ui/view-controls';
@@ -86,6 +90,45 @@ const viewControlsEl = $<HTMLElement>('#view-controls');
 hydrateIcons();
 const sheet = createSheet($<HTMLElement>('#panel'));
 document.body.dataset.mode = initialMode;
+// Power and strike pinned next to the cue ball on the 3D table (follows the camera every frame).
+const shotLabel = createShotLabel($<HTMLElement>('#stage'));
+// Ball numbers in the top view, where the balls are too small to read (Snap's "check the layout").
+const ballTags = createBallTags($<HTMLElement>('#stage'));
+let lastFrame: FrameInfo | null = null;
+function labelShown(s: AppState): boolean {
+  return !!view3d && tableStageOn(s) && !!s.plan && sheet.state() !== 'expanded' && document.body.classList.contains('has-3d') && !document.querySelector('#snap[data-inspect="true"]');
+}
+/** What the in-scene label says (refreshed on every render; the label itself follows every 3D frame). */
+let labelContent: LabelContent | null = null;
+function labelContentOf(s: AppState, names: Record<PocketId, string>): LabelContent | null {
+  const p = s.plan;
+  if (!p) return null;
+  // A provisional stroke about to be replaced by the recommended one is not shown (it would flip from
+  // "4.5/10 centre ball" to "3/10 1 tip above centre" a moment later); the card says "optimising…".
+  if (s.strokeMode === 'recommended' && s.recommended?.pending && p.strokeSource !== 'player' && p.makeable) return null;
+  // A shot that cannot happen as planned gets no stroke: why, and what to try instead.
+  if (!p.makeable) {
+    const alt = p.alternatives[0];
+    const blocked = p.warnings.some((w) => w.code === 'blocked-cue' || w.code === 'blocked-object');
+    return { kind: 'warn', text: blocked ? 'Not makeable · a ball is in the way' : 'Not makeable', sub: alt ? `Try the ${names[alt.pocketId]}` : 'Try another ball, or play safe' };
+  }
+  if (p.warnings.some((w) => w.code === 'cb-short'))
+    return { kind: 'warn', text: 'Too soft: the cue ball stops short', sub: p.minPower <= 10 ? `Use power ${Math.ceil(p.minPower * 2) / 2}+` : 'Too far even at full power' };
+  return { kind: 'stroke', stroke: p.stroke, name: p.strokeName };
+}
+function updateLabel(): void {
+  shotLabel.update(lastFrame, labelContent, labelShown(S));
+  const balls = editableBalls(S);
+  ballTags.update(lastFrame, balls ?? [], !!view3d && !!balls && tableStageOn(S) && sheet.state() !== 'expanded' && document.body.classList.contains('has-3d') && !document.querySelector('#snap[data-inspect="true"]'), S.table.id === 'snooker12');
+}
+// Polite announcements: the plan the player will play (after the recommendation lands, debounced),
+// and each warning once when it first appears (announce.ts).
+const liveEl = document.createElement('div');
+liveEl.className = 'sr-only';
+liveEl.setAttribute('aria-live', 'polite');
+liveEl.id = 'plan-live';
+document.body.appendChild(liveEl);
+const announcer = createAnnouncer(liveEl);
 
 // ---------------------------------------------------------------------------------------------
 // 3D table (feature 002 US1): the stage of Practice and of Snap's layout step. The 2D TableView is
@@ -108,6 +151,10 @@ function sync3D(): void {
           cameraPreset = p;
           store.update(() => {});
         },
+        onFrame: (info) => {
+          lastFrame = info;
+          updateLabel();
+        },
       },
       { reducedMotion },
     );
@@ -117,6 +164,9 @@ function sync3D(): void {
   } else if (!want && view3d) {
     view3d.destroy();
     view3d = null;
+    lastFrame = null;
+    shotLabel.hide();
+    ballTags.hide();
   }
   document.body.classList.toggle('has-3d', !!view3d);
   view3d?.resize();
@@ -150,16 +200,12 @@ function update3DInsets(): void {
       bottom = c.bottom - b.bottom + 6;
     }
   }
-  // Keep the table clear of the view controls: beside it in a wide free area, symmetric (centred) in a tall one.
-  let left2 = left;
-  const vc = viewControlsEl.getBoundingClientRect();
-  if (vc.width > 0) {
-    const need = c.right - vc.left + 6;
-    right = Math.max(right, need);
-    if (c.width - left - right < (c.height - top - bottom) * 1.05) left2 = Math.max(left, right);
-  }
-  const ins = { top: Math.max(0, top), right, bottom: Math.max(0, bottom), left: left2 };
-  freeWide = c.width - ins.left - ins.right >= c.height - ins.top - ins.bottom;
+  // Keep the table clear of the camera pill centred at the top of the stage (Play sits at the dock's
+  // level, below the free area), so the table is framed centred with even gutters.
+  const vc = viewControlsEl.querySelector<HTMLElement>('.vc-presets')?.getBoundingClientRect();
+  if (vc && vc.width > 0 && vc.height > 0) top = Math.max(top, vc.bottom - c.top + 6);
+  const ins = { top: Math.max(0, top), right, bottom: Math.max(0, bottom), left };
+  freeWide = landscapeFrame(c.width / c.height, { top: ins.top / c.height, right: ins.right / c.width, bottom: ins.bottom / c.height, left: ins.left / c.width });
   const key = [ins.top, ins.right, ins.bottom, ins.left].map((v) => Math.round(v)).join(',');
   if (key === lastInsets) return;
   lastInsets = key;
@@ -218,7 +264,7 @@ function labelOf(id: string): string {
 }
 
 /** Pocket names as the player sees them: screen-relative on the practice table, near/far in camera and Snap (unique, see pocket-names.ts). */
-function pocketNames(): Record<PocketId, string> {
+function pocketNames(targetId: string | null = S.targetId): Record<PocketId, string> {
   const out = { ...POCKET_NAMES };
   const name = (pk: (typeof S.table.pockets)[number], q: Vec2, c: Vec2) => {
     const dx = q.x - c.x;
@@ -228,9 +274,28 @@ function pocketNames(): Record<PocketId, string> {
     if (pk.kind === 'corner') return `${v}-${h} corner`;
     return Math.abs(dx) > Math.abs(dy) ? `${h} side` : `${v} side`;
   };
+  // Named from the shooter's side: standing behind the cue ball, facing the target (or the middle
+  // of the table), by bearing (pocket-names.ts). They stay the same whatever the 3D camera does. In
+  // Snap, once the player's photo is lined up, from where that photo was taken and the way it faces.
+  const balls = S.mode === 'practice' ? S.practice.balls : S.mode === 'snap' ? S.snap.layout : null;
+  const cue = balls?.find((b) => b.kind === 'cue');
+  const tgt = targetId ? balls?.find((b) => b.id === targetId) : undefined;
+  const pose = S.mode === 'snap' ? S.snap.player?.result?.pose : undefined;
+  if (pose) {
+    const R = pose.R;
+    const t = pose.t;
+    // Camera centre C = −Rᵀt; its view direction is the third row of R, on the table plane.
+    const C = { x: -(R[0]! * t.x + R[3]! * t.y + R[6]! * t.z), y: -(R[1]! * t.x + R[4]! * t.y + R[7]! * t.z) };
+    const fwd = { x: R[6]!, y: R[7]! };
+    if (Math.hypot(fwd.x, fwd.y) > 0.2) return { ...out, ...shooterPocketNames(S.table.pockets, C, fwd) };
+  }
+  if (cue && (S.mode === 'practice' || tgt)) {
+    let f = tgt ? { x: tgt.pos.x - cue.pos.x, y: tgt.pos.y - cue.pos.y } : { x: -cue.pos.x, y: -cue.pos.y };
+    if (Math.hypot(f.x, f.y) < 0.05) f = { x: 1, y: 0 };
+    return { ...out, ...shooterPocketNames(S.table.pockets, cue.pos, f) };
+  }
   if (S.mode === 'practice') {
     if (view3d) {
-      // Named as on the Overview (top-down) preset, so names don't change while the camera moves.
       const up = freeWide ? { x: 0, y: 1 } : { x: 1, y: 0 };
       const right = { x: up.y, y: -up.x };
       for (const pk of S.table.pockets) {
@@ -254,6 +319,11 @@ function pocketNames(): Record<PocketId, string> {
     }
   }
   return out;
+}
+
+/** Inside the iOS app (Capacitor's native shell) rather than a browser. */
+function isNativeShell(): boolean {
+  return !!(window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.();
 }
 
 function toast(msg: string, ms = 2600): void {
@@ -288,7 +358,7 @@ function onPlanner(m: PlannerOut): void {
     if (m.id !== latest.recommend) return; // stale
     store.update((s) => {
       if (!s.recommended) return;
-      s.recommended = { ...s.recommended, stroke: Number.isFinite(m.score) ? m.stroke : null, pending: false, reachable: m.reachable, evaluated: m.evaluated };
+      s.recommended = { ...s.recommended, stroke: Number.isFinite(m.score) ? m.stroke : null, pending: false, reachable: m.reachable, evaluated: m.evaluated, risks: m.risks ?? [] };
       if (s.landing && !m.reachable) toast('That spot can’t be reached safely — showing the closest safe stroke.');
     });
     replan();
@@ -621,7 +691,7 @@ async function enterCamera(): Promise<void> {
     visionWorker();
     pump();
   } catch (e) {
-    store.update((s) => (s.cameraError = describeCameraError(e)));
+    store.update((s) => (s.cameraError = describeCameraError(e, isNativeShell())));
   }
 }
 
@@ -879,6 +949,8 @@ const strokeControls = buildStrokeControls($<HTMLElement>('#stroke-controls'), {
     }
     if (name === 'draw') st.vert = -0.4;
     if (name === 'follow') st.vert = 0.4;
+    // Stun, draw and follow are centre-line strokes: they drop any side from an earlier stroke.
+    if (name === 'stun' || name === 'draw' || name === 'follow') st.side = 0;
     if (name === 'centre') st.side = 0;
     if (name === 'left') st.side = -0.25;
     if (name === 'right') st.side = 0.25;
@@ -895,9 +967,10 @@ const strokeControls = buildStrokeControls($<HTMLElement>('#stroke-controls'), {
 });
 
 // 3D view controls: camera presets and Play shot (FR-104, FR-108).
+let slowReplay = false;
 async function playShot(): Promise<void> {
   if (!view3d || !S.plan || view3d.isPlaying()) return;
-  const done = view3d.playShot(S.plan);
+  const done = view3d.playShot(S.plan, { slow: slowReplay });
   store.update(() => {});
   await done;
   store.update(() => {});
@@ -909,6 +982,10 @@ const viewControls = buildViewControls(viewControlsEl, {
     store.update(() => {});
   },
   play: () => void playShot(),
+  slow(on) {
+    slowReplay = on;
+    toast(on ? 'Replays at half speed.' : 'Replays at full speed.');
+  },
   stop() {
     view3d?.stopPlayback();
     store.update(() => {});
@@ -956,6 +1033,8 @@ const snapCtl = createSnapController($<HTMLElement>('#snap'), {
   collapseSheet: () => sheet.collapse(),
   layoutChanged: queueInsets,
   refresh: () => store.update(() => {}),
+  pocketName: (id) => pocketNames()[id],
+  riskPockets: () => planRisks(S).map((r) => r.pocketId),
 });
 
 buildSettings(settingsDlg, () => S.settings, (next: Settings) => {
@@ -986,6 +1065,7 @@ buildSettings(settingsDlg, () => S.settings, (next: Settings) => {
 $<HTMLButtonElement>('#btn-settings').addEventListener('click', () => settingsDlg.showModal());
 document.querySelectorAll<HTMLButtonElement>('.mode-switch [data-mode]').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode as Mode)));
 $<HTMLButtonElement>('#btn-practice-fallback').addEventListener('click', () => setMode('practice'));
+$<HTMLButtonElement>('#btn-snap-fallback').addEventListener('click', () => setMode('snap'));
 $<HTMLButtonElement>('#btn-retry-camera').addEventListener('click', () => void enterCamera());
 
 // ---------------------------------------------------------------------------------------------
@@ -1009,7 +1089,8 @@ function clothRgbOf(c: { hue: number; sat: number; val: number } | null | undefi
 function update3D(s: AppState, layout: TableLayout, heat: Scene3DData['heatmap']): void {
   if (!view3d) return;
   const cloth = s.mode === 'snap' ? clothRgbOf(s.snap.overview?.vision?.cloth) : undefined;
-  const deps = [s.table, layout.balls, s.plan, s.targetId, s.pocketId, s.landing, heat, cloth?.join(',')];
+  const risks = planRisks(s).map((r) => r.pocketId);
+  const deps = [s.table, layout.balls, s.plan, s.targetId, s.pocketId, s.landing, heat, cloth?.join(','), risks.join(',')];
   if (deps.length === last3D.length && deps.every((d, i) => d === last3D[i])) return;
   last3D = deps;
   view3d.setData({
@@ -1022,6 +1103,7 @@ function update3D(s: AppState, layout: TableLayout, heat: Scene3DData['heatmap']
     heatmap: heat,
     stroke: s.plan?.stroke ?? null,
     ...(cloth ? { clothRgb: cloth } : {}),
+    ...(risks.length ? { riskPockets: risks } : {}),
   });
 }
 
@@ -1039,8 +1121,18 @@ function snapHint(s: AppState): string {
   }
 }
 
+/** Scratch risks of the stroke being shown, when it is the recommended one (from its robustness probes). */
+function planRisks(s: AppState): StrokeRisk[] {
+  const r = s.recommended;
+  const p = s.plan;
+  if (!p || !r || r.pending || !r.stroke || p.strokeSource !== 'recommended' || !p.makeable) return [];
+  const same = r.stroke.power === p.stroke.power && r.stroke.side === p.stroke.side && r.stroke.vert === p.stroke.vert;
+  return same ? (r.risks ?? []) : [];
+}
+
 function render(s: AppState): void {
   document.body.dataset.mode = s.mode;
+  document.body.classList.toggle('camera-off', s.mode === 'camera' && !!s.cameraError);
   document.body.dataset.snap = s.snap.step;
   document.querySelectorAll<HTMLButtonElement>('.mode-switch [data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === s.mode)));
   toolbar.update(s);
@@ -1066,7 +1158,9 @@ function render(s: AppState): void {
   const hint =
     s.mode === 'snap'
       ? snapHint(s)
-      : s.mode === 'camera' && (!s.vision || s.vision.status === 'searching')
+      : s.mode === 'camera' && s.cameraError
+        ? 'The camera is off. Use photos (Snap) or the practice table instead.'
+        : s.mode === 'camera' && (!s.vision || s.vision.status === 'searching')
         ? 'Point the camera at the table so the whole cloth is in view.'
         : s.interaction === 'calibrate'
           ? 'Tap the 4 corners where the cloth meets the rails.'
@@ -1077,6 +1171,8 @@ function render(s: AppState): void {
             : 'Tap the ball you want to pocket, then a pocket (or let CueSight pick the best one).';
   const names = pocketNames();
   const tb = s.targetId ? layout?.balls.find((b) => b.id === s.targetId) : undefined;
+  const cueB = layout?.balls.find((b) => b.kind === 'cue');
+  const alt = s.plan && !s.plan.makeable ? s.plan.alternatives[0] : undefined;
   renderShotCard(card, s.plan, {
     ...(tb?.color ? { targetColor: tb.color } : {}),
     targetStripe: !!tb?.stripe,
@@ -1086,8 +1182,21 @@ function render(s: AppState): void {
     recommendedPending: !!s.recommended?.pending,
     showDetails: s.settings.showDetails,
     hint,
+    speedRef: s.plan ? speedReference(s.plan.obPocketSpeed, s.table.length, s.params) : null,
+    altPocket: alt ? { id: alt.pocketId, name: names[alt.pocketId] } : null,
+    // Keyboard / screen-reader (and big-finger) way to pick: the balls, then the pockets by name.
+    balls: (layout?.balls ?? [])
+      .filter((b) => b.kind !== 'cue')
+      .map((b) => ({ id: b.id, label: labelOf(b.id), ...(b.color ? { color: b.color } : {}), ...(b.stripe ? { stripe: true } : {}) })),
+    pockets: s.targetId ? s.table.pockets.map((p) => ({ id: p.id, name: names[p.id], selected: (s.plan?.pocketId ?? s.pocketId) === p.id })) : [],
+    ...(cueB && s.plan ? { cbDistance: dist(cueB.pos, s.plan.ghost), ballRadius: s.table.ballRadius } : {}),
+    risks: planRisks(s).map((r) => ({ scratchIf: r.scratchIf, pocketName: names[r.pocketId] })),
   });
-  renderSuggestions(sugEl, s, labelOf, (id) => names[id], (x: ShotSuggestion) => {
+  announcer.update(s.plan, !!s.recommended?.pending && s.strokeMode === 'recommended', names, labelOf);
+  labelContent = labelContentOf(s, names);
+  updateLabel();
+  // Each suggestion's pocket is named from behind the cue ball facing that suggestion's ball.
+  renderSuggestions(sugEl, s, labelOf, (id, targetId) => (targetId && targetId !== s.targetId ? pocketNames(targetId)[id] : names[id]), (x: ShotSuggestion) => {
     store.update((st) => {
       st.targetId = x.targetId;
       st.pocketId = x.pocketId;
@@ -1103,6 +1212,25 @@ function render(s: AppState): void {
   toastEl.hidden = !s.toast;
 }
 store.subscribe(render);
+
+// Shot card actions (the not-makeable card offers another pocket or suggestions).
+card.addEventListener('click', (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-card-act]');
+  if (!b) return;
+  if ((b.dataset.cardAct === 'alt' || b.dataset.cardAct === 'pocket') && b.dataset.pocket) selectPocket(b.dataset.pocket as PocketId);
+  else if (b.dataset.cardAct === 'ball' && b.dataset.id) {
+    const ball = currentLayout()?.balls.find((x) => x.id === b.dataset.id);
+    if (ball) selectBall(ball);
+  }
+  else if (b.dataset.cardAct === 'suggest') {
+    if (!S.suggestions) actions.suggest();
+  }
+});
+sheet.onChange = (st) => {
+  document.body.dataset.sheet = st;
+  queueInsets();
+  updateLabel();
+};
 window.addEventListener('resize', () => {
   queueInsets();
   store.update(() => {});
@@ -1176,7 +1304,7 @@ window.__cuesight = hook;
 export type CueSightHook = typeof hook;
 
 // PWA: offline support in production web builds only (not inside the iOS app, not from file: etc.).
-const nativeShell = !!(window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.();
+const nativeShell = isNativeShell();
 if (import.meta.env.PROD && 'serviceWorker' in navigator && !nativeShell && (location.protocol === 'https:' || location.protocol === 'http:')) {
   window.addEventListener('load', () => void navigator.serviceWorker.register('./sw.js').catch(() => undefined));
 }

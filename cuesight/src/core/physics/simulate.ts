@@ -98,6 +98,9 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
   const lastX = new Float64Array(n);
   const lastY = new Float64Array(n);
   const points: Vec2[][] = [];
+  // Per recorded point: simulated time and ω (only when recording; replays show slide and spin).
+  const times: number[][] = [];
+  const spins: Vec3[][] = [];
   const ballEvents: SimEvent[][] = [];
   const events: SimEvent[] = [];
   const firstHits: Record<string, FirstHit> = {};
@@ -116,6 +119,8 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     lastX[i] = b.pos.x;
     lastY[i] = b.pos.y;
     points.push([{ x: b.pos.x, y: b.pos.y }]);
+    times.push([0]);
+    spins.push([{ x: s.wx[i]!, y: s.wy[i]!, z: s.wz[i]! }]);
     ballEvents.push([]);
     classify(i);
   }
@@ -157,11 +162,16 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     if (other !== undefined) ev.otherId = other;
     events.push(ev);
     ballEvents[i]!.push(ev);
-    if (record) {
-      points[i]!.push({ x: s.px[i]!, y: s.py[i]! });
-      lastX[i] = s.px[i]!;
-      lastY[i] = s.py[i]!;
-    }
+    if (record) mark(i, t);
+  }
+
+  /** Records point i at time t (with its ω after any event at that instant). */
+  function mark(i: number, t: number): void {
+    points[i]!.push({ x: s.px[i]!, y: s.py[i]! });
+    times[i]!.push(t);
+    spins[i]!.push({ x: s.wx[i]!, y: s.wy[i]!, z: s.wz[i]! });
+    lastX[i] = s.px[i]!;
+    lastY[i] = s.py[i]!;
   }
 
   function moving(i: number): boolean {
@@ -412,11 +422,7 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         s.vy[i] = 0;
         continue;
       }
-      if (record && (Math.abs(s.px[i]! - lastX[i]!) > spacing || Math.abs(s.py[i]! - lastY[i]!) > spacing)) {
-        points[i]!.push({ x: s.px[i]!, y: s.py[i]! });
-        lastX[i] = s.px[i]!;
-        lastY[i] = s.py[i]!;
-      }
+      if (record && (Math.abs(s.px[i]! - lastX[i]!) > spacing || Math.abs(s.py[i]! - lastY[i]!) > spacing)) mark(i, time + dt);
     }
     time += dt;
     steps++;
@@ -429,13 +435,18 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     const pos = { x: s.px[i]!, y: s.py[i]! };
     const pts = points[i]!;
     const last = pts[pts.length - 1]!;
-    if (record && (last.x !== pos.x || last.y !== pos.y)) pts.push(pos);
+    if (record && (last.x !== pos.x || last.y !== pos.y)) {
+      pts.push(pos);
+      times[i]!.push(time);
+      spins[i]!.push({ x: s.wx[i]!, y: s.wy[i]!, z: s.wz[i]! });
+    }
     trajectories.push({
       ballId: id,
       points: pts,
       events: ballEvents[i]!,
       rest: pocketOf[i] ? null : pos,
       pocket: pocketOf[i] ?? null,
+      ...(record ? { times: times[i]!, spins: spins[i]! } : {}),
     });
     final[id] = { pos, pocket: pocketOf[i] ?? null, pocketSpeed: pocketSpeed[i]! };
   }

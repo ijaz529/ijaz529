@@ -8,7 +8,11 @@ export const PALETTE = {
   ghost: '#FFFFFF', // white, dotted
   warn: '#D55E00', // vermillion
   ok: '#009E73', // bluish green
-  target: '#F0E442', // yellow ring
+  // Target ball: a white ring with a dark halo. Not yellow: that is the 1-ball's (and snooker's
+  // yellow's) colour. Yellow stays for the landing spot only.
+  target: '#FFFFFF',
+  /** Target pocket: gold ring (a highlight on the rail, away from the balls). */
+  pocket: '#E9C46A',
   other: '#CC79A7', // reddish purple, dash-dot
   landing: '#F0E442',
 } as const;

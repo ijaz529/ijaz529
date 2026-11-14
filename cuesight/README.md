@@ -3,11 +3,14 @@
 Point your phone at a pool or snooker table. CueSight finds the table and the balls. You tap the ball you
 want to pocket, and it shows you **exactly how to play it**:
 
-- the aim line and ghost ball, the contact point, the cut angle and the fractional aim (½-ball, ¾-ball…)
-- throw and squirt corrections in degrees and millimetres
-- recommended **power** (1–10 plus a speed word) and **spin** (tip position on a cue-ball diagram)
+- the aim line and ghost ball, the contact point, the cut angle and the fractional aim every ⅛ of a ball
+  (⅞, ¾, ⅝, ½, ⅜…), qualified when the cut is between labels ("a touch thinner than ½-ball")
+- throw and squirt corrections in aiming terms ("aim the cue 1.1° left of the blue line", "aim 1.3 mm thicker")
+- recommended **power** (1–10, a speed word and a pace players can calibrate to: "pocket speed + 2 diamonds")
+  and **spin** (the tip drawn on the cue ball's face, as coaches draw it). Side spin is only recommended when it
+  clearly pays: it adds throw and squirt
 - the predicted object-ball and cue-ball paths through cushions, and where the cue ball stops
-- a margin of error and difficulty rating, plus a one-line coaching tip ("stun: the cue ball leaves on the
+- a margin of error (millimetres of contact) and difficulty rating, plus a one-line coaching tip ("stun: the cue ball leaves on the
   tangent line, the 90° rule")
 
 All of it runs on your phone. No account, no upload. It also works offline once it has loaded. Three
@@ -25,14 +28,14 @@ the cue ball) and **Practice** (a 3D table you can orbit, drag balls on and repl
 
 | | |
 |---|---|
-| **Snap: two-photo guide** | Photograph the whole table, fix the detected layout and pick your ball. Then crouch behind the cue ball and photograph the shot: CueSight works out where you stood and draws the aim line, ghost ball and pocket on your photo, the strike dot on the cue ball, and the power |
+| **Snap: two-photo guide** | Photograph the whole table, fix the detected layout and pick your ball. Then crouch behind the cue ball and photograph the shot: CueSight works out where you stood and draws the aim line, ghost ball and pocket on your photo, the strike dot on the cue ball's face (high is always above centre), and the power |
 | **3D practice table** | WebGL2 table with lamp lighting and glossy numbered balls. Orbit, pinch and pan, presets (top, player's eye, broadcast), drag balls, a cue stick showing tip offset and power, and *Play shot* to replay the simulation. Falls back to the 2D table without WebGL2 |
 | **Live camera AR** | Detects any cloth colour automatically and locks onto the table. Draws the plan in perspective on the cloth, with a top-down mini-map |
 | **Freeze & calibrate** | Freeze the layout and walk around. Fall back to tapping four corners. Swap the long and short rails. Tap the cue ball if it wasn't found |
 | **Drills** | No camera needed: built-in practice layouts (straight-in, 30° cut, rail ball, blocked, scratch risk, 9-ball) |
 | **Physics-grounded plan** | Time-stepped rigid-ball simulator with sliding/rolling friction, frictional ball–ball impulse (throw), cushions and jaws |
 | **Your stroke** | Power slider and spin pad, plus presets (stun, draw, follow, left, right). Predictions update instantly |
-| **Position play** | Tap where the cue ball should finish. CueSight searches about 170 strokes and recommends the most forgiving one. Without a target spot it picks the stroke that leaves the easiest next shot |
+| **Position play** | Tap where the cue ball should finish. CueSight searches about 170 strokes, tests the finalists against speed, tip, aim and squirt errors, and recommends the most forgiving one. Without a target spot it picks the stroke that leaves the easiest next shot |
 | **Suggest & zones** | Ranks every makeable shot. Heatmap of cue-ball zones that leave an easy next ball |
 | **Tables** | 9-, 8- and 7-ft pool, UK 7-ft and 12-ft snooker. Adjustable cloth speed, cushion bounce and shaft type (standard or low-deflection) |
 
@@ -65,13 +68,16 @@ high. An overhead angle is the most accurate. If the corners are hidden, use **�
 Practice opens on a hand-written WebGL2 table (`src/app/render3d/`, no 3D library). Tap a ball, then a
 pocket, as before. Drag a ball to move it, drag the cloth to orbit, pinch or scroll to zoom, and use two
 fingers to pan. Double-tap the cloth to go back to the last preset. The glass buttons on the right switch
-between **Top**, **Player** (eye low behind the cue ball, down the aim line) and **3D** (broadcast angle).
-**Play** replays the simulated shot in real time: the cue strikes, and the balls roll with the right
-rotation and drop into the pocket. Tap, **Skip** or Escape ends it.
+between **Top**, **Player** (eye low behind the cue ball, down the aim line, framed so the pocket stays in
+view) and **3D** (broadcast angle). A glass label next to the cue ball shows the power (n/10, speed word,
+10-segment bar) and the strike point on a face-on cue ball, in every view.
+**Play** replays the simulated shot in real time: the cue strikes, and the balls slide, spin and roll as
+simulated (a draw shot visibly turns backward) and drop into the pocket. Tap, **Skip** or Escape ends it.
 
 The plan uses the same colours and line styles as everywhere else: aim line, ghost ball, contact point,
 object-ball and cue-ball paths, pocket highlight, landing marker and position heatmap. The cue stick sits
-behind the cue ball at the recommended tip offset and is drawn back further for more power. Without
+behind the cue ball along the cue's own (squirt-corrected) line at the recommended tip offset and is drawn
+back further for more power; it is hidden in the top-down view. Without
 WebGL2, or with `?renderer=2d`, the 2D table does everything the same way.
 
 ## Snap guide

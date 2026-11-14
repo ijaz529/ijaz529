@@ -61,8 +61,9 @@ vec3 lampIrradiance(vec3 p, vec3 n) {
 // Dim room ambient. Objects on the cloth (balls) also get green bounce light from below.
 vec3 ambient(vec3 n) {
   // Soft ceiling bounce + a little cool room fill so rails and cushions read outside the lamp pool.
-  vec3 sky = vec3(0.074, 0.069, 0.070);
-  vec3 ground = vec3(0.010, 0.010, 0.013);
+  // (Raised from 0.074 / 0.010: vertical cloth faces — the pocket jaws' end caps — read as black slabs.)
+  vec3 sky = vec3(0.11, 0.104, 0.105);
+  vec3 ground = vec3(0.02, 0.02, 0.024);
   return mix(ground, sky, clamp(n.z * 0.5 + 0.5, 0.0, 1.0)) * PI;
 }
 vec3 ambientBounce(vec3 n, vec3 p) {
@@ -168,10 +169,14 @@ void main() {
     albedo = uClothLin * (0.9 + (w - 0.5) * 0.2);
     ao = mix(0.45, 1.0, smoothstep(0.0, 0.03, vWorld.z));
     // Jaws inside the pocket throat sit in the drop's shadow.
-    ao *= mix(0.3, 1.0, smoothstep(0.0, 0.03, holeDist(vWorld.xy)));
+    // (Lifted from 0.3: the side-pocket facings read as flat, unlit slabs in the player view.)
+    ao *= mix(0.7, 1.0, smoothstep(0.0, 0.03, holeDist(vWorld.xy)));
     // Sheen on the rounded nose.
     float sheen = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 3.0);
-    vec3 E = lampIrradiance(vWorld, N) + ambient(N);
+    // Wrap-lit share of the lamp on the bed: cloth on a vertical face (the jaws' end caps, the cushion
+    // faces) gets at least ~18 % of what the cloth top gets, so it reads as cloth, not a black plate.
+    float wrap = (N.z * 0.5 + 0.5) * 0.36;
+    vec3 E = lampIrradiance(vWorld, N) + ambient(N) + lampIrradiance(vWorld, vec3(0.0, 0.0, 1.0)) * wrap * (1.0 - max(N.z, 0.0));
     vec3 col = albedo / PI * E * ao + uClothLin * sheen * 0.35 * E / PI;
     fragColor = finish(col);
     return;
@@ -196,18 +201,18 @@ void main() {
     f0 = 0.06;
     rough = 0.08;
   } else if (uMat == ${MAT.pocket}) {
-    // Dark leather drop; deeper is darker.
-    albedo = srgbToLinear(vec3(0.075, 0.05, 0.04));
-    ao = mix(0.02, 0.35, smoothstep(uPocketBottom, 0.03, vWorld.z));
+    // Leather drop: brown at the lip, black 6 cm down (it reads as a pocket, not a hole in the render).
+    albedo = srgbToLinear(vec3(0.169, 0.122, 0.094));
+    ao = mix(0.03, 0.85, smoothstep(-0.06, 0.0, vWorld.z));
     f0 = 0.02;
     rough = 0.7;
     specAo = ao * 0.3;
   } else if (uMat == ${MAT.liner}) {
-    // Black rubber liner; its rounded inner lip catches a soft highlight.
-    albedo = srgbToLinear(vec3(0.05, 0.047, 0.05));
-    f0 = 0.04;
-    rough = 0.4;
-    specAo = 0.6;
+    // Leather lip (#2B1F18) around the drop; its rounded inner edge catches a specular rim.
+    albedo = srgbToLinear(vec3(0.169, 0.122, 0.094));
+    f0 = 0.045;
+    rough = 0.45;
+    specAo = 0.8;
   } else if (uMat == ${MAT.floor}) {
     vec2 p = vWorld.xy;
     // Dark floor that melts into the Midnight Felt background a short way from the table, with the
@@ -231,11 +236,16 @@ void main() {
     rough = mix(0.45, 0.07, t.a);
   }
   vec3 E = lampIrradiance(vWorld, N) + ambient(N);
+  // The far rails sit outside the lamp's pool: a little more room light keeps the wood readable.
+  if (uMat == ${MAT.wood}) E += ambient(N) * 0.18;
   vec3 col = albedo / PI * E * ao;
   if (f0 > 0.0) {
     float ndv = clamp(dot(N, V), 0.0, 1.0);
     float F = fresnel(f0, ndv);
     vec3 R = reflect(-V, N);
+    // Geometric specular anti-aliasing: where the normal changes faster than a pixel (rail and
+    // cushion seams far away), widen the lobe instead of sparkling.
+    rough = max(rough, min(0.7, 1.4 * length(fwidth(N))));
     col = col * (1.0 - F) + envRadiance(vWorld, R, rough) * F * specAo;
   }
   fragColor = finish(col);
@@ -379,7 +389,7 @@ void main() {
     float m = max(a.x, max(a.y, a.z));
     float aa = fwidth(m) * 0.9 + 1e-4;
     float dot6 = smoothstep(0.9925 - aa, 0.9925 + aa, m);
-    base = mix(base, vec3(0.55, 0.09, 0.08), dot6 * 0.72);
+    base = mix(base, vec3(0.445, 0.042, 0.042), dot6 * 0.85); // #B23A3A: crisp red measles, not dirt
   }
   float ndv = clamp(dot(N, V), 0.0, 1.0);
   vec3 R = reflect(-V, N);
@@ -394,8 +404,9 @@ void main() {
   vec3 H = normalize(L + V);
   col += LAMP_COLOR * pow(max(dot(N, H), 0.0), 90.0) * 0.06 * uLamp.w * 0.04;
   vec4 o = finish(col);
-  // Selection highlight rim (target ball), drawn in sRGB so it reads as UI.
-  if (uBallKind.w > 0.5) o.rgb = mix(o.rgb, vec3(0.941, 0.894, 0.259), pow(1.0 - ndv, 3.0) * 0.55);
+  // Selection highlight rim (target ball), drawn in sRGB so it reads as UI: white, like its ring
+  // (yellow would read as the 1-ball's colour).
+  if (uBallKind.w > 0.5) o.rgb = mix(o.rgb, vec3(1.0), pow(1.0 - ndv, 3.0) * 0.5);
   fragColor = o;
 }`;
 

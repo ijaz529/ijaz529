@@ -4,8 +4,15 @@
  */
 import { speedWord } from '../../core/shot/power';
 
-/** Segment colour ramp: soft → medium → firm → power. Meaning is also carried by the numeral and word. */
-const RAMP = ['#18A374', '#18A374', '#2FB59A', '#56B4E9', '#56B4E9', '#56B4E9', '#E9C46A', '#E69F00', '#E8822F', '#D55E00'];
+/**
+ * Segment colour ramp: one hue, soft white → accent sky by intensity (the plan's line colours — orange,
+ * blue, green — mean paths, never speeds). Meaning is also carried by the numeral and the word.
+ */
+const RAMP = Array.from({ length: 10 }, (_, i) => {
+  const t = i / 9;
+  const mix = (a: number, b: number) => Math.round(a + (b - a) * t);
+  return `rgb(${mix(214, 86)},${mix(226, 180)},${mix(240, 233)})`;
+});
 
 const fmt = (n: number) => (Math.round(n * 10) / 10).toString();
 

@@ -121,10 +121,15 @@ export interface Trajectory {
   events: SimEvent[];
   rest: Vec2 | null;
   pocket: PocketId | null;
+  /** Simulated time (s) of each recorded point (recorded runs only). */
+  times?: number[];
+  /** Angular velocity ω (rad/s, world frame) at each recorded point, so replays can show slide and spin, not just rolling. */
+  spins?: Vec3[];
 }
 
 export type WarningCode =
   | 'not-makeable'
+  | 'cb-short'
   | 'blocked-cue'
   | 'blocked-object'
   | 'scratch'
@@ -157,9 +162,18 @@ export interface ShotPlan {
   cutSide: 1 | -1 | 0;
   fraction: number;
   fractionLabel: string;
+  /** The label in words, qualified when the cut is more than 1.5° off it ("a touch thinner than ½-ball"). */
+  fractionPhrase: string;
   throwDeg: number;
   throwShiftMm: number;
+  /**
+   * Which way the throw-compensated ghost ball moved from the plain one, as the player aims it:
+   * thinner/thicker on a cut, left/right of full ball on a straight-in; null when there is no shift.
+   */
+  throwAim: 'thinner' | 'thicker' | 'left' | 'right' | null;
   squirtDeg: number;
+  /** Direction to point the cue (unit): the cue-ball path (aimDir) turned by the squirt compensation. */
+  cueDir: Vec2;
   stroke: Stroke;
   strokeSource: 'player' | 'recommended' | 'default';
   minPower: number;
@@ -175,8 +189,12 @@ export interface ShotPlan {
   difficulty: Difficulty;
   warnings: Warning[];
   tip: string;
+  /** The stroke as coaches name it ("Draw", "Stun", "Stop shot", "Follow, right english"); null when the cue ball stops short. */
+  strokeName: string | null;
   cbSpeedAtContact: number;
   obSpeed: number;
+  /** Object-ball speed (m/s) as it crosses into the pocket (0 when it does not drop). */
+  obPocketSpeed: number;
   /** Alternative pockets ranked by tolerance (for not-makeable or comparison). */
   alternatives: { pocketId: PocketId; toleranceDeg: number }[];
 }
@@ -185,8 +203,20 @@ export interface ShotSuggestion {
   targetId: string;
   pocketId: PocketId;
   toleranceDeg: number;
+  /** Margin of error as contact on the object ball (mm), the unit the shot card uses. */
+  toleranceMm: number;
   difficulty: Difficulty;
   score: number;
+}
+
+/**
+ * A way the recommended stroke goes wrong under a small, typical error (the robustness probes): the
+ * cue ball drops in `pocketId` if the stroke is played a little harder/softer, with the tip a little
+ * off, or with a small aim error.
+ */
+export interface StrokeRisk {
+  scratchIf: 'harder' | 'softer' | 'aim' | 'tip';
+  pocketId: PocketId;
 }
 
 export interface Recommendation {
@@ -196,4 +226,6 @@ export interface Recommendation {
   restError?: number;
   rest?: Vec2 | null;
   evaluated: number;
+  /** Scratches seen in the robustness probes of the chosen stroke (empty when it is safe). */
+  risks?: StrokeRisk[];
 }

@@ -26,8 +26,8 @@ import type {
   Vec2,
   Warning,
 } from '../types';
-import { angleBetween, deg, dist, fromAngle, angleOf, norm, sub } from '../vec';
-import { coachingTip, contactSpinOf, difficultyOf } from './coach';
+import { angleBetween, cross, deg, dist, fromAngle, angleOf, norm, sub } from '../vec';
+import { coachingTip, contactSpinOf, difficultyOf, strokeName } from './coach';
 import { cutAngle, cutSide, fractionOf, ghostBall, contactPoint } from './geometry';
 import { pathBlockers } from './obstruction';
 import { pocketWindow, type PocketWindow } from './pocket-window';
@@ -122,6 +122,13 @@ export interface PlanOptions {
   record?: boolean;
   /** View-relative pocket names for messages (e.g. "far-left corner"). */
   names?: Partial<Record<PocketId, string>>;
+  /**
+   * Robustness probes: the player's aim error (rad, + = counter-clockwise) applied to the cue-ball
+   * direction, and a different squirt model (shaft mass ratio) than the one the aim was compensated
+   * for. Both leave the plan's aim as planned and only change what the simulation does with it.
+   */
+  aimErrorRad?: number;
+  actualSquirtMassRatio?: number;
 }
 
 export function planShot(layout: TableLayout, request: ShotRequest, params: PhysicsParams, opts: PlanOptions = {}): ShotPlan {
@@ -169,7 +176,20 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   if (dist(cue.pos, target.pos) < 2 * R + 1e-3)
     warnings.push({ code: 'frozen', message: 'Cue ball is frozen to the object ball: expect extra throw; hit it softly with follow.' });
   if (Math.hypot(stroke.side, stroke.vert) > 0.45) warnings.push({ code: 'miscue-risk', message: 'Tip is near the miscue limit: chalk up and stroke smoothly.' });
-  if (stroke.power < minPower - 1e-6)
+  // Does the cue ball even get to the object ball? (A slow, low stroke can stop on the way.)
+  const contact = straightLineState(speed, 2.5 * speed * stroke.vert, geo.cbDistance, params);
+  const cbShort = geo.makeable && contact.stopped;
+  const targetName = target.label ?? target.id;
+  if (cbShort)
+    warnings.push({
+      code: 'cb-short',
+      message:
+        minPower > 10
+          ? `The cue ball stops before it reaches the ${targetName}: too far even at full power.`
+          : `The cue ball stops before it reaches the ${targetName}. Use power ${(Math.ceil(minPower * 2) / 2).toString()}+.`,
+      ballId: target.id,
+    });
+  else if (stroke.power < minPower - 1e-6)
     warnings.push({
       code: 'too-soft',
       message: minPower > 10 ? 'Too far: even full power may not reach the pocket.' : `Too soft — object ball stops short. Use power ${minPower.toFixed(1)}+.`,
@@ -206,7 +226,17 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   squirtRad = strike.squirtRad * Math.sign(stroke.side);
 
   // --- Full simulation ---------------------------------------------------------------------------
-  const sim = simulate(table, toInit(balls, cue.id, strike.vel, strike.omega), params, { record: opts.record ?? true });
+  // Probes: a mis-aimed cue, or a shaft that squirts more/less than the compensation assumed.
+  let simStrike = strike;
+  if (opts.aimErrorRad || opts.actualSquirtMassRatio) {
+    const intended = strikeBall(aimDir, speed, stroke.side, stroke.vert, R, params.squirtMassRatio);
+    const real = opts.actualSquirtMassRatio ? strikeBall(aimDir, speed, stroke.side, stroke.vert, R, opts.actualSquirtMassRatio) : intended;
+    // The cue points along intended.cueDir; the ball leaves rotated from it by the real squirt.
+    const dSquirt = Math.sign(stroke.side) * (real.squirtRad - intended.squirtRad);
+    const travel = fromAngle(angleOf(aimDir) + (opts.aimErrorRad ?? 0) + dSquirt);
+    simStrike = strikeBall(travel, speed, stroke.side, stroke.vert, R, params.squirtMassRatio);
+  }
+  const sim = simulate(table, toInit(balls, cue.id, simStrike.vel, simStrike.omega), params, { record: opts.record ?? true });
   const byId = (id: string): Trajectory => sim.trajectories.find((t) => t.ballId === id)!;
   const cuePath = byId(cue.id);
   const objectPath = byId(target.id);
@@ -230,7 +260,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       warnings.push({ code: 'kiss', message: `Object ball kisses ${balls.find((x) => x.id === id)?.label ?? id}.`, ballId: id });
     }
   }
-  const softWarned = warnings.some((w) => w.code === 'too-soft');
+  const softWarned = warnings.some((w) => w.code === 'too-soft' || w.code === 'cb-short');
   if (geo.makeable && !obPocketed && !softWarned && geo.blockersObject.length === 0 && geo.blockersCue.length === 0) {
     warnings.push({
       code: 'ob-missed',
@@ -239,9 +269,14 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   }
 
   // --- Contact state for coaching ----------------------------------------------------------------
-  const contact = straightLineState(speed, 2.5 * speed * stroke.vert, geo.cbDistance, params);
   const tolDeg = deg(geo.toleranceRad);
   const throwShiftMm = dist(ghost, geo.ghost) * 1000;
+  // Which way the compensation moves the ghost ball, in the player's terms.
+  let throwAim: ShotPlan['throwAim'] = null;
+  if (throwShiftMm >= 0.05) {
+    if (cutDeg < 1) throwAim = cross(aimDir, sub(ghost, geo.ghost)) > 0 ? 'left' : 'right';
+    else throwAim = cutAngle(cue.pos, ghost, fromAngle(aimAngle)) > geo.cut ? 'thinner' : 'thicker';
+  }
   const blocked = geo.blockersCue.length > 0 || geo.blockersObject.length > 0;
   const plan: ShotPlan = {
     targetId: target.id,
@@ -256,9 +291,12 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     cutSide: cutSide(cue.pos, geo.ghost, geo.window.dir),
     fraction: fr.fraction,
     fractionLabel: fr.label,
+    fractionPhrase: fr.phrase,
     throwDeg: deg(throwRad),
     throwShiftMm,
+    throwAim,
     squirtDeg: deg(squirtRad),
+    cueDir: strike.cueDir,
     stroke,
     strokeSource,
     minPower,
@@ -274,17 +312,33 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     difficulty: difficultyOf(tolDeg),
     warnings,
     tip: '',
+    strokeName: null,
     cbSpeedAtContact: contact.v,
     obSpeed: obHit ? Math.hypot(obHit.vel.x, obHit.vel.y) : 0,
+    obPocketSpeed: obPocketed ? sim.final[target.id]!.pocketSpeed : 0,
     alternatives,
   };
+  const contactSpin = cbShort ? 'short' : contactSpinOf(contact.v, contact.w);
+  // Rail and ball together: the cue ball's first cushion within 5 ms of its first ball contact (either
+  // order: an object ball on the rail is hit "ball and rail together").
+  const firstBall = cuePath.events.find((e) => e.kind === 'ball');
+  const firstRail = cuePath.events.find((e) => e.kind === 'cushion');
+  const railFirst = !!firstBall && !!firstRail && firstBall.otherId === target.id && Math.abs(firstRail.t - firstBall.t) <= 0.005;
+  plan.strokeName = strokeName({ contact: contactSpin, contactRatio: contact.v > 0 ? contact.w / contact.v : 0, cutDeg, vert: stroke.vert, side: stroke.side });
   plan.tip = coachingTip({
     cutDeg,
-    contact: contactSpinOf(contact.v, contact.w),
+    contact: contactSpin,
+    cbDistance: geo.cbDistance,
+    ballRadius: R,
+    targetLabel: targetName,
+    needPower: minPower,
+    railFirst,
     throwDeg: plan.throwDeg,
     throwShiftMm,
+    throwAim,
     squirtDeg: plan.squirtDeg,
     side: stroke.side,
+    vert: stroke.vert,
     scratch,
     blocked,
     makeable: geo.makeable,

@@ -17,6 +17,10 @@
  *   public/icons/icon-512.png               512   RGBA  manifest "any", rounded tile
  *   public/icons/icon-maskable-512.png      512   RGB   manifest "maskable": artwork inside the 80 % safe circle
  *   ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png   1024  RGB (App Store rejects alpha)
+ *   ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-dark.png    1024  RGBA  iOS 18 dark appearance:
+ *        the artwork on a transparent background (no felt, no rail; the system supplies the dark backdrop)
+ *   ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-tinted.png  1024  RGB   iOS 18 tinted appearance:
+ *        the dark artwork's luminance in greyscale on black (the system applies the tint)
  *   ios/App/App/Assets.xcassets/Splash.imageset/splash-2732x2732{,-1,-2}.png  2732  RGB launch screen
  *
  * "RGB" outputs are composited onto the brand background #070B14 and written as PNG colour type 2,
@@ -46,7 +50,21 @@ const OUTPUTS = [
   { file: 'public/icons/icon-512.png', size: 512, variant: 'full', shape: 'squircle', alpha: true },
   { file: 'public/icons/icon-maskable-512.png', size: 512, variant: 'maskable', shape: 'square', alpha: false },
   { file: 'ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png', size: 1024, variant: 'full', shape: 'square', alpha: false, texture: true },
+  { file: 'ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-dark.png', size: 1024, variant: 'full', shape: 'square', alpha: true, appearance: 'dark' },
+  { file: 'ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-1024-tinted.png', size: 1024, variant: 'full', shape: 'square', alpha: false, appearance: 'tinted' },
 ];
+
+/** Greyscale (Rec. 709 luminance) of an RGBA image, composited on black, as RGB. */
+function tinted(rgba) {
+  const px = rgba.length / 4;
+  const out = new Uint8Array(px * 3);
+  for (let p = 0; p < px; p++) {
+    const a = rgba[p * 4 + 3] / 255;
+    const y = Math.round((0.2126 * rgba[p * 4] + 0.7152 * rgba[p * 4 + 1] + 0.0722 * rgba[p * 4 + 2]) * a);
+    out[p * 3] = out[p * 3 + 1] = out[p * 3 + 2] = y;
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------------------------
 // PNG encoder (colour type 2 = RGB or 6 = RGBA, 8 bit), adaptive per-row filters.
@@ -162,7 +180,7 @@ function flatten(rgba, bg = BG) {
 // Browser side: draw the (variant-adjusted) SVG into a canvas and return the raw pixels.
 // ---------------------------------------------------------------------------------------------
 /* eslint-disable no-undef */
-async function browserRaster({ svgText, size, variant, shape, splash, texture }) {
+async function browserRaster({ svgText, size, variant, shape, splash, texture, appearance }) {
   const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
   const svg = doc.documentElement;
   if (variant === 'maskable') {
@@ -170,7 +188,7 @@ async function browserRaster({ svgText, size, variant, shape, splash, texture })
     // background) so every important pixel lands well inside it.
     doc.getElementById('art').setAttribute('transform', 'translate(512 512) scale(0.8) translate(-512 -512)');
   }
-  svg.setAttribute('class', [variant === 'small' ? 'small' : '', texture ? '' : 'flat'].join(' ').trim());
+  svg.setAttribute('class', [variant === 'small' ? 'small' : '', texture ? '' : 'flat', appearance ? 'dark' : ''].join(' ').trim());
   const N = splash ? 2732 : size;
   const tile = splash ? 1024 : size;
   svg.setAttribute('width', String(tile));
@@ -303,7 +321,7 @@ async function main() {
     await page.setContent('<!doctype html><html><body style="margin:0;background:#070B14"></body></html>');
     for (const o of OUTPUTS) {
       const { rgba, size } = await render(page, svgText, o);
-      const png = o.alpha ? encodePng(rgba, size, size, 4) : encodePng(flatten(rgba), size, size, 3);
+      const png = o.appearance === 'tinted' ? encodePng(tinted(rgba), size, size, 3) : o.alpha ? encodePng(rgba, size, size, 4) : encodePng(flatten(rgba), size, size, 3);
       write(o.file, png);
       const h = readIhdr(png);
       if (h.width !== o.size || h.height !== o.size || h.colorType !== (o.alpha ? 6 : 2)) throw new Error(`bad output ${o.file}`);

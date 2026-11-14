@@ -8,6 +8,7 @@
  * silhouettes. Everything is clipped against a near plane in front of the camera, so a path that runs
  * behind the photographer is cut, never mirrored.
  */
+import { describeSpin } from '../../core/shot/power';
 import type { PocketId, ShotPlan, Stroke, TableSpec, Vec2, Vec3 } from '../../core/types';
 import { projectBallOutline, strikePoint, type CameraPose } from '../../vision/player-view';
 
@@ -27,6 +28,8 @@ export interface GuideInput {
   target: Vec2 | null;
   /** The stroke to show (normally plan.stroke). */
   stroke: Pick<Stroke, 'side' | 'vert' | 'power'>;
+  /** Pockets the cue ball could drop into with a small error (scratch risk), ringed dashed. */
+  riskPockets?: PocketId[];
 }
 
 export interface StrikeMark {
@@ -37,6 +40,30 @@ export interface StrikeMark {
   /** On the side of the ball the camera sees. */
   visible: boolean;
   inFrame: boolean;
+}
+
+/**
+ * The strike point as coaches draw it: the cue ball's face seen straight along the cue, a flat disc
+ * over the ball in the photo with the tip dot at (side·r, −vert·r) from its centre. Unlike the
+ * projected `strike` (a point on the back of the ball seen from above, which drops below centre for
+ * a high hit), "high" is always above centre here, so the picture agrees with the words.
+ */
+export interface StrikeFace {
+  /** Centre and radius of the cue ball in the photo (px). */
+  c: Vec2;
+  r: number;
+  /** The tip's contact point on the face (px) and its radius (px). */
+  dot: Vec2;
+  dotR: number;
+  /** Miscue-limit ring radius (px). */
+  miscueR: number;
+}
+
+/** Face-on strike mark for a cue ball drawn at centre c with radius r (pure). */
+export function strikeFace(c: Vec2, r: number, side: number, vert: number): StrikeFace {
+  const m = Math.hypot(side, vert);
+  const k = m > MISCUE_FRAC * 1.8 ? (MISCUE_FRAC * 1.8) / m : 1;
+  return { c, r, dot: { x: c.x + side * k * r, y: c.y - vert * k * r }, dotR: Math.max(2.5, (TIP_RADIUS_M / 0.028575) * r), miscueR: MISCUE_FRAC * r };
 }
 
 export interface PlayerGuide {
@@ -50,6 +77,8 @@ export interface PlayerGuide {
   cueBall: Vec2[];
   /** Pocket mouth ring on the bed. */
   pocket: Vec2[][];
+  /** Scratch-risk rings (one list of runs per risky pocket). */
+  risk: Vec2[][][];
   pocketId: PocketId;
   /** Contact point on the object ball at ball-centre height. */
   contact: Vec2 | null;
@@ -57,7 +86,10 @@ export interface PlayerGuide {
   cueCenter: Vec2 | null;
   /** Projected cue-ball radius at its centre (px), for the inset crop. */
   cueRadiusPx: number;
+  /** Where the tip meets the ball in 3D, projected (location only: see `face` for display). */
   strike: StrikeMark | null;
+  /** The strike point face-on over the cue ball (what is drawn). Null when the cue ball is not in the photo. */
+  face: StrikeFace | null;
   /** Miscue-limit ring and centre cross on the cue ball's face (front-facing runs only). */
   miscue: Vec2[][];
   cross: Vec2[][];
@@ -231,8 +263,10 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   const R = table.ballRadius;
   const C = cameraCenter(pose);
   const cue3 = on(i.cue, R);
-  const aimL = Math.hypot(plan.aimDir.x, plan.aimDir.y) || 1;
-  const aim = { x: plan.aimDir.x / aimL, y: plan.aimDir.y / aimL };
+  // The cue itself points along the squirt-corrected direction (equal to aim without side spin).
+  const cd = plan.cueDir ?? plan.aimDir;
+  const cdL = Math.hypot(cd.x, cd.y) || 1;
+  const cueDir = { x: cd.x / cdL, y: cd.y / cdL };
 
   // Lines on the cloth disappear where a real ball (cue, target) hides the cloth from the camera.
   const solid = [cue3, ...(i.target ? [on(i.target, R)] : [])];
@@ -253,6 +287,13 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   // Hole centre a little behind the mouth line (pockets sit outside the cushion nose).
   const hole = { x: pk.mouthCenter.x - pk.inward.x * mouth * 0.25, y: pk.mouthCenter.y - pk.inward.y * mouth * 0.25 };
   const pocket = projectPolyline(pose, bedCircle(hole, mouth * 0.55));
+  const risk = (i.riskPockets ?? [])
+    .filter((id) => id !== plan.pocketId)
+    .map((id) => {
+      const rp = table.pockets.find((p) => p.id === id)!;
+      const rm = rp.kind === 'corner' ? table.cornerMouth : table.sideMouth;
+      return projectPolyline(pose, bedCircle({ x: rp.mouthCenter.x - rp.inward.x * rm * 0.25, y: rp.mouthCenter.y - rp.inward.y * rm * 0.25 }, rm * 0.6));
+    });
 
   const cc = toCam(pose, { x: plan.contactPoint.x, y: plan.contactPoint.y, z: R });
   const contact = cc.z > NEAR ? pix(pose, cc) : null;
@@ -266,7 +307,7 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   // Strike point and its marks on the ball's face.
   const side = i.stroke.side;
   const vert = i.stroke.vert;
-  const sp = strikePoint(cue3, aim, side, vert, R);
+  const sp = strikePoint(cue3, cueDir, side, vert, R);
   const spc = toCam(pose, sp);
   let strike: StrikeMark | null = null;
   if (spc.z > NEAR) {
@@ -277,19 +318,20 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   const ring: Vec3[] = [];
   for (let k = 0; k <= 48; k++) {
     const a = (2 * Math.PI * k) / 48;
-    ring.push(strikePoint(cue3, aim, MISCUE_FRAC * Math.cos(a), MISCUE_FRAC * Math.sin(a), R));
+    ring.push(strikePoint(cue3, cueDir, MISCUE_FRAC * Math.cos(a), MISCUE_FRAC * Math.sin(a), R));
   }
   const miscue = frontRuns(pose, C, cue3, ring);
   const crossH: Vec3[] = [];
   const crossV: Vec3[] = [];
   for (let k = 0; k <= 16; k++) {
     const u = -MISCUE_FRAC + (2 * MISCUE_FRAC * k) / 16;
-    crossH.push(strikePoint(cue3, aim, u, 0, R));
-    crossV.push(strikePoint(cue3, aim, 0, u, R));
+    crossH.push(strikePoint(cue3, cueDir, u, 0, R));
+    crossV.push(strikePoint(cue3, cueDir, 0, u, R));
   }
   const cross = [...frontRuns(pose, C, cue3, crossH), ...frontRuns(pose, C, cue3, crossV)];
-  // The cue: a level line from the strike point back toward the shooter, 0.9 m long.
-  const cueAxis = projectPolyline(pose, [sp, { x: sp.x - aim.x * 0.9, y: sp.y - aim.y * 0.9, z: sp.z + 0.04 }]);
+  // The cue: a level line from the strike point back toward the shooter along the cue's own
+  // direction (squirt-corrected), 0.9 m long.
+  const cueAxis = projectPolyline(pose, [sp, { x: sp.x - cueDir.x * 0.9, y: sp.y - cueDir.y * 0.9, z: sp.z + 0.04 }]);
 
   const inFrame = {
     cue: polyInFrame(pose, cueBall),
@@ -300,8 +342,7 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
 
   const messages: string[] = [];
   if (!inFrame.cue) messages.push('The cue ball is outside the photo. Step back a little so the cue ball is in the picture, then retake.');
-  else if (strike && !strike.inFrame) messages.push('Your strike point is cut off at the edge of the photo. It is shown on the spin ball.');
-  else if (strike && !strike.visible) messages.push('From here the strike point is on the far side of the cue ball. Move behind the cue ball. It is shown on the spin ball.');
+  else if (strike && !strike.visible) messages.push('This photo is not from behind the cue ball. Crouch behind it, facing the shot, and retake. The strike point is shown on the spin ball.');
   if (!inFrame.ghost && !inFrame.target) messages.push('The target ball is out of the photo. Turn toward the shot and retake.');
   else if (!inFrame.pocket) messages.push('The pocket is out of the photo. Follow the orange line off the edge.');
 
@@ -313,12 +354,14 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
     target,
     cueBall,
     pocket,
+    risk,
     pocketId: plan.pocketId,
     contact,
     ghostCenter,
     cueCenter: cueCenter ?? centroid(cueBall),
     cueRadiusPx,
     strike,
+    face: inFrame.cue && cueCenter && cueRadiusPx > 0 ? strikeFace(cueCenter, cueRadiusPx, side, vert) : null,
     miscue,
     cross,
     cueAxis,
@@ -343,4 +386,53 @@ export function scaleFocal(focal: number, from: { width: number; height: number 
 export function strikeHeadline(stroke: Pick<Stroke, 'side' | 'vert'>, describe: (s: Pick<Stroke, 'side' | 'vert'>) => string): string {
   const d = describe(stroke);
   return d === 'centre ball' ? 'Strike dead centre' : `Strike ${d}`;
+}
+
+/**
+ * Where to strike in words a player can follow without a diagram: "½ tip above centre",
+ * "1 tip below centre, ¼ tip right", "dead centre" — the app's one spin vocabulary (describeSpin).
+ */
+export function strikeWords(stroke: Pick<Stroke, 'side' | 'vert'>): string {
+  const d = describeSpin(stroke);
+  return d === 'centre ball' ? 'dead centre' : d;
+}
+
+/**
+ * Region of the player photo worth zooming onto (photo px): the cue ball, the ghost and target
+ * balls, the contact point and the pocket, clipped to the photo. Null when there is nothing to frame.
+ */
+export function guideFocus(g: PlayerGuide, width: number, height: number): { x0: number; y0: number; x1: number; y1: number } | null {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  const add = (p: Vec2) => {
+    if (p.x < 0 || p.y < 0 || p.x > width || p.y > height) return;
+    x0 = Math.min(x0, p.x);
+    y0 = Math.min(y0, p.y);
+    x1 = Math.max(x1, p.x);
+    y1 = Math.max(y1, p.y);
+  };
+  for (const poly of [g.cueBall, g.ghost, g.target]) for (const p of poly) add(p);
+  if (g.contact) add(g.contact);
+  for (const run of g.pocket) for (const p of run) add(p);
+  if (!Number.isFinite(x0) || x1 - x0 < 4 || y1 - y0 < 4) return null;
+  return { x0, y0, x1, y1 };
+}
+
+/** A plan the player can actually play: makeable, and the cue ball gets to the object ball. */
+export function playable(plan: Pick<ShotPlan, 'makeable' | 'warnings'>): boolean {
+  return plan.makeable && !plan.warnings.some((w) => w.code === 'cb-short');
+}
+
+/**
+ * What the guide's how-to panel says when the shot cannot be played as planned: the reason first, and
+ * the best other pocket to try — never a strike point or a power (Principle II).
+ */
+export function unplayableHeadline(plan: Pick<ShotPlan, 'makeable' | 'warnings' | 'alternatives'>): { title: string; reason: string; altPocketId: PocketId | null } {
+  const short = plan.warnings.find((w) => w.code === 'cb-short');
+  if (plan.makeable && short) return { title: 'Too soft to get there', reason: short.message, altPocketId: null };
+  const w = plan.warnings.find((x) => x.code === 'not-makeable') ?? plan.warnings.find((x) => x.code === 'blocked-cue' || x.code === 'blocked-object');
+  const reason = (w?.message ?? 'No clean path to this pocket.').replace(/^Not makeable: /, '').replace(/ Try the [^.]+\.$/, '');
+  return { title: 'Not makeable', reason: reason.charAt(0).toUpperCase() + reason.slice(1), altPocketId: plan.alternatives[0]?.pocketId ?? null };
 }

@@ -7,9 +7,12 @@
  * between events; a span that ends the motion ends at zero speed, i.e. an ease-out). Spans with no
  * time information at all fall back to distance with an ease-out.
  *
- * Rotation: balls roll without slipping, so a displacement d turns the ball by |d|/R about
- * ẑ × d̂ (the contact point is instantaneously at rest). Orientations are accumulated per point,
- * so the result is exact along each straight sub-segment and independent of the frame rate.
+ * Rotation: when the simulator recorded each point's time and angular velocity ω (planShot does),
+ * the ball turns by ω·Δt over each recorded span, so a draw shot visibly slides with backspin and a
+ * stun shot skids without turning, exactly as simulated. Without that record (hand-built tracks),
+ * balls roll without slipping: a displacement d turns the ball by |d|/R about ẑ × d̂ (the contact
+ * point is instantaneously at rest). Orientations are accumulated per point, so the result is
+ * independent of the frame rate.
  */
 import type { PocketId, SimEvent, Trajectory, Vec2 } from '../../core/types';
 import { quatFromAxisAngle, quatMultiply, quatNormalize, type Quat } from './math3d';
@@ -28,6 +31,11 @@ export interface PlaybackTrack {
   y: Float64Array;
   /** Cumulative rolling rotation at each point (relative to the start), 4 per point. */
   q: Float64Array;
+  /**
+   * Rotation over the span from point i to i+1 as axis (x, y, z) + angle, 4 per span, when the
+   * trajectory recorded ω; sampling inside a span applies a fraction of it. Null = rolling.
+   */
+  span: Float64Array | null;
   start: number;
   /** Time the ball stops or enters the pocket mouth. */
   end: number;
@@ -50,6 +58,13 @@ export function rollingQuat(dx: number, dy: number, R: number): Quat {
   if (d < 1e-12) return [0, 0, 0, 1];
   // axis = ẑ × d̂ = (−dy, dx, 0)/|d|
   return quatFromAxisAngle([-dy / d, dx / d, 0], d / R);
+}
+
+/** Rotation by angular velocity ω (rad/s, world frame) held for dt seconds. */
+export function spinQuat(wx: number, wy: number, wz: number, dt: number): Quat {
+  const w = Math.hypot(wx, wy, wz);
+  if (w < 1e-12 || dt <= 0) return [0, 0, 0, 1];
+  return quatFromAxisAngle([wx / w, wy / w, wz / w], w * dt);
 }
 
 /** Apply a rolling displacement to an orientation (world-frame rotation, so it pre-multiplies). */
@@ -145,11 +160,22 @@ export function buildTrack(tr: Trajectory, R: number, opts: TrackOpts = {}): Pla
   const x = new Float64Array(n);
   const y = new Float64Array(n);
   const q = new Float64Array(4 * n);
+  // Recorded spin: ω at the start of each span (the state after any event there) times its duration.
+  const spins = tr.spins && tr.times && tr.spins.length === n && tr.times.length === n && tr.points.length === n ? tr.spins : null;
+  const span = spins ? new Float64Array(4 * Math.max(0, n - 1)) : null;
   let cur: Quat = [0, 0, 0, 1];
   for (let i = 0; i < n; i++) {
     x[i] = pts[i]!.x;
     y[i] = pts[i]!.y;
-    if (i > 0) cur = rollBall(cur, x[i]! - x[i - 1]!, y[i]! - y[i - 1]!, R);
+    if (i > 0) {
+      if (spins && span) {
+        const w = spins[i - 1]!;
+        const dt = Math.max(0, tr.times![i]! - tr.times![i - 1]!);
+        const m = Math.hypot(w.x, w.y, w.z);
+        if (m > 1e-12) span.set([w.x / m, w.y / m, w.z / m, m * dt], 4 * (i - 1));
+        cur = quatNormalize(quatMultiply(spinQuat(w.x, w.y, w.z, dt), cur));
+      } else cur = rollBall(cur, x[i]! - x[i - 1]!, y[i]! - y[i - 1]!, R);
+    }
     q.set(cur, 4 * i);
   }
   let start = 0;
@@ -167,7 +193,7 @@ export function buildTrack(tr: Trajectory, R: number, opts: TrackOpts = {}): Pla
     const ly = n > 0 ? y[n - 1]! : 0;
     pocket = { id, x: h?.x ?? lx, y: h?.y ?? ly, depth: opts.pocketDepth ?? 0.09 };
   }
-  return { ballId: tr.ballId, t, x, y, q, start, end, pocket };
+  return { ballId: tr.ballId, t, x, y, q, span, start, end, pocket };
 }
 
 /** Time at which the track's animation (including a pocket drop) is complete. */
@@ -216,7 +242,11 @@ export function sampleTrack(tr: PlaybackTrack, time: number, R: number, out: Bal
   setPoint(tr, lo, out);
   const dx = (tr.x[hi]! - tr.x[lo]!) * f;
   const dy = (tr.y[hi]! - tr.y[lo]!) * f;
-  out.q = rollBall(out.q, dx, dy, R);
+  if (tr.span) {
+    const k = 4 * lo;
+    const ang = tr.span[k + 3]! * f;
+    if (ang > 0) out.q = quatNormalize(quatMultiply(quatFromAxisAngle([tr.span[k]!, tr.span[k + 1]!, tr.span[k + 2]!], ang), out.q));
+  } else out.q = rollBall(out.q, dx, dy, R);
   out.x += dx;
   out.y += dy;
   return out;

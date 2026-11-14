@@ -11,6 +11,8 @@ import {
   orbitBasis,
   overviewOrbit,
   playerOrbit,
+  PLAYER_BACK,
+  PLAYER_EYE_HEIGHT,
   tableFramePoints,
 } from '../../../src/app/render3d/camera';
 import { tableGeom } from '../../../src/app/render3d/geom';
@@ -83,9 +85,10 @@ describe('render3d camera presets', () => {
     const aspect = 1280 / 800;
     const o = playerOrbit(g, cue, aim, ghost, aspect);
     const b = orbitBasis(o);
-    expect(b.eye[2]).toBeCloseTo(0.3, 6);
+    expect(b.eye[2]).toBeCloseTo(PLAYER_EYE_HEIGHT, 6);
+    expect(PLAYER_EYE_HEIGHT).toBeLessThan(0.3); // lower than the 001 view (0.3 m): down on the shot
     const back = { x: cue.x - b.eye[0], y: cue.y - b.eye[1] };
-    expect(Math.hypot(back.x, back.y)).toBeCloseTo(0.55, 6);
+    expect(Math.hypot(back.x, back.y)).toBeCloseTo(PLAYER_BACK, 6);
     expect((back.x * aim.x + back.y * aim.y) / Math.hypot(back.x, back.y)).toBeCloseTo(1, 6);
     // Looking along the aim (horizontally) and slightly down.
     const fh = Math.hypot(b.forward[0], b.forward[1]);
@@ -97,6 +100,32 @@ describe('render3d camera presets', () => {
     const qg = ndc(o, aspect, [ghost.x, ghost.y, g.R]);
     for (const q of [qc, qg]) expect(Math.max(Math.abs(q.x), Math.abs(q.y))).toBeLessThan(0.95);
     expect(qc.y).toBeLessThan(qg.y);
+  });
+
+  it('player view keeps the target pocket and the object-ball path end clear of the controls', () => {
+    // Portrait phone, the view-control rail covering the right 18 % and the sheet the bottom 25 %.
+    const aspect = 393 / 852;
+    const ins = { top: 0.08, right: 0.18, bottom: 0.25, left: 0 };
+    // A cut to the shooter's right: the pocket is ~20° right of the aim line.
+    const cue = { x: -0.5, y: 0 };
+    const ghost = { x: 0.3, y: 0.05 };
+    const aim = { x: ghost.x - cue.x, y: ghost.y - cue.y };
+    const pocket: V3 = [g.hx, -g.hy, 0];
+    const obEnd: V3 = [g.hx - 0.05, -g.hy + 0.05, g.R];
+    const plain = playerOrbit(g, cue, aim, ghost, aspect);
+    const fitted = playerOrbit(g, cue, aim, ghost, aspect, { keep: [pocket, obEnd], insets: ins });
+    const inside = (o: typeof plain, p: V3, m = 0) => {
+      const q = ndc(o, aspect, p, insetShift(ins));
+      return q.x >= -1 + 2 * ins.left + m && q.x <= 1 - 2 * ins.right - m && q.y >= -1 + 2 * ins.bottom + m && q.y <= 1 - 2 * ins.top - m;
+    };
+    expect(inside(plain, pocket)).toBe(false); // the plain view loses the pocket under the rail
+    for (const p of [pocket, obEnd, [cue.x, cue.y, g.R] as V3]) expect(inside(fitted, p, 0.05)).toBe(true);
+    // Still a player view: behind the cue ball, low, looking roughly down the aim line.
+    const b = orbitBasis(fitted);
+    expect(b.eye[2]).toBeLessThan(0.45);
+    const fh = Math.hypot(b.forward[0], b.forward[1]);
+    const al = Math.hypot(aim.x, aim.y);
+    expect((b.forward[0] * aim.x + b.forward[1] * aim.y) / (fh * al)).toBeGreaterThan(Math.cos(0.56));
   });
 
   it('interpolates orbits along the shortest yaw and clamps user pitch', () => {

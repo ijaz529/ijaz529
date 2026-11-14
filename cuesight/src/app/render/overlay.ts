@@ -70,7 +70,7 @@ export class Overlay {
     // Manual calibration taps: numbered rings.
     d.calibTaps.forEach((t, i) => {
       const q = map.toScreen(t);
-      this.ring(q, 11, PALETTE.target, 3, 8);
+      this.ring(q, 11, PALETTE.pocket, 3, 8);
       this.label(String(i + 1), { x: q.x + 15, y: q.y - 12 });
     });
     const cal = d.calibration;
@@ -94,7 +94,7 @@ export class Overlay {
     for (const pk of t.pockets) {
       const q = on0(pk.mouthCenter);
       if (pk.id === d.pocketId) {
-        this.ring(q, 13, PALETTE.target, 3.5, 14);
+        this.ring(q, 13, PALETTE.pocket, 3.5, 14);
         this.ring(q, 7, '#FFFFFF', 1.5, 0);
       } else this.ring(q, 11, 'rgba(255,255,255,0.6)', 1.5, 0);
     }
@@ -208,25 +208,40 @@ export class Overlay {
     c.restore();
   }
 
-  /** Crisp label with a dark halo, kept inside the canvas and clear of the labels already placed. */
+  /**
+   * A glass pill label (the Snap and 3D label style: rgba(7,11,20,.78), 1 px strong border, 12 px/700),
+   * kept inside the canvas and clear of the labels already placed.
+   */
   private label(text: string, q: Vec2, color: string = UI.text, align: 'left' | 'right' = 'left'): void {
     const c = this.ctx;
     c.save();
-    c.font = `600 13px -apple-system, 'SF Pro Text', system-ui, sans-serif`;
+    c.font = `700 12px -apple-system, 'SF Pro Text', system-ui, sans-serif`;
     c.textBaseline = 'middle';
     c.textAlign = 'left';
-    const w = c.measureText(text).width;
-    const x = Math.min(this.cssW - w - 6, Math.max(6, align === 'right' ? q.x - w : q.x));
-    let y = Math.min(this.cssH - 10, Math.max(10, q.y));
-    const hit = (yy: number) => this.placed.some((b) => x < b.x + b.w && x + w > b.x && yy - 9 < b.y + b.h && yy + 9 > b.y);
-    for (let k = 1; k <= 6 && hit(y); k++) y = Math.min(this.cssH - 10, Math.max(10, q.y + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * 18));
-    this.placed.push({ x, y: y - 9, w, h: 18 });
-    c.lineJoin = 'round';
-    c.strokeStyle = UI.haloStrong;
-    c.lineWidth = 4.5;
-    c.strokeText(text, x, y);
+    const tw = c.measureText(text).width;
+    const padX = 8;
+    const w = tw + padX * 2;
+    const h = 22;
+    const x = Math.min(this.cssW - w - 6, Math.max(6, align === 'right' ? q.x - w : q.x - padX));
+    let y = Math.min(this.cssH - h / 2 - 4, Math.max(h / 2 + 4, q.y));
+    const hit = (yy: number) => this.placed.some((b) => x < b.x + b.w && x + w > b.x && yy - h / 2 < b.y + b.h && yy + h / 2 > b.y);
+    for (let k = 1; k <= 6 && hit(y); k++) y = Math.min(this.cssH - h / 2 - 4, Math.max(h / 2 + 4, q.y + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (h + 4)));
+    this.placed.push({ x, y: y - h / 2, w, h });
+    const r = h / 2;
+    c.beginPath();
+    c.moveTo(x + r, y - r);
+    c.arcTo(x + w, y - r, x + w, y + r, r);
+    c.arcTo(x + w, y + r, x, y + r, r);
+    c.arcTo(x, y + r, x, y - r, r);
+    c.arcTo(x, y - r, x + w, y - r, r);
+    c.closePath();
+    c.fillStyle = 'rgba(7,11,20,0.78)';
+    c.fill();
+    c.lineWidth = 1;
+    c.strokeStyle = 'rgba(255,255,255,0.16)';
+    c.stroke();
     c.fillStyle = color;
-    c.fillText(text, x, y);
+    c.fillText(text, x + padX, y + 0.5);
     c.restore();
   }
 

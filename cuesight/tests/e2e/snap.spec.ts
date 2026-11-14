@@ -12,10 +12,10 @@ const gt = JSON.parse(readFileSync(`${dir}snap-layout.json`, 'utf8')) as {
 };
 type Snap = { step: string; layout: { id: string; kind: string; pos: V2 }[] | null; player: { result: { ok: boolean; confidence: number; reason?: string } | null } | null };
 type Hook = {
-  state: { snap: Snap; plan: { targetId: string; pocketId: string; stroke: { power: number } } | null; table: { pockets: { id: string; mouthCenter: V2 }[] } };
+  state: { snap: Snap; plan: { targetId: string; pocketId: string; stroke: { power: number; vert: number } } | null; table: { pockets: { id: string; mouthCenter: V2 }[] } };
   practiceToScreen(p: V2): V2;
   view3d: { isAnimating?(): boolean } | null;
-  snap: { photoToScreen(p: V2): V2; photos(): { player: { width: number } | null }; guide(): { strike: { visible: boolean } | null } | null };
+  snap: { photoToScreen(p: V2): V2; photos(): { player: { width: number } | null }; guide(): { strike: { visible: boolean } | null; face: { c: V2; dot: V2; r: number } | null } | null };
 };
 const H = (page: Page) => page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.snap);
 const stepIs = (page: Page, steps: string[]) =>
@@ -25,8 +25,12 @@ const stepIs = (page: Page, steps: string[]) =>
 const AIM_BLUE: [number, number, number] = [0x00, 0x72, 0xb2];
 const OBJECT_ORANGE: [number, number, number] = [0xe6, 0x9f, 0x00];
 
-const settled = (page: Page) =>
-  page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(!(window as unknown as { __cuesight: Hook }).__cuesight.view3d?.isAnimating?.())))));
+const settled = async (page: Page) => {
+  // Playwright's waitForFunction treats a returned Promise as truthy (it does not await it), so the
+  // camera wait is a plain predicate, then two frames so the final camera pose has been drawn.
+  await page.waitForFunction(() => !(window as unknown as { __cuesight: Hook }).__cuesight.view3d?.isAnimating?.());
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
+};
 
 /** The pocket's on-screen position once the table has stopped moving (re-frames are animated). */
 async function stableScreenPoint(page: Page, pocket: string): Promise<V2> {
@@ -112,7 +116,13 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     const px = await regionStats(page, await visibleBox(page, '#snap-canvas'), [AIM_BLUE, OBJECT_ORANGE]);
     expect(px.matchFrac[0], 'aim line pixels').toBeGreaterThan(0.0005);
     expect(px.matchFrac[1], 'object-ball path pixels').toBeGreaterThan(0.0002);
-    await expect(page.locator('#snap-inset')).toBeVisible();
+    // Where to strike: the cue ball's face drawn flat (as coaches draw it), on the photo and in the
+    // HUD, so a high hit is above the centre in both (never a projected point that reads as low).
+    await expect(page.locator('#hud-spin svg .tip-dot')).toBeVisible();
+    const face = await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.guide()?.face ?? null);
+    expect(face).not.toBeNull();
+    if (plan.stroke.vert > 0.04) expect(face!.dot.y).toBeLessThan(face!.c.y);
+    if (plan.stroke.vert < -0.04) expect(face!.dot.y).toBeGreaterThan(face!.c.y);
 
     // Leaving Snap releases the photos (FR-122).
     await page.locator('.mode-switch [data-mode="practice"]').click();
@@ -121,7 +131,9 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
 
   test('a photo it cannot line up → reason → two taps → guide (manual fallback)', async ({ page }) => {
     await tablePhoto(page);
-    await pick(page, gt.balls.find((b) => b.id === '8')!.pos, 'TR');
+    // The 8 to the bottom-right corner (a 52° cut): a shot that can be played, so the guide gives a
+    // strike point and a power. (The 8 to TR is a 92° "cut" — not makeable — and gets no stroke at all.)
+    await pick(page, gt.balls.find((b) => b.id === '8')!.pos, 'BR');
     await expect(page.getByTestId('shot-card')).toBeVisible();
     await page.setInputFiles('#snap-file-player', `${dir}snap-player-hard.png`);
     await stepIs(page, ['guide', 'manual-taps']);

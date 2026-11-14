@@ -131,8 +131,16 @@ export interface CuePose {
 /** Minimum cue elevation (real players rarely get below ~3–5° over a rail). ASSUMPTION. */
 export const MIN_CUE_ELEVATION = (4 * Math.PI) / 180;
 
-/** Tip–ball gap for a given power (1–10): 0.05 + 0.03·power m. */
+/**
+ * Back-swing for a given power (1–10): the tip–ball gap at the top of the stroke, 0.05 + 0.03·power m.
+ * At rest the cue sits at the ADDRESS_GAP (a player addressing the ball), and the power shows as the
+ * length of the idle practice strokes and of the back-swing before a replay.
+ */
 export const cueGap = (power: number): number => 0.05 + 0.03 * Math.max(0, Math.min(10, power));
+/** Tip–ball gap at address (cue resting just behind the strike point). */
+export const ADDRESS_GAP = 0.015;
+/** Length of an idle practice stroke for a given power (m): 0.03 + 0.02·power. */
+export const practiceStroke = (power: number): number => 0.03 + 0.02 * Math.max(0, Math.min(10, power));
 
 /**
  * 3D strike point on the cue ball: behind the ball (opposite the aim), offset side·R to the
@@ -216,6 +224,8 @@ export interface OverlayInput {
   targetId: string | null;
   pocketId: PocketId | null;
   landing: Vec2 | null;
+  /** Pockets the cue ball could drop into with a small error (scratch risk), marked dashed. */
+  riskPockets?: PocketId[];
 }
 
 /** Index of the first point at/after the cue ball's first ball contact (−1 if none). */
@@ -225,7 +235,25 @@ export function firstContactIndex(plan: ShotPlan): number {
   return plan.cuePath.points.findIndex((p) => Math.abs(p.x - hit.pos.x) < 1e-6 && Math.abs(p.y - hit.pos.y) < 1e-6);
 }
 
-export function planRibbons(inp: OverlayInput, g: TableGeom): RibbonSpec[] {
+export interface RibbonOpts {
+  /** Ring the target ball (off in Player view: the object-ball path and contact dot already say which). */
+  targetRing?: boolean;
+  /**
+   * Small balls on screen (the top view): outline the ghost ball in solid sky instead of white dots,
+   * so it cannot be mistaken for the white target ring a few pixels away.
+   */
+  ghostSolid?: boolean;
+}
+
+/** An ✕ of half-size s at q (two strokes). */
+function crossMark(key: string, q: Vec2, s: number, z: number, color: RGBA): RibbonSpec[] {
+  return [
+    { key: `${key}-a`, pts: [{ x: q.x - s, y: q.y - s }, { x: q.x + s, y: q.y + s }], z, color, halo: DARK_HALO, width: 0.005, minPx: 2.6, haloPx: 1.2 },
+    { key: `${key}-b`, pts: [{ x: q.x + s, y: q.y - s }, { x: q.x - s, y: q.y + s }], z, color, halo: DARK_HALO, width: 0.005, minPx: 2.6, haloPx: 1.2 },
+  ];
+}
+
+export function planRibbons(inp: OverlayInput, g: TableGeom, opts: RibbonOpts = {}): RibbonSpec[] {
   const out: RibbonSpec[] = [];
   const R = g.R;
   const z = RIBBON_Z;
@@ -243,9 +271,26 @@ export function planRibbons(inp: OverlayInput, g: TableGeom): RibbonSpec[] {
       const after = plan.cuePath.points.slice(k);
       if (after.length > 1) out.push({ key: 'cb', pts: simplifyPath(after), z, color: hexRGBA(PALETTE.cue), halo: DARK_HALO, dash: [0.045, 0.028, 0, 0], width: 0.006, minPx: 2.6, haloPx: 1.2 });
     }
-    // Aim line: cue-ball centre → ghost-ball centre (warn colour when the shot is not makeable).
-    out.push({ key: 'aim', pts: [cue.pos, plan.ghost], z, color: hexRGBA(plan.makeable ? PALETTE.aim : PALETTE.warn), halo: LIGHT_HALO, width: 0.006, minPx: 3.2, haloPx: 1.1 });
-    out.push({ key: 'ghost', pts: circlePoints(plan.ghost.x, plan.ghost.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.ghost, 0.95), halo: [0, 0, 0, 0.35], dash: [0.0055, 0.0075, 0, 0], width: 0.003, minPx: 2, haloPx: 0.8 });
+    // Aim line: cue-ball centre → ghost-ball centre. Not makeable: vermillion AND dashed (never by
+    // colour alone), with an ✕ on each ball in the way.
+    out.push({
+      key: 'aim',
+      pts: [cue.pos, plan.ghost],
+      z,
+      color: hexRGBA(plan.makeable ? PALETTE.aim : PALETTE.warn),
+      halo: LIGHT_HALO,
+      ...(plan.makeable ? {} : { dash: [0.022, 0.016, 0, 0] as [number, number, number, number] }),
+      width: 0.006,
+      minPx: 3.2,
+      haloPx: 1.1,
+    });
+    const blockers = new Set(plan.warnings.filter((w) => (w.code === 'blocked-cue' || w.code === 'blocked-object') && w.ballId).map((w) => w.ballId!));
+    for (const id of blockers) {
+      const b = inp.balls.find((x) => x.id === id);
+      if (b) out.push(...crossMark(`block:${id}`, b.pos, R * 1.25, z, hexRGBA(PALETTE.warn)));
+    }
+    if (opts.ghostSolid) out.push({ key: 'ghost', pts: circlePoints(plan.ghost.x, plan.ghost.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.cue, 0.95), halo: [0, 0, 0, 0.4], width: 0.0025, minPx: 1.5, haloPx: 0.8 });
+    else out.push({ key: 'ghost', pts: circlePoints(plan.ghost.x, plan.ghost.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.ghost, 0.95), halo: [0, 0, 0, 0.35], dash: [0.0055, 0.0075, 0, 0], width: 0.003, minPx: 2, haloPx: 0.8 });
     if (plan.cueRest) {
       const q = plan.cueRest;
       const s = Math.max(0.018, R * 0.7);
@@ -254,15 +299,56 @@ export function planRibbons(inp: OverlayInput, g: TableGeom): RibbonSpec[] {
       out.push({ key: 'rest-ring', pts: circlePoints(q.x, q.y, R, 36), z, closed: true, color: hexRGBA(PALETTE.cue, 0.95), halo: [0, 0, 0, 0.3], dash: [0.006, 0.007, 0, 0], width: 0.003, minPx: 2, haloPx: 0.8 });
     }
   }
-  if (target) out.push({ key: 'target', pts: circlePoints(target.pos.x, target.pos.y, R * 1.42, 48), z, closed: true, color: hexRGBA(PALETTE.target), halo: DARK_HALO, width: 0.004, minPx: 2.6, haloPx: 1 });
+  if (target && opts.targetRing !== false)
+    out.push({ key: 'target', pts: circlePoints(target.pos.x, target.pos.y, R * 1.42, 48), z, closed: true, color: hexRGBA(PALETTE.target), halo: DARK_HALO, width: 0.004, minPx: 2.4, haloPx: 1.4 });
   const pocketId = plan?.pocketId ?? inp.pocketId;
   const hole = pocketId ? g.holes.find((h) => h.id === pocketId) : undefined;
-  if (hole) out.push({ key: 'pocket', pts: circlePoints(hole.x, hole.y, hole.r + 0.007, 56), z: g.railTop + 0.0015, closed: true, color: hexRGBA(PALETTE.target), halo: DARK_HALO, width: 0.006, minPx: 3, haloPx: 1.2 });
+  const spec = pocketId ? inp.table.pockets.find((p) => p.id === pocketId) : undefined;
+  // The target pocket: a gold arc on the cloth across the mouth, jaw to jaw (at rail height a full
+  // ring hovered over the pocket like a halo in the low Player view).
+  if (hole && spec) out.push({ key: 'pocket', pts: mouthArc(spec, hole), z: 0.0015, color: hexRGBA(PALETTE.pocket), halo: [0.02, 0.04, 0.06, 0.7], width: 0.006, minPx: 3, haloPx: 3 });
+  // Scratch: an ✕ ring on the pocket the cue ball would drop into.
+  const scratchId = plan?.scratch ? plan.cuePath.pocket : null;
+  const sh = scratchId ? g.holes.find((h) => h.id === scratchId) : undefined;
+  if (sh) {
+    out.push({ key: 'scratch', pts: circlePoints(sh.x, sh.y, sh.r + 0.004, 56), z: g.railTop + 0.0016, closed: true, color: hexRGBA(PALETTE.warn), halo: DARK_HALO, dash: [0.012, 0.008, 0, 0], width: 0.005, minPx: 2.6, haloPx: 1.2 });
+    out.push(...crossMark('scratch-x', { x: sh.x, y: sh.y }, sh.r * 0.55, g.railTop + 0.0016, hexRGBA(PALETTE.warn)));
+  }
+  // Scratch risk (a small error drops the cue ball here): a dashed vermillion ring, no ✕ (not a scratch yet).
+  for (const id of inp.riskPockets ?? []) {
+    const rh = g.holes.find((h) => h.id === id);
+    if (rh && rh !== sh) out.push({ key: `risk:${id}`, pts: circlePoints(rh.x, rh.y, rh.r + 0.004, 56), z: g.railTop + 0.0016, closed: true, color: hexRGBA(PALETTE.warn, 0.9), halo: DARK_HALO, dash: [0.008, 0.012, 0, 0], width: 0.004, minPx: 2.2, haloPx: 1.1 });
+  }
   if (inp.landing) {
     const q = inp.landing;
     out.push({ key: 'landing', pts: circlePoints(q.x, q.y, 0.15, 64), z, closed: true, color: hexRGBA(PALETTE.landing), halo: DARK_HALO, dash: [0.03, 0.02, 0, 0], width: 0.004, minPx: 2.2, haloPx: 1 });
     out.push({ key: 'landing-h', pts: [{ x: q.x - 0.03, y: q.y }, { x: q.x + 0.03, y: q.y }], z, color: hexRGBA(PALETTE.landing), halo: DARK_HALO, width: 0.004, minPx: 2.2, haloPx: 1 });
     out.push({ key: 'landing-v', pts: [{ x: q.x, y: q.y - 0.03 }, { x: q.x, y: q.y + 0.03 }], z, color: hexRGBA(PALETTE.landing), halo: DARK_HALO, width: 0.004, minPx: 2.2, haloPx: 1 });
+  }
+  return out;
+}
+
+/**
+ * Arc through the two jaw points of a pocket, bulging into the table (the side the ball comes from),
+ * centred on the hole.
+ */
+export function mouthArc(p: { jawA: Vec2; jawB: Vec2; inward: Vec2 }, hole: { x: number; y: number }, n = 28): Vec2[] {
+  const ra = Math.hypot(p.jawA.x - hole.x, p.jawA.y - hole.y);
+  const rb = Math.hypot(p.jawB.x - hole.x, p.jawB.y - hole.y);
+  const a0 = Math.atan2(p.jawA.y - hole.y, p.jawA.x - hole.x);
+  let a1 = Math.atan2(p.jawB.y - hole.y, p.jawB.x - hole.x);
+  // Sweep the way that passes the inward direction.
+  const ai = Math.atan2(p.inward.y, p.inward.x);
+  const norm = (a: number) => ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  let sweep = norm(a1 - a0);
+  if (norm(ai - a0) > sweep) sweep -= 2 * Math.PI;
+  a1 = a0 + sweep;
+  const out: Vec2[] = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const a = a0 + (a1 - a0) * t;
+    const r = ra + (rb - ra) * t;
+    out.push({ x: hole.x + r * Math.cos(a), y: hole.y + r * Math.sin(a) });
   }
   return out;
 }

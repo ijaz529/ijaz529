@@ -21,12 +21,13 @@ export function stopCamera(video: HTMLVideoElement): void {
   video.srcObject = null;
 }
 
-export function describeCameraError(e: unknown): string {
+/** `native`: running inside the iOS app (Capacitor), where the switch is in the Settings app, not a browser. */
+export function describeCameraError(e: unknown, native = false): string {
   const name = (e as { name?: string })?.name ?? '';
   switch (name) {
     case 'NotAllowedError':
     case 'SecurityError':
-      return 'Camera access was blocked. CueSight needs the camera to see the table — everything is processed on this device and never uploaded. Allow camera access in your browser settings, or use the practice table.';
+      return `Camera access was blocked. CueSight needs the camera to see the table — everything is processed on this device and never uploaded. ${native ? 'Open Settings › CueSight › Camera to allow it' : 'Allow camera access in your browser settings'}, or use the practice table.`;
     case 'NotFoundError':
     case 'OverconstrainedError':
       return 'No camera was found on this device. You can still plan shots on the practice table.';

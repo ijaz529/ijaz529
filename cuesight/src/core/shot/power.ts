@@ -1,6 +1,7 @@
 /**
  * Power scale ↔ cue-ball speed, and coaching language for speed and spin (research.md R-12).
  */
+import { rollingDistance } from '../physics/analytic';
 import type { Stroke } from '../types';
 
 /** Cue-ball speed (m/s) for power levels 1..10. */
@@ -48,17 +49,55 @@ const TIP_WORDS: [number, string][] = [
   [2, '2'],
 ];
 
-function tips(frac: number): string {
+/** Tips of offset in words: "¼ tip", "½ tip", "1 tip", "1½ tips" (plural above one). */
+export function tipsText(frac: number): string {
   const t = Math.abs(frac) / TIP_FRACTION;
   let best = TIP_WORDS[0]!;
   for (const w of TIP_WORDS) if (Math.abs(w[0] - t) < Math.abs(best[0] - t)) best = w;
-  return `${best[1]} tip`;
+  return `${best[1]} ${best[0] > 1 ? 'tips' : 'tip'}`;
 }
 
-/** "½ tip low, ¼ tip right" / "centre ball". */
+/**
+ * Where to strike the cue ball, in the one vocabulary the whole app uses (card, 3D label, coaching
+ * tip, Snap, screen reader): "½ tip below centre", "1½ tips above centre, 1 tip right",
+ * "centre ball".
+ */
 export function describeSpin(s: Pick<Stroke, 'side' | 'vert'>): string {
   const parts: string[] = [];
-  if (Math.abs(s.vert) >= 0.04) parts.push(`${tips(s.vert)} ${s.vert > 0 ? 'high' : 'low'}`);
-  if (Math.abs(s.side) >= 0.04) parts.push(`${tips(s.side)} ${s.side > 0 ? 'right' : 'left'}`);
+  if (Math.abs(s.vert) >= 0.04) parts.push(`${tipsText(s.vert)} ${s.vert > 0 ? 'above' : 'below'} centre`);
+  if (Math.abs(s.side) >= 0.04) parts.push(`${tipsText(s.side)} ${s.side > 0 ? 'right' : 'left'}`);
   return parts.length ? parts.join(', ') : 'centre ball';
+}
+
+/** ASSUMPTION: a diamond is ⅛ of the playing length (standard pool and snooker diamond spacing). */
+export const DIAMONDS_PER_LENGTH = 8;
+
+/** Above this many diamonds past pocket speed the reference stops counting (see speedReference). */
+export const PACE_CAP_DIAMONDS = 12;
+
+/** How far (diamonds) the object ball would roll past the pocket on an endless cloth, from its mouth speed. */
+export function paceDiamonds(obMouthSpeed: number, tableLength: number, params: { muRoll: number; g: number }): number {
+  if (!(obMouthSpeed > 0) || !(tableLength > 0)) return 0;
+  return rollingDistance(obMouthSpeed, params) / (tableLength / DIAMONDS_PER_LENGTH);
+}
+
+/**
+ * Speed in a reference players can calibrate to: how far past the pocket the object ball would
+ * roll if the pocket were not there, from its speed at the mouth (rolling distance v²/(2μr·g),
+ * research.md R-12), in diamonds or a table length. Null when the ball does not drop.
+ *
+ * The rolling distance ignores the cushions a real ball would hit (each takes ~20–45 % of its speed,
+ * params.ts cushion restitution), so beyond about a table length the count stops meaning anything a
+ * player can feel ("+ 28 table lengths"): past PACE_CAP_DIAMONDS it says "well past pocket speed".
+ */
+export function speedReference(obMouthSpeed: number, tableLength: number, params: { muRoll: number; g: number }): string | null {
+  if (!(obMouthSpeed > 0) || !(tableLength > 0)) return null;
+  const diamonds = paceDiamonds(obMouthSpeed, tableLength, params);
+  if (diamonds < 0.5) return 'pocket speed: it just drops';
+  if (diamonds < 7.5) {
+    const n = Math.round(diamonds);
+    return `pocket speed + ${n} diamond${n === 1 ? '' : 's'}`;
+  }
+  if (diamonds < PACE_CAP_DIAMONDS) return 'pocket speed + a table length';
+  return 'well past pocket speed: over a table length';
 }

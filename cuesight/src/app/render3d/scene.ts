@@ -66,8 +66,13 @@ export interface FrameState {
   cue: Mat4 | null;
   glow: { x: number; y: number; r: number; color: RGBA } | null;
   ribbons: boolean;
+  /** During a replay: only the planned aim, object-ball and cue-ball lines, faint, to compare against. */
+  ribbonsFaint?: boolean;
   heat: boolean;
 }
+
+/** Ribbons kept (faint) during a replay. */
+const FAINT_KEYS = new Set(['aim', 'ob', 'cb']);
 
 const MAX_RIBBON_VERTS = 24_000;
 /** ASSUMPTION: visual tuning (lamp radiance and exposure chosen by eye against the design). */
@@ -388,9 +393,10 @@ export class Renderer {
       gl.bindVertexArray(this.ribbonVao);
       for (const r of this.ribbons) {
         const s = r.spec;
-        ln.f3('uWidth', s.width, s.minPx * f.dpr, s.haloPx * f.dpr);
-        ln.f4('uColor', ...s.color);
-        ln.f4('uHalo', ...s.halo);
+        if (f.ribbonsFaint && !FAINT_KEYS.has(s.key)) continue;
+        ln.f3('uWidth', s.width, s.minPx * f.dpr * (f.ribbonsFaint ? 0.7 : 1), s.haloPx * f.dpr);
+        ln.f4('uColor', s.color[0], s.color[1], s.color[2], s.color[3] * (f.ribbonsFaint ? 0.38 : 1));
+        ln.f4('uHalo', s.halo[0], s.halo[1], s.halo[2], f.ribbonsFaint ? 0 : s.halo[3]);
         const d = s.dash ?? [0, 0, 0, 0];
         ln.f4('uDash', d[0], d[1], d[2], d[3]);
         ln.f1('uPlaneZ', s.z);
