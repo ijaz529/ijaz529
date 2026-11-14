@@ -1,0 +1,209 @@
+# CueSight: web checks, iOS Simulator smoke test with screenshots, WebKit iPhone e2e, and TestFlight upload.
+# The app lives in cuesight/; see cuesight/docs/ios.md for local builds and the one-time TestFlight setup.
+name: CueSight iOS
+
+on:
+  push:
+    branches: ['claude/**', 'main']
+    paths:
+      - 'cuesight/**'
+      - '.github/workflows/cuesight-ios.yml'
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: 'Upload the build to TestFlight (needs the App Store Connect secrets)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: cuesight-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: cuesight
+
+env:
+  NODE_VERSION: '22'
+  # Pin an Xcode (e.g. 26.1) with the repository variable XCODE_VERSION; default = newest installed.
+  XCODE_VERSION: ${{ vars.XCODE_VERSION }}
+
+jobs:
+  web:
+    name: Web (typecheck, unit tests, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cuesight/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx vite build
+      - name: Bundle size
+        run: |
+          {
+            echo "## Web build"
+            echo ""
+            echo '```'
+            find dist -type f \( -name '*.js' -o -name '*.css' \) -exec sh -c 'printf "%8d B gz  %s\n" "$(gzip -c "$1" | wc -c)" "$1"' _ {} \; | sort -k4
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  chromium-e2e:
+    name: Chromium phone e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cuesight/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-e2e-results
+          path: cuesight/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  ios-simulator:
+    name: iOS Simulator (build, launch, screenshots)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: bash scripts/ios-select-xcode.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cuesight/package-lock.json
+      - run: npm ci
+      - name: Build the web app (tour build) and sync it into the iOS project
+        env:
+          VITE_CUESIGHT_TOUR: '1'
+        run: npm run build && npx cap sync ios
+      - name: Build, install, launch and screenshot in the Simulator
+        run: bash scripts/ios-sim-smoke.sh
+        env:
+          SIM_OUT: build/sim
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-screenshots
+          path: |
+            cuesight/build/sim/
+          retention-days: 14
+          if-no-files-found: warn
+
+  webkit-e2e:
+    name: WebKit iPhone 15 e2e
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cuesight/package-lock.json
+      - run: npm ci
+      - run: npx playwright install webkit
+      - run: npx vite build
+      - name: Playwright (WebKit, iPhone 15 profile; the live fake-camera spec is Chromium-only)
+        run: npx playwright test -c playwright.webkit.config.ts --trace off
+        env:
+          CI: 'true'
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkit-e2e-report
+          path: |
+            cuesight/playwright-report/
+            cuesight/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  testflight:
+    name: TestFlight upload
+    needs: [web, ios-simulator]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.upload)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      # Secrets cannot be used in a job-level `if`, so this step decides whether the job does anything.
+      - name: Check App Store Connect secrets
+        id: gate
+        working-directory: .
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID || vars.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          [[ -n "$ASC_KEY_ID" ]] || missing+=(APP_STORE_CONNECT_KEY_ID)
+          [[ -n "$ASC_ISSUER_ID" ]] || missing+=(APP_STORE_CONNECT_ISSUER_ID)
+          [[ -n "$ASC_KEY_P8" ]] || missing+=(APP_STORE_CONNECT_KEY_P8)
+          [[ -n "$APPLE_TEAM_ID" ]] || missing+=(APPLE_TEAM_ID)
+          if (( ${#missing[@]} )); then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::TestFlight upload skipped - App Store Connect secrets are not configured (missing: ${missing[*]}). See cuesight/docs/ios.md."
+            {
+              echo "## TestFlight"
+              echo ""
+              echo "Skipped: missing ${missing[*]}. Follow cuesight/docs/ios.md (TestFlight setup) to enable uploads."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+      - if: steps.gate.outputs.enabled == 'true'
+        name: Select Xcode
+        run: bash scripts/ios-select-xcode.sh
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: cuesight/package-lock.json
+      - if: steps.gate.outputs.enabled == 'true'
+        run: npm ci
+      - if: steps.gate.outputs.enabled == 'true'
+        name: Release web build and sync into the iOS project
+        env:
+          CUESIGHT_APP_ID: ${{ vars.IOS_BUNDLE_ID || 'com.cuesight.app' }}
+        run: npm run build && npx cap sync ios
+      - if: steps.gate.outputs.enabled == 'true'
+        name: Archive and upload to App Store Connect (TestFlight)
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID || vars.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.cuesight.app' }}
+        run: bash scripts/ios-testflight.sh
+      - if: failure() && steps.gate.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-logs
+          path: cuesight/build/*.log
+          retention-days: 7
+          if-no-files-found: ignore

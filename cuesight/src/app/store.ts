@@ -6,8 +6,9 @@ import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, TableLayout, Tab
 import type { Calibration } from '../vision/calibration';
 import type { LockStatus } from '../vision/tracker';
 import type { Settings } from './settings';
+import type { SnapSession } from './snap/session';
 
-export type Mode = 'camera' | 'practice';
+export type Mode = 'camera' | 'practice' | 'snap';
 export type Interaction = 'select' | 'position' | 'calibrate' | 'mark-cue' | 'pick-next';
 
 export interface LiveVision {
@@ -44,6 +45,8 @@ export interface AppState {
   cameraError: string | null;
   cueOverrideId: string | null;
   toast: string | null;
+  /** Snap mode (two-photo guide) session; photos themselves live in the Snap controller. */
+  snap: SnapSession;
 }
 
 type Listener = (s: AppState) => void;

@@ -3,6 +3,8 @@
  * limit (½ R); the hollow ring shows the recommended tip.
  */
 import { clampTip } from '../../core/physics/strike';
+import { describeSpin } from '../../core/shot/power';
+import { sphereBody, sphereDefs } from './spin-ball';
 
 export interface SpinPad {
   el: HTMLElement;
@@ -10,11 +12,12 @@ export interface SpinPad {
 }
 
 const NS = 'http://www.w3.org/2000/svg';
+let padId = 0;
 
 export function createSpinPad(onChange: (side: number, vert: number) => void): SpinPad {
   const size = 132;
-  const r = size / 2 - 6;
   const c = size / 2;
+  const r = (46 / 100) * size; // the sphere body is drawn in a 0..100 box with radius 46
   const el = document.createElement('div');
   el.className = 'spin-pad';
   const svg = document.createElementNS(NS, 'svg');
@@ -23,20 +26,26 @@ export function createSpinPad(onChange: (side: number, vert: number) => void): S
   svg.setAttribute('height', String(size));
   svg.setAttribute('role', 'slider');
   svg.setAttribute('aria-label', 'Cue tip position: drag to set spin');
+  svg.setAttribute('aria-valuetext', 'centre ball');
   svg.setAttribute('tabindex', '0');
+  const id = `pad${++padId}`;
   svg.innerHTML = `
-    <circle cx="${c}" cy="${c}" r="${r}" fill="#f7f7f2" stroke="#888" stroke-width="2"/>
-    <circle cx="${c}" cy="${c}" r="${r * 0.5}" fill="none" stroke="#b55" stroke-dasharray="4 4"/>
-    <line x1="${c - r}" y1="${c}" x2="${c + r}" y2="${c}" stroke="#ccc"/>
-    <line x1="${c}" y1="${c - r}" x2="${c}" y2="${c + r}" stroke="#ccc"/>
+    <g transform="scale(${size / 100})">${sphereDefs(id)}${sphereBody(id)}</g>
     <circle class="rec" r="10" fill="none" stroke="#0072B2" stroke-width="2.5" stroke-dasharray="3 2"/>
-    <circle class="tip" r="10" fill="#0072B2" stroke="#fff" stroke-width="2"/>`;
+    <circle class="tip-shadow" r="11" fill="rgba(0,0,0,0.28)"/>
+    <circle class="tip" r="10" fill="#0072B2" stroke="#fff" stroke-width="2.5"/>`;
   el.appendChild(svg);
   const tip = svg.querySelector('.tip') as SVGCircleElement;
+  const tipShadow = svg.querySelector('.tip-shadow') as SVGCircleElement;
   const rec = svg.querySelector('.rec') as SVGCircleElement;
   const place = (node: SVGCircleElement, side: number, vert: number) => {
     node.setAttribute('cx', String(c + side * r));
     node.setAttribute('cy', String(c - vert * r));
+    if (node === tip) {
+      tipShadow.setAttribute('cx', String(c + side * r));
+      tipShadow.setAttribute('cy', String(c - vert * r + 2));
+      svg.setAttribute('aria-valuetext', describeSpin({ side, vert }));
+    }
   };
   const fromEvent = (e: PointerEvent) => {
     const b = svg.getBoundingClientRect();

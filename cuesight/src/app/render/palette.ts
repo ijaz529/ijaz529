@@ -13,6 +13,26 @@ export const PALETTE = {
   landing: '#F0E442',
 } as const;
 
+/**
+ * Midnight Felt surface colours for canvas drawing (rails, cloth, halos). These carry no plan
+ * meaning; the plan colours above are unchanged.
+ */
+export const UI = {
+  text: '#F4F6FB',
+  halo: 'rgba(7,11,20,0.55)',
+  haloStrong: 'rgba(7,11,20,0.88)',
+  wood: '#4A2C18',
+  woodHi: '#6E4426',
+  woodLo: '#2C190D',
+  cushion: '#0A5A41',
+  cloth: '#0E6B4F',
+  clothHi: '#16855F',
+  clothLo: '#0A4F3A',
+  pearl: '#F1E6C8',
+  leather: '#141210',
+  ivory: '#F6F3EA',
+} as const;
+
 export const DASH = {
   aim: [] as number[],
   object: [] as number[],

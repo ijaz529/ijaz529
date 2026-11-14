@@ -1,1 +1,113 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#14532d"/><circle cx="26" cy="38" r="12" fill="#f7f7f2"/><circle cx="44" cy="22" r="9" fill="#e69f00"/><path d="M26 38 L44 22" stroke="#56b4e9" stroke-width="3" stroke-dasharray="5 4"/><circle cx="37" cy="28" r="9" fill="none" stroke="#fff" stroke-width="2" stroke-dasharray="3 3"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>CueSight</title>
+  <style>
+    .small .detail, .flat .texture { display: none; }
+    .small .reticle { stroke-width: 26px; }
+  </style>
+  <defs>
+    <radialGradient id="felt" cx="470" cy="90" r="1050" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2BC892"/>
+      <stop offset="0.22" stop-color="#14855F"/>
+      <stop offset="0.52" stop-color="#0B4A3B"/>
+      <stop offset="0.8" stop-color="#08241F"/>
+      <stop offset="1" stop-color="#070B14"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx="512" cy="430" r="760" gradientUnits="userSpaceOnUse">
+      <stop offset="0.55" stop-color="#070B14" stop-opacity="0"/>
+      <stop offset="1" stop-color="#070B14" stop-opacity="0.7"/>
+    </radialGradient>
+    <filter id="weave" x="0" y="0" width="1024" height="1024" filterUnits="userSpaceOnUse">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="7" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.09 0"/>
+      <feComposite in2="SourceGraphic" operator="in"/>
+    </filter>
+
+    <!-- cue ball -->
+    <radialGradient id="cueBody" cx="380" cy="690" fx="398" fy="590" r="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.2" stop-color="#FDFBF4"/>
+      <stop offset="0.52" stop-color="#ECE8DB"/>
+      <stop offset="0.8" stop-color="#C2C0B5"/>
+      <stop offset="0.94" stop-color="#8E9592"/>
+      <stop offset="1" stop-color="#66727A"/>
+    </radialGradient>
+    <radialGradient id="cueBounce" cx="380" cy="610" r="272" gradientUnits="userSpaceOnUse">
+      <stop offset="0.8" stop-color="#2FC48F" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2FC48F" stop-opacity="0.22"/>
+    </radialGradient>
+
+    <!-- object ball (the "1") -->
+    <radialGradient id="objBody" cx="690" cy="330" fx="660" fy="282" r="106" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFE9A8"/>
+      <stop offset="0.28" stop-color="#FFC53D"/>
+      <stop offset="0.7" stop-color="#E69F00"/>
+      <stop offset="1" stop-color="#8F5200"/>
+    </radialGradient>
+    <radialGradient id="objBounce" cx="690" cy="282" r="152" gradientUnits="userSpaceOnUse">
+      <stop offset="0.8" stop-color="#2FC48F" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2FC48F" stop-opacity="0.3"/>
+    </radialGradient>
+
+    <radialGradient id="spec" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="beam" x1="380" y1="690" x2="690" y2="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9FDBFA"/>
+      <stop offset="1" stop-color="#56B4E9"/>
+    </linearGradient>
+
+    <filter id="shadow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="22"/></filter>
+    <filter id="shadowTight" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="7"/></filter>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="16"/></filter>
+    <filter id="specBlur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="3"/></filter>
+  </defs>
+
+  <!-- felt under an overhead lamp -->
+  <rect width="1024" height="1024" fill="url(#felt)"/>
+  <rect class="detail texture" width="1024" height="1024" fill="#000" filter="url(#weave)"/>
+  <rect width="1024" height="1024" fill="url(#vignette)"/>
+
+  <g id="art">
+    <!-- aim beam (tapers with distance: the player's view down the line) -->
+    <path d="M 349.7 663.9 L 410.3 716.1 L 700.6 339.1 L 679.4 320.9 Z" fill="#56B4E9" opacity="0.7" filter="url(#glow)"/>
+    <path d="M 355.8 669.1 L 404.2 710.9 L 696.8 335.9 L 683.2 324.1 Z" fill="url(#beam)"/>
+    <path class="detail" d="M 374.7 685.4 L 385.3 694.6 L 691.9 331.6 L 688.1 328.4 Z" fill="#FFFFFF" opacity="0.75"/>
+
+    <!-- object ball: contact shadow, body, number disc, felt bounce, specular -->
+    <ellipse cx="704" cy="428" rx="98" ry="26" fill="#000" opacity="0.5" filter="url(#shadow)"/>
+    <ellipse cx="696" cy="424" rx="62" ry="12" fill="#000" opacity="0.55" filter="url(#shadowTight)"/>
+    <circle cx="690" cy="330" r="100" fill="url(#objBody)"/>
+    <g class="detail">
+      <ellipse cx="676" cy="314" rx="40" ry="37" fill="#FFFDF5" transform="rotate(-20 676 314)"/>
+      <path d="M 667 302 L 680 295 L 680 334" fill="none" stroke="#1B1F2A" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <circle cx="690" cy="330" r="100" fill="url(#objBounce)"/>
+    <ellipse cx="652" cy="276" rx="30" ry="18" fill="url(#spec)" transform="rotate(-32 652 276)"/>
+
+    <!-- the sight: a HUD reticle locked on the target -->
+    <g class="detail" fill="none" stroke="#56B4E9" stroke-width="30" stroke-linecap="round" opacity="0.45" filter="url(#glow)">
+      <circle cx="690" cy="330" r="148"/>
+    </g>
+    <g class="reticle" fill="none" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round">
+      <path d="M 720.8 185.2 A 148 148 0 0 1 834.8 299.2"/>
+      <path d="M 834.8 360.8 A 148 148 0 0 1 720.8 474.8"/>
+      <path d="M 659.2 474.8 A 148 148 0 0 1 545.2 360.8"/>
+      <path d="M 545.2 299.2 A 148 148 0 0 1 659.2 185.2"/>
+      <line x1="690" y1="152" x2="690" y2="196"/>
+      <line x1="868" y1="330" x2="824" y2="330"/>
+      <line x1="690" y1="508" x2="690" y2="464"/>
+      <line x1="512" y1="330" x2="556" y2="330"/>
+    </g>
+
+    <!-- cue ball: soft + tight contact shadows, body, felt bounce, specular -->
+    <ellipse cx="392" cy="872" rx="196" ry="44" fill="#000" opacity="0.55" filter="url(#shadow)"/>
+    <ellipse cx="386" cy="872" rx="120" ry="18" fill="#000" opacity="0.6" filter="url(#shadowTight)"/>
+    <circle cx="380" cy="690" r="190" fill="url(#cueBody)"/>
+    <circle cx="380" cy="690" r="190" fill="url(#cueBounce)"/>
+    <ellipse cx="400" cy="584" rx="70" ry="40" fill="url(#spec)" opacity="0.9" transform="rotate(8 400 584)"/>
+    <ellipse cx="403" cy="576" rx="24" ry="13" fill="#FFFFFF" transform="rotate(8 403 576)" filter="url(#specBlur)"/>
+  </g>
+</svg>

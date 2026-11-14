@@ -83,9 +83,9 @@ export function tableGeom(table: TableSpec): TableGeom {
     outerX: hx + cw + rw,
     outerY: hy + cw + rw,
     holes,
-    lampZ: 0.95,
-    lampHalfX: Math.min(0.85, table.length * 0.3),
-    lampHalfY: 0.19,
+    lampZ: 0.85,
+    lampHalfX: Math.min(0.85, table.length * 0.27),
+    lampHalfY: 0.17,
     cornerLean,
     sideLean,
     snooker,
@@ -100,13 +100,15 @@ function pocketHole(p: PocketSpec, cw: number, cornerLean: number, sideLean: num
   if (p.kind === 'corner') {
     // Each facing moves its jaw by (−lean·cw along the rail, −cw outward); projected on the mouth
     // line (45°) that closes the gap by cw·(lean − 1)/√2 per side.
+    // WPA corner shelf (mouth line → drop) is 1"–2.25": the drop sits in the rail corner.
     const throat = mouth - Math.SQRT2 * cw * (cornerLean - 1);
-    r = Math.max(table.ballRadius * 1.65, throat / 2 + 0.003);
-    shelf = 0.002;
+    r = Math.max(table.ballRadius * 1.7, throat / 2 + 0.004);
+    shelf = 0.032;
   } else {
+    // Side shelf is 0–0.375".
     const throat = mouth - 2 * sideLean * cw;
-    r = Math.max(table.ballRadius * 1.65, throat / 2 + 0.002);
-    shelf = 0.003;
+    r = Math.max(table.ballRadius * 1.7, throat / 2 + 0.003);
+    shelf = 0.005;
   }
   const back = shelf + r;
   return {

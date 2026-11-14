@@ -338,14 +338,19 @@ appear in TestFlight.
   aim line, ghost ball, contact point, object-ball path, cue-ball path and other balls' paths, the
   pocket highlight, the rest and landing markers and the position heatmap. Labels MUST be readable
   text.
-- **FR-107**: When a plan exists, the system MUST draw a cue stick behind the cue ball, level and along
-  the aim line. Its tip MUST sit at the recommended strike point (side and vertical offset), and its
-  gap behind the ball MUST grow with power.
+- **FR-107**: When a plan exists, the system MUST draw a cue stick behind the cue ball along the aim
+  line, near level and raised only as needed to clear the rail. Its axis MUST pass through the
+  recommended strike point (side and vertical offset), and the gap between its tip and the ball MUST
+  grow with power.
 - **FR-108**: *Play shot* MUST replay the simulated trajectories of every ball in motion at real-time
-  speed. Replays longer than 4 s MUST be sped up evenly to last 4 s. Ball rotation MUST be physically
-  consistent: no slip while a ball rolls, and a sliding-to-rolling transition after the strike and
-  after impact. Pocketed balls MUST drop into their pocket. The replay MUST be skippable (button, tap,
-  Escape) and MUST restore the planned layout when it ends.
+  speed, passing every simulation event at its time. Replays longer than 4 s MUST be sped up evenly
+  to last 4 s.
+  - Ball rotation MUST be consistent with rolling: no slip while a ball rolls. It SHOULD also show
+    the sliding-to-rolling transition after the strike and after impact, so stun, draw and follow
+    look different.
+  - Pocketed balls MUST drop into their pocket.
+  - The replay MUST be skippable (button, tap, Escape) and MUST restore the planned layout when it
+    ends.
 - **FR-109**: The 3D view MUST draw frames only when something changes (camera move, data change,
   playback) and MUST be idle otherwise.
 - **FR-110**: When WebGL2 is unavailable, or the 3D view cannot be created or restored, the system MUST

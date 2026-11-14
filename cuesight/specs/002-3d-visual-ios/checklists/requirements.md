@@ -47,8 +47,9 @@
    `data-mode` (FR-125) are kept on purpose. They are test hooks that end-to-end tests depend on (the
    second one already exists in 001).
 2. Iteration 1 found three issues, all fixed:
-   1. FR-108 originally said "realistic rotation". It now says *no slip while rolling* plus the
-      slide-to-roll transition, which SC-103 measures (slip < 1 % of speed).
+   1. FR-108 originally said "realistic rotation". It now says *no slip while rolling* (MUST, which
+      SC-103 measures as slip < 1 % of speed) and the slide-to-roll transition (SHOULD, research R-17
+      level 2).
    2. FR-118 originally said "fallback when the fit is bad". It now names the trigger (failure or
       confidence below the threshold) and the exact fallback (tap the cue ball and the target).
    3. SC-106 originally said "accurate on most photos". It now states the scene envelope (height,

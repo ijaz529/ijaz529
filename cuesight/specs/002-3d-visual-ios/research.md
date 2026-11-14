@@ -1,0 +1,524 @@
+# Phase 0 Research: 3D Table, Two-Photo Snap Guide, Polished UI and iOS App
+
+Decisions continue the numbering of [001 research](../001-realtime-shot-guide/research.md) (R-01 … R-14).
+Each decision lists what was chosen, why, and what was rejected. `ASSUMPTION:` marks a value that
+tests on synthetic fixtures must confirm or tune.
+
+## R-15 3D renderer: hand-written WebGL2, no library
+
+- **Decision**: a small, purpose-built WebGL2 renderer in `src/app/render3d/`. It contains:
+  - a math module (vec3 and quat tuples, mat4 on `Float32Array`, rays);
+  - procedural meshes;
+  - one lit material shader with variants (cloth, wood, ball, cushion, pocket), a line/ribbon
+    shader and a decal shader (contact shadows, glows);
+  - CPU ray picking.
+
+  It is loaded with a dynamic `import()` when a 3D view is first needed, so it does not count against
+  the initial bundle.
+- **Rationale**:
+  - Principle VII: zero runtime dependencies. The scene is a fixed, known set of objects: one
+    table, ≤ 22 spheres, one cue, a few overlays. It needs no scene graph, loaders or physics.
+  - Budget: three.js is ~150 KB+ gzip even when tree-shaken for a lit scene with lines, which alone
+    would take most of the 250 KB initial budget. The hand-written renderer is ~30–45 KB gzip
+    (ASSUMPTION: estimated from ~2–3k lines of TypeScript and GLSL).
+  - Control over render-on-demand, DPR capping, context-loss recovery and the exact line styles the
+    2D view uses (Principle VI parity).
+- **Alternatives rejected**:
+  - three.js, Babylon.js: size, and a runtime dependency to justify for little gain.
+  - regl, OGL, twgl: small, but they still add a dependency and solve only the boilerplate (~300
+    lines here).
+  - WebGPU: not available on iOS 15–17 Safari. WebGL2 covers iOS 15+.
+  - CSS 3D transforms: no lighting, shadows or sphere shading.
+
+## R-16 Materials, lighting and shadows
+
+- **Decision**:
+  - **Lighting**: "overhead lamp" lighting from 2–3 area lights over the table centre line (like a
+    pool-table lamp), each approximated as a point light with a size term. A dim hemispheric ambient
+    (warm from below, cool from above) is added.
+  - **Shading**: specular highlights plus a Fresnel (Schlick) clear-coat lobe for the balls (glossy
+    phenolic), the varnished rails and the cue. Lambert plus a soft sheen term for the cloth.
+    Lighting is computed in linear space with an ACES-fitted tone map, sRGB output and a subtle
+    vignette.
+  - **Ball reflections**: an analytic "pool hall" environment function in the shader: a dark room
+    with bright rectangular lamp shapes, so the balls show the characteristic lamp highlights. It
+    needs no texture. Roughness widens the lamp shapes.
+  - **Shadows**: soft contact shadows drawn as analytic darkening **decals** on the cloth, one per
+    ball. Each is a blurred core under the contact point plus a penumbra elongated along the lamp
+    axis and pushed away from it (the sphere-occluder shape under an overhead lamp). The cushion
+    bases and pocket holes get an ambient-occlusion falloff in the shaders. Decals follow the balls
+    every frame at the cost of one quad per ball.
+    - An upgrade path, if decals look flat on device: a bed-space shadow texture rendered by a pass
+      that evaluates the analytic sphere occlusion per texel, re-rendered only when balls move.
+  - **Cloth weave**: a 256² procedurally generated twill tile with mipmaps, plus anisotropic filtering
+    where `EXT_texture_filter_anisotropic` exists, so the weave fades without moiré at grazing angles.
+    A low-frequency nap variation and the lamp falloff give the cloth depth. The cloth colour comes
+    from `Scene3DData.clothRgb` when given (for example, the cloth learned from a Snap photo).
+  - **Wood**: a procedural grain texture (512 × 64). **Diamonds**: small inlaid quads on the rail top
+    (pool only). **Snooker markings**: baulk line, D and spots, drawn into the bed texture.
+  - **Antialiasing**: the default framebuffer's MSAA (`antialias: true`). The device pixel ratio is
+    capped by `opts.maxPixelRatio` (default 2).
+- **Rationale**: overhead lamps cast nearly vertical, soft shadows. An analytic sphere-occluder
+  shape is right for that case, has no acne or aliasing, runs on SwiftShader in CI, and costs one quad
+  per ball.
+- **Alternatives rejected**:
+  - Shadow maps: one map per lamp, PCF for softness, acne and peter-panning tuning, and higher mobile
+    cost.
+  - SSAO: heavy, and noisy on mobile GPUs.
+  - Baked lightmaps: balls move, so the shadows can't be baked.
+
+## R-17 Replay timing and ball rotation from trajectories
+
+- **Context**: `Trajectory.points` are positions sampled at every event and at least every 2 cm. They
+  carry no timestamps. `Trajectory.events` carry exact simulation times `t` and positions.
+- **Decision (timing)**: build a per-ball timeline, a pure function in `render3d/playback.ts`:
+  - **Keyframes**: every recorded point that coincides with one of the ball's events gets that
+    event's exact time `t`.
+  - **Between keyframes**: points are spread by arc length assuming a constant deceleration. This is
+    a display choice: the implementation uses an ASSUMPTION constant (`PLAYBACK_DECEL`); a
+    per-phase `μ_slide·g` / `μ_roll·g` is an option. A span that ends the motion ends at zero speed
+    (ease-out). Spans with no timing information fall back to distance with an ease-out.
+  - Position at time `t` comes by interpolating the timed points.
+  - Every keyframe is hit exactly, so positions at event times match the simulation by construction
+    (SC-103). The between-event model only shapes the speed profile.
+- **Decision (rotation), level 1 (required)**: rolling without slip along the path. A displacement
+  `d` turns the ball by `|d|/R` about `ẑ × d̂`. Orientations are accumulated per recorded point, so
+  the result is exact along each straight sub-segment and independent of the frame rate. This meets
+  FR-108's MUST and SC-103's no-slip criterion.
+- **Decision (rotation), level 2 (recommended, FR-108 SHOULD)**: show the sliding phase too, so stun,
+  draw and follow look different right after the strike and after impact. Integrate a 3D angular
+  velocity ω and an orientation quaternion per ball, with sub-steps ≤ 4 ms. The sliding-friction
+  torque is the 001 simulator's own model.
+  - **Initial spin**: the cue ball starts with `strikeBall(aimDir, stroke, table, params).omega`.
+    Object balls start at ω = 0 when first hit (as in R-07, ball–ball friction transfers only a small
+    spin, which is ignored for display).
+  - **Slip**: at each sub-step, `u = v + ω × (−R ẑ)` (contact-point velocity).
+  - **Sliding** (`|u| > ε`): `ω += (5 μ_slide g / 2R) · (ẑ × û) · dt`. This drives the slip to zero at
+    the rate (7/2) μ g, exactly as in the simulator.
+  - **Rolling**: `ω_h = ẑ × v / R`, with no slip by construction.
+  - **Sidespin**: `ω_z` decays at `spinDecel`.
+  - **Impulses**: at `ball`, `cushion` and `jaw` events the ball keeps its ω and the slip is
+    re-evaluated, so a draw shot visibly spins backward after contact and then turns over.
+  - **Orientation**: `q ← exp(½ ω dt) ⊗ q`.
+- **Decision (replay)**:
+  - Rate 1×. If the total simulated time T exceeds 4 s, the replay runs at T/4×, so it always ends at
+    the true rest positions within 4 s.
+  - A pocketed ball, after its `pocket` event, moves to the pocket centre and falls under gravity
+    (`POCKET_DROP_S` ≈ 0.4 s), then hides.
+  - The final frame holds for 600 ms. The renderer then shows the `Scene3DData` layout again.
+  - `stopPlayback()` restores at once.
+  - Resting orientation: number up, tilted 20° toward the default camera, so numbers read in
+    Overview.
+- **Rationale**: positions stay exactly faithful to the physics at every event, with no change to
+  core. Level 1 is exact for every rolling phase, which is most of what a player watches. Level 2
+  reuses the simulator's own friction law (Principle I), so the sliding phases look right too. Until
+  level 2 lands, the spin of a stun or draw shot right after the strike is drawn as rolling. That is
+  a documented display simplification, not a physics claim.
+- **Alternative**: record per-point timestamps (`Trajectory.times?`) in `simulate()`. It would be a
+  non-breaking optional field in core and would remove the reconstruction, but it touches the core API.
+  Deferred until replay accuracy needs it. The SC-103 tests decide.
+
+## R-18 Camera model, presets and gestures
+
+- **Decision**:
+  - **Orbit camera**: target T, yaw ψ, pitch θ, distance d and vertical FOV.
+    - User gestures clamp θ to [8°, 89°] and d to a fixed range (`DIST_MIN` … `DIST_MAX` in
+      `camera.ts`). Pan moves T, which is clamped to the table's outer rectangle.
+    - Presets may set θ = 90° (exact top-down).
+    - Transitions interpolate (T, ψ, θ, log d, fov) with the shared easing. A flight lasts 240 ms for
+      small changes and up to 600 ms for preset flights. With reduced motion it jumps.
+  - **Defaults** (ASSUMPTION, tuned visually; the constants in `src/app/render3d/camera.ts` are
+    authoritative):
+    - **Overview**: θ = 90°, fov 30°. ψ is chosen so the table's long axis follows the screen's long
+      axis. Landscape: +x right and +y up, like the 2D view. Portrait: +x up. d is fitted so the table
+      plus rails fill the viewport (≈ 3.5 % margin, minus UI insets).
+    - **Player view**: eye ≈ 0.55 m behind the cue-ball centre along −aimDir and ≈ 0.30 m above the
+      bed. fov 50° (landscape) or 58° (portrait). The look point lies on the z = R plane along the aim
+      line, so that the ghost ball is in view and the cue ball sits in the lower part of the frame.
+      Without a plan, aimDir = the direction from the cue ball to the table centre.
+    - **Broadcast**: an elevated three-quarter view, fov 38°. Landscape: from the bottom long rail,
+      turned toward a corner (ψ ≈ −112°, θ ≈ 34°). Portrait: from behind the left short rail,
+      slightly off-axis (ψ ≈ 196°, θ ≈ 40°). d is fitted.
+- **Gestures**: a pointer state machine with `setPointerCapture` and `touch-action: none`.
+  - **Tap**: movement < 8 px and duration < 350 ms → `onTap(pick)`.
+  - **Double-tap**: two taps on empty cloth within 300 ms and 24 px → the last preset.
+  - **Drag**: on a ball → `onBallDrag` (start/move/end) on the z = R plane, clamped to the bed. On
+    empty cloth or background → orbit (0.3°/px), which sets the camera to `custom`.
+  - **Two pointers**: the distance ratio → zoom; the midpoint motion → pan. **Wheel**: zoom.
+- **Rationale**: an orbit camera is predictable for players. The presets map to what coaches show:
+  the map view, the shooter's eye line and the TV angle. Thresholds match platform tap conventions.
+
+## R-19 Picking: analytic CPU ray casts
+
+- **Decision**: unproject the pointer through the inverse view-projection into a world ray. Hits are
+  tried in this order:
+  1. Nearest ray–sphere hit among the balls (z = R).
+  2. Otherwise the nearest ball whose projected centre lies within max(projected radius, 22 CSS px).
+     This keeps the 44 px touch target (Principle VI).
+  3. Otherwise the ray–bed-plane hit inside a pocket's capture disc (mouth centre, radius = mouth/2 +
+     R) → pocket.
+  4. Otherwise a hit inside the bed → cloth.
+  5. Otherwise `null`.
+
+  `toScreen` is the exact forward projection used by tests.
+- **Rationale**: exact, deterministic, pure (unit-testable in Node), no GPU read-back stall.
+- **Alternative rejected**: GPU ID-buffer picking. It needs `readPixels` (slow on mobile, async in
+  Safari) and an extra pass.
+
+## R-20 Drawing the plan in 3D
+
+- **Decision**:
+  - **Paths** (aim line, object-ball path, cue-ball path, other paths): screen-space ribbons of
+    constant pixel width (3 CSS px; 4 for the aim line). They are extruded in the vertex shader from
+    neighbouring points and drawn 0.6 mm above the cloth with polygon offset. Depth testing against
+    the balls is on, so paths pass behind balls correctly.
+  - **Dashes** use a per-vertex arc length in metres (cue path 40 mm on / 25 mm off; other paths
+    dash-dot), so dashes foreshorten with perspective and read as "on the cloth".
+  - **Colours** are exactly `PALETTE` and `DASH` from `render/palette.ts`.
+  - **Ghost ball**: a translucent white sphere (α 0.22) with a dotted screen-facing ring.
+  - **Contact point**: a small dot on the object ball's surface.
+  - **Target and pocket**: the target ring in `PALETTE.target`, and a pocket ring plus chevron in the
+    object-ball colour.
+  - **Rest marker**: ✕. **Landing marker**: ring plus ✕ in `PALETTE.landing`.
+  - **Heatmap**: an R8 bed texture with a single-hue alpha ramp, under the paths.
+  - **Text labels** (pocket names, "ghost", "rest") are DOM elements placed with `toScreen`, so they
+    stay crisp, accessible and translatable.
+  - **Cue stick**: a tapered cylinder (tip, ferrule, maple shaft, wrap, butt) along −aimDir. Its axis
+    passes through the strike point, using the same convention as `strikePoint` (R-26).
+    `render3d` keeps its own copy (`strikePoint3`), which is tested to agree.
+    - Tip gap behind the strike point: `cueGap(power) = 0.05 + 0.03·power` m. This is a display
+      mapping, not physics.
+    - Elevation: near-level (a small minimum, `MIN_CUE_ELEVATION`), raised only as much as needed to
+      clear the rail behind the cue ball. The shot card notes it when the elevation is noticeable.
+    - It is hidden during playback.
+- **Rationale**: the same visual language as the 2D view and the camera overlay (Principle VI). It
+  stays legible at any zoom.
+
+## R-21 Two photos ("Snap") instead of live table-level AR
+
+- **Decision**: a new **Snap** mode with two stills. The **table photo** gives the layout, using the
+  001 detector where it is accurate. The **player photo** gives only the camera pose, fitted against
+  that known layout. Live (001) stays for overhead use.
+- **Rationale**:
+  - At table level the whole table is never in view, and the cloth is seen at a grazing angle. The
+    001 approach (quad → homography → rectified balls) cannot run there.
+  - Depth from one grazing photo is hopeless. For a camera 0.15 m above the bed and a ball 2 m away,
+    one pixel of vertical error is ≈ 2.7 cm of depth error (f ≈ 1000 px). Lateral resolution there
+    is ≈ 2 mm/px, which is exactly what drawing an aim line needs. An overview photo gives positions
+    with a median error of ≈ 4 mm (001 results). Each photo does what it is good at.
+  - Stills give full sensor resolution, autofocus, HDR and no motion blur. Timing is not critical.
+- **Alternatives rejected**:
+  - Continuous live AR at table level (pose tracking at 10 Hz): fragile with motion blur and with
+    balls as the only features. Kept as a later upgrade, since the pose solver (R-24) is the same.
+  - Player photo only: layout depth error too large (above).
+  - ARKit world tracking: native only, breaks PWA parity, and still needs the layout.
+
+## R-22 Taking and decoding photos
+
+- **Decision**:
+  - Two file inputs, both `accept="image/*"`: one with `capture="environment"` (camera) and one
+    without (library). They open the native camera and picker in Safari, WKWebView and Chrome.
+  - Decoding goes through an `HTMLImageElement` from an object URL plus `decode()`, drawn into a canvas
+    at the processing size: long side 1280 px for both photos. Modern browsers apply the EXIF
+    orientation in `drawImage` (`image-orientation: from-image` is the default).
+    `createImageBitmap(blob, { imageOrientation: 'from-image' })` is a fast path where supported.
+  - Then `getImageData` → `Frame` → transferred to the vision worker.
+  - The object URL is revoked and the full-size image dropped at once.
+  - HEIC is converted to JPEG by iOS for file inputs.
+  - Nothing is written to storage (Principle V).
+- **Rationale**: the native camera UI is familiar and gives the best photo. `ImageCapture.takePhoto`
+  is not supported in Safari. A frame grabbed from `getUserMedia` is limited to video resolution.
+- **Known risk**: decoding 48 MP photos needs a large transient buffer on older iPhones. Mitigation:
+  scale while drawing, and release the source promptly. This is checked in the device test.
+
+## R-23 Table photo processing: the 001 pipeline on a still
+
+- **Decision**: the vision worker keeps a **separate** pipeline instance for stills, so live tracking
+  state is never disturbed. On a `still` message it runs `process(frame)` repeatedly on the same
+  frame (N = 6 by default: the tracker locks after 5 stable frames), and returns the last
+  `VisionResult`, with `ms` covering all iterations. After the first pass it MAY reuse the first
+  table detection to save time. Configuration (table, FOV, axis swap) comes from the last `config`
+  message.
+- **Rationale**: one detector, one accuracy contract (SC-105 reuses 001 SC-003). The tracker's lock
+  logic doubles as a stability check.
+- **Gap**: manual corners for a still are not in the v2 message. See the proposed optional extension
+  in [contracts/worker-protocol-v2.md](./contracts/worker-protocol-v2.md).
+
+## R-24 Player-photo pose: known-layout model fitting
+
+- **Camera model**: pinhole, square pixels, principal point at the image centre, no distortion.
+  ASSUMPTION: phone pipelines correct lens distortion. Unknowns θ = (rotation vector ρ ∈ ℝ³,
+  translation t ∈ ℝ³, log f): **6-DoF plus focal**.
+- **Image evidence** (allocation-free over typed arrays):
+  - **Cloth mask**: hue learned from the photo's lower-central band, checked against the table
+    photo's cloth hue.
+  - **Ball candidates**: connected non-cloth blobs bounded by cloth. Each gets a circle fit to its
+    *cloth-adjacent* boundary pixels: an algebraic (Kåsa) fit, then a geometric refinement. Arcs
+    ≥ 120° are accepted, so balls cut off by the frame edge or partly hidden by nearer balls still
+    fit. Each candidate gives a centre, a radius, a mean RGB and its arc fraction.
+  - **Cushion edges**: points on the cloth→rail boundary above the balls (row-wise transitions),
+    later fitted to the projected cushion-nose lines.
+- **Residuals** (robust, Cauchy loss):
+  1. **Ball silhouette centre**: the centroid of `projectBallOutline` (exact cone-tangent silhouette,
+     not the projected centre, which is biased off-axis) vs the detected centre. σ = 1.5 px.
+  2. **Ball apparent radius**: the predicted silhouette radius vs the detected radius. σ = 1 px + 3 %.
+     It fixes depth and breaks the focal–distance (dolly-zoom) ambiguity once two balls lie at
+     different depths.
+  3. **Cushion edges**: point-to-projected-segment distance to the outer cloth edge
+     (`L/2 + cushionWidth` at `cushionHeight`, as in 001 R-05). σ = 2 px, down-weighted.
+  4. **Priors**:
+     - log f: σ = 0.15 when `focalPx` is given (same camera), else 0.6 around a 65° HFOV;
+     - roll ≈ 0 (σ = 10°; phones are held level);
+     - camera height 0.03–0.8 m (soft barrier);
+     - every matched ball in front of the camera.
+- **Initialisation**: multi-hypothesis "player behind the cue ball", deterministic and in a fixed
+  order.
+  - The yaw direction is from the cue ball to the target (`targetId`), or else to each of 8 compass
+    directions.
+  - Camera position: distance d ∈ {0.35, 0.6, 1.0} m behind the cue ball, height h ∈ {0.10, 0.25,
+    0.45} m, yaw ψ ∈ aim ± {0°, 12°, 25°}, looking at the target.
+  - Focal: f ∈ {0.6, 1, 1.6} × prior. This covers the 0.5×, 1× and 2× phone lenses.
+
+  Each hypothesis is scored cheaply. Known balls are projected and associated greedily with
+  candidates by distance < 3 r̂, radius ratio ∈ [0.6, 1.6] and colour (the cue ball is the whitest;
+  others by `rgb` when known). The best 5 by inliers and cost are refined.
+- **Refinement**: Levenberg–Marquardt (Nielsen damping) with a forward-difference Jacobian. There
+  are 7 parameters and ≤ ~150 residuals. Up to 50 iterations, stopping at a relative cost change below
+  1e-6. Associations are re-run after convergence, and the solver refines once more. The lowest
+  robust cost wins.
+- **Confidence and honesty** (Principle II):
+  - Posterior covariance Σ = σ²(JᵀJ)⁻¹, propagated to the image position of the ghost ball → σ_px.
+  - confidence = inlier term × residual term × exp(−σ_px / (0.01·diag)), in [0, 1].
+  - `ok` when confidence ≥ 0.5, residualPx ≤ max(4 px, 0.6 % of the diagonal), ≥ 3 balls matched (or 2
+    balls plus ≥ 1 cushion edge) and the cue ball or target matched. ASSUMPTION: thresholds tuned on
+    the synthetic grid so that SC-106 and SC-107 hold.
+  - Failure reasons are player-facing strings: too few balls, balls moved, too dark, cue ball not
+    found, not behind the cue ball (a warning only).
+- **Performance**: the hypotheses × cheap scoring plus ≤ 5 refinements run well under the 0.5 s CI
+  budget (SC-109). Everything runs in the vision worker.
+- **Alternatives rejected**:
+  - PnP from ball centres alone (EPnP and the like): needs ≥ 4 well-spread correspondences and known
+    association. At table level, balls are often nearly collinear in depth, and the association is
+    the hard part.
+  - Learned pose regression: needs a dataset and a model runtime (Principle VII).
+  - Vanishing points from cushion lines alone: the rails are often out of frame or occluded at table
+    level.
+
+## R-25 Manual two-tap fallback
+
+- **Decision**: the player taps the cue ball, then the target ball.
+  1. Each tap seeds the association for that ball id.
+  2. A local circle fit runs in a window around the tap (radius 8 % of the diagonal) to get the
+     centre and radius. If it fails, the tap is the centre and the radius residual is dropped.
+  3. The same LM runs with stronger priors: roll 0 ± 5°, height 0.2 ± 0.15 m, yaw within ±30° of the
+     cue→target direction, the focal prior. Two balls give up to 6 equations, plus the priors, for 7
+     unknowns.
+  4. Associations are then re-run, so any other ball found automatically adds constraints, and the
+     solver refines.
+
+  Confidence is capped at 0.7 when only the two tapped balls constrain the fit, and it is always
+  shown.
+- **Rationale**: two taps are the least a player can do. With the apparent radii they fix depth, and
+  with a level phone they fix the pose well enough to draw the aim line (SC-108).
+
+## R-26 Drawing the strike point on the cue ball
+
+- **Decision**:
+  - **Geometry**: `strikePoint(c, aimDir, side, vert, R)`. Take the level cue axis along `aimDir`,
+    offset by `side·R` to the shooter's right (`(aimDir.y, −aimDir.x)`) and `vert·R` up. Intersect it
+    with the sphere on the *back* side:
+    `P = c − aimDir·R·√(1 − side² − vert²) + side·R·right + vert·R·ẑ`, so `|P − c| = R`.
+  - **Dot**: projected with the pose, as a filled `PALETTE.aim` disc of the tip's size (tip Ø 13 mm →
+    ≈ 0.23 R) with a white halo and a dark outer stroke.
+  - **Context drawn on the sphere and then projected**, so perspective is right even when the camera
+    is off the cue axis:
+    - the miscue-limit ring (the 3D circle of points at offset 0.5 R, dashed);
+    - a centre cross (the vertical and horizontal arcs through the back pole);
+    - ¼-tip ticks.
+  - **Text label**: e.g. "Strike ½ tip low, ¼ tip right" from 001 `describeSpin`.
+  - **Inset**: a magnified (2.5×) crop of the cue ball from the photo, with the same drawing.
+  - **Visibility**: P is visible when (P − C)·(P − c) < 0. When it is hidden or off-frame, the guide
+    shows the strike point on the shaded spin ball (`renderSpinBall`) with the message from FR-119.
+- **Rationale**: the dot is where the player's tip must touch, seen from where they stand. The text
+  and spin ball give a redundant encoding (Principle VI).
+
+## R-27 iOS wrapper: Capacitor 8 (dev-only npm), no plugins
+
+- **Decision**: Capacitor 8 with `@capacitor/cli`, `@capacitor/core` and `@capacitor/ios` as
+  **devDependencies pinned exactly to 8.6.0** (verified on npm; the CLI requires Node ≥ 22).
+  - **iOS project**: the Capacitor 8 default Swift Package Manager template (no CocoaPods), minimum
+    iOS 15, committed under `ios/`.
+  - **Config**: `capacitor.config.json` with `webDir: "dist"`, no `server.url` (bundled assets
+    only), and the background colour `#070B14`.
+  - **No plugins**, and app code never imports `@capacitor/core`. The native bridge injects
+    `window.Capacitor`, and feature detection reads that global. The web bundle keeps **zero runtime
+    npm dependencies**.
+- **Rationale**:
+  - Capacitor serves assets from `capacitor://localhost`, a secure context. `getUserMedia`, module
+    workers and service-worker-free offline loading all work there. Plain `file://` would break
+    workers and the camera.
+  - It configures WKWebView correctly. Verified in the 8.6.0 sources: `allowsInlineMediaPlayback =
+    true`, and the media-capture permission delegate grants the per-origin prompt, so only the
+    system camera prompt appears.
+  - It handles safe areas, the status bar and `cap sync`, and it was the planned path (001 R-01).
+- **Native runtime dependency**: the Capacitor Swift package (`capacitor-swift-pm` 8.x) is linked
+  into the iOS binary. It is justified here and listed in plan.md Complexity Tracking.
+- **Alternatives rejected**:
+  - **Hand-written WKWebView shell**: ~200 lines of Swift, but we would own a `WKURLSchemeHandler`
+    (MIME types, range requests), permission delegates, safe areas and keyboard behaviour that
+    Capacitor already gets right.
+  - **PWA only**: the user asked for TestFlight, and store presence matters for trust.
+  - **Cordova**: legacy, CocoaPods-based.
+  - **Tauri 2 mobile**: adds a Rust toolchain to CI for no gain here.
+  - **React Native WebView**: a whole JS runtime for a wrapper.
+
+## R-28 Camera and photos inside WKWebView
+
+- **Decision**:
+  - **Live**: `getUserMedia` works in WKWebView on iOS 14.3+, with
+    `<video playsinline muted autoplay>`. Capacitor sets inline playback, so the 001 camera module
+    needs no change.
+  - **Snap**: uses the file inputs (R-22). In WKWebView, "Take Photo" presents the system camera, and
+    "Photo Library" uses the system picker, which needs no library permission on iOS 14+.
+  - **Info.plist**:
+    - `NSCameraUsageDescription` (required): "CueSight uses the camera to see the table and the balls
+      so it can show you the shot. Photos and video stay on your phone."
+    - `NSPhotoLibraryUsageDescription` (defensive, for older picker paths): "Choose a photo of your
+      table to plan a shot. Photos stay on your phone."
+    - `ITSAppUsesNonExemptEncryption = NO`.
+  - **Simulator**: there is no camera. `getUserMedia` rejects, which triggers the 001 fallback, and
+    the camera input falls back to the photo library. When no `videoinput` device exists, the app
+    starts in Practice.
+- **Rationale**: the same code path on the web and in the app. No camera plugin, so no runtime
+  dependency.
+
+## R-29 CI on GitHub-hosted macOS runners
+
+- **Decision**: one workflow, `.github/workflows/ios.yml`, at the **git root** (`/`; the app lives in
+  `cuesight/`, so `defaults.run.working-directory: cuesight`). It runs on push, pull request and
+  `workflow_dispatch` (input `upload: boolean`), with a concurrency group per ref.
+  1. **`web`** (ubuntu-latest, Node 22): `npm ci`, `typecheck`, `test`, `fixtures`, `vite build`, and
+     the Chromium e2e suite (SwiftShader WebGL flags).
+  2. **`ios-simulator`** (macOS image with Xcode 26; the job prints `xcodebuild -version`):
+     1. `npm ci`, then `VITE_CUESIGHT_TOUR=1 npx vite build`, then `npx cap sync ios`.
+     2. Build:
+        `xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Debug -sdk iphonesimulator -destination "id=$UDID" -derivedDataPath build/ios CODE_SIGNING_ALLOWED=NO build`.
+        `$UDID` is the first available iPhone simulator on the newest iOS runtime, chosen from
+        `xcrun simctl list devices available -j`.
+     3. `simctl boot` + `bootstatus -b`, status-bar override (9:41, full battery), `simctl install`.
+     4. Launch with `simctl launch --console-pty` (a pty, so Swift's `print` is line-buffered), with
+        output tee'd to `sim.log`.
+     5. **Smoke test**: the app logs `[CueSight] ready` (Capacitor forwards `console.*` to native stdout
+        as `⚡️  [info] - …` in Debug builds, verified in the 8.6.0 sources). The job fails if the marker
+        doesn't appear within 60 s.
+     6. **Screenshot tour**: the build-time flag `VITE_CUESIGHT_TOUR` makes the app step through
+        Practice Overview → Player view → Broadcast → Snap (bundled sample photos, FR-123) → guide. It
+        logs `[CueSight] tour <step>` at each step. CI runs `simctl io screenshot` on each marker.
+     7. Logs and screenshots are uploaded as artifacts.
+  3. **`webkit-e2e`** (macOS): `npx playwright install webkit`, then `playwright test
+     --project=webkit-iphone` (an iPhone device profile). The live-camera spec is skipped on WebKit,
+     which has no fake camera. Practice, Snap (with `setInputFiles`) and UI specs run.
+  4. **`testflight`** (macOS; needs `ios-simulator` and `webkit-e2e`; runs on `main` or when
+     `inputs.upload`) — see R-30.
+- **Rationale**: the tour flag gives deterministic screenshots without an XCUITest target. It is a
+  compile-time define, so release builds never contain it. Picking the simulator at run time survives
+  runner-image updates.
+- **Alternatives rejected**:
+  - An XCUITest target: more Xcode project surgery, slower, and it can't see inside the web view
+    without accessibility plumbing.
+  - Appium: heavy.
+  - Self-hosted Macs: not available.
+
+## R-30 TestFlight upload with an App Store Connect API key
+
+- **Decision**: `xcodebuild` only, with no fastlane or altool.
+  1. A first step checks that the secrets `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`,
+     `APP_STORE_CONNECT_KEY_P8` (base64 of the `.p8`) and `APPLE_TEAM_ID` are present, through `env`.
+     GitHub does not allow `secrets` in a job-level `if`. It sets an output. When they are missing,
+     every later step is skipped and the job prints `::notice::TestFlight upload skipped — App Store
+     Connect secrets are not configured`.
+  2. The key is decoded to `$RUNNER_TEMP/AuthKey.p8` (mode 600) and deleted in an `always()` step.
+  3. Release web build (no tour flag), then `cap sync ios`.
+  4. `xcodebuild archive` with `-scheme App -configuration Release -destination
+     'generic/platform=iOS' -archivePath build/App.xcarchive -allowProvisioningUpdates
+     -authenticationKeyPath … -authenticationKeyID … -authenticationKeyIssuerID …` and the settings
+     `DEVELOPMENT_TEAM`, `CODE_SIGN_STYLE=Automatic`, `PRODUCT_BUNDLE_IDENTIFIER=${{ vars.IOS_BUNDLE_ID
+     }}`, `CURRENT_PROJECT_VERSION=${{ github.run_number }}${{ github.run_attempt }}` (strictly
+     increasing) and `MARKETING_VERSION` from `package.json`.
+  5. `xcodebuild -exportArchive -exportOptionsPlist ios/ExportOptions.plist` with `method =
+     app-store-connect`, `destination = upload`, `signingStyle = automatic`, `teamID` and
+     `uploadSymbols = true`, plus the same authentication flags. This uploads straight to App Store
+     Connect, and the build then appears in TestFlight after processing.
+- **App Store Connect prerequisites** (one-time, manual):
+  - an app record with the bundle ID;
+  - a Team API key. The **Admin** role lets Xcode create a cloud-managed distribution certificate on a
+    fresh runner. App Manager is enough only when signing assets already exist. Verify on the first
+    run.
+- **Rationale**: the smallest toolchain, which is Apple's supported path. The API key avoids Apple ID
+  passwords and two-factor prompts. Secrets never reach pull requests from forks.
+
+## R-31 Icon pipeline: headless Chromium rasterisation
+
+- **Decision**:
+  - **Master**: `public/icon.svg` is the vector master. It is full-bleed square, with the artwork
+    designed to survive the iOS mask and the maskable safe zone.
+  - **Rasterising**: `scripts/make-icons.cjs` uses the pre-installed Playwright Chromium
+    (`require('playwright')`, deviceScaleFactor 1). It draws the SVG into a `<canvas>` at each target
+    size, reads the pixels with `getImageData` and returns them to Node.
+  - **Encoding**: Node encodes PNGs with an in-house encoder (the `scripts/png.ts` approach, extended
+    with an RGB colour type):
+    - `icon-192`, `icon-512`, `favicon-32`: RGBA.
+    - `icon-maskable-512`: artwork scaled to the central 80 % on the full-bleed background.
+    - `icon-180` (apple-touch) and `AppIcon-1024`: **RGB, no alpha channel**, because App Store
+      validation rejects alpha.
+  - **Small sizes**: the favicon MAY use a simplified small-size variant.
+  - **Output**: committed to the repo. A unit test parses each PNG's IHDR to check the size and colour
+    type.
+- **Rationale**: no new dependencies (sharp, resvg and ImageMagick are not available or are native).
+  Chromium's SVG renderer is the reference renderer for the PWA anyway.
+
+## R-32 Design system implementation ("Midnight Felt")
+
+- **Decision**:
+  - CSS custom properties on `:root`, exactly as listed in data-model.md, with `color-scheme: dark`.
+  - Glass panels use `backdrop-filter` and `-webkit-backdrop-filter`, with
+    `@supports not (backdrop-filter: blur(1px))` → `--surface-solid`.
+  - Motion tokens `--dur: 200ms; --ease: cubic-bezier(.2,.8,.2,1)`. Under
+    `prefers-reduced-motion: reduce`, `--dur: 0ms`, and JS reads the same media query for camera
+    flights.
+  - Icons are inline SVG built with `createElementNS` (24 px grid, 1.75 px round strokes,
+    `currentColor`).
+  - The bottom sheet uses pointer drag with two snap points (peek and expanded), and a handle button
+    with `aria-expanded` for keyboard and screen-reader users.
+- **Contrast rules** (computed against `--bg #070B14`):
+  - `--text` 18.2:1, `--text-2` 9.3:1, `--accent` 8.5:1, `--warn` 8.7:1, `--danger` 5.1:1, `--ok`
+    5.7:1.
+  - **`--text-3` is only 4.3:1** (3.8:1 on `--surface-solid`). It is for large text (≥ 24 px) or
+    non-essential, decorative text only. Captions use `--text-2`.
+  - Buttons filled with `--accent` use dark text (`--bg`, 8.5:1). White on `--accent` is only 2.3:1.
+    White text needs `--accent-2` (5.2:1).
+- **Rationale**: no framework or runtime dependency. Tokens make the camera overlay, 3D view and cards
+  one product.
+
+## R-33 Testing strategy for 002
+
+- **Decision**:
+  - **Pure modules** (Vitest, Node):
+    - `render3d`: math, camera presets and clamps, picking, playback timing and rotation, plan
+      geometry and cue placement, the gesture state machine;
+    - `vision/player-view`: projection, silhouettes, strike point, the estimator on synthetic photos;
+    - the Snap session state machine;
+    - the icon headers.
+  - **Synthetic player photos**: `vision/synth/render.ts` already supports any camera pose and FOV.
+    Table-level scenes come from a fixed, deterministic grid (heights 8–40 cm, distances 0.3–1.2 m,
+    yaw ±15°, HFOV 40–100°, 3 cloths). "Low light" frames are post-processed in the test helper with
+    gain and deterministic noise. Negative scenes: one ball visible, balls moved, too dark.
+  - **Browser** (Playwright):
+    - Chromium with SwiftShader (`--use-angle=swiftshader --enable-unsafe-swiftshader
+      --ignore-gpu-blocklist`) proves the WebGL2 path, using `toScreen` taps and pixel probes.
+    - `?renderer=2d` proves the fallback.
+    - Snap uses `setInputFiles` with PNG fixtures from `scripts/make-snap-fixtures.ts`.
+    - WebKit with an iPhone profile runs on macOS CI.
+  - **iOS**: the Simulator smoke test and screenshot tour (R-29).
+- **Rationale**: Principle III. Every new algorithm has ground truth, and GPU code is checked through
+  its observable projection.

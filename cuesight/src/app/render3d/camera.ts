@@ -154,9 +154,9 @@ export function broadcastOrbit(g: TableGeom, aspect: number, ins: Insets = NO_IN
   const landscape = effAspect >= 1;
   // Landscape: from the bottom long rail, turned toward the bottom-left corner. Portrait: from
   // behind the left short rail, slightly off-axis, so the long axis recedes into the screen.
-  const yaw = landscape ? -112 * DEG : 196 * DEG;
-  const pitch = landscape ? 34 * DEG : 40 * DEG;
-  const base = { target: [0, 0, 0] as V3, yaw, pitch, fovY: 38 * DEG };
+  const yaw = landscape ? -112 * DEG : 186 * DEG;
+  const pitch = landscape ? 34 * DEG : 58 * DEG;
+  const base = { target: [0, 0, 0] as V3, yaw, pitch, fovY: (landscape ? 38 : 46) * DEG };
   return { ...base, dist: fitDistance(base, tableFramePoints(g), aspect, ins, 0.04) };
 }
 
@@ -185,7 +185,11 @@ export function playerOrbit(g: TableGeom, cue: Vec2, aimDir: Vec2, ghost: Vec2 |
   const toCue = Math.atan2(h - g.R, back);
   const toGhost = Math.atan2(h - g.R, back + dGhost);
   const half = fovY / 2;
-  const look = Math.max(toGhost, toCue - 0.62 * half);
+  // Use the frame for the table, not the room: put the horizon near the top edge, but keep the
+  // cue ball no higher than just above the centre and the ghost ball inside the frame.
+  let look = 0.78 * half;
+  look = Math.min(look, toCue + 0.1 * half);
+  look = Math.max(look, toCue - 0.8 * half, toGhost - 0.85 * half);
   // Look point on the plane z = R along the aim line at depression `look`.
   const run = (h - g.R) / Math.tan(Math.max(look, 1e-3));
   const target: V3 = [eye[0] + ax * run, eye[1] + ay * run, g.R];

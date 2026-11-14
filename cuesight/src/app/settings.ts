@@ -13,6 +13,8 @@ export interface Settings {
   cushionWidthCm: number;
   fovDeg: number;
   showDetails: boolean;
+  /** Practice/Snap table in 3D (WebGL2); off = the 2D table (feature 002 FR-110). */
+  table3d: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -23,6 +25,7 @@ export const DEFAULT_SETTINGS: Settings = {
   cushionWidthCm: 5,
   fovDeg: 65,
   showDetails: false,
+  table3d: true,
 };
 
 const KEY = 'cuesight.settings.v1';

@@ -7,7 +7,7 @@ import type { Vec2 } from '../core/vec';
 import { detectBalls } from './ball-detect';
 import { calibrationFromCorners, type Calibration } from './calibration';
 import type { Frame } from './image';
-import { createTableScratch, detectTable, type ClothModel, type TableScratch } from './table-detect';
+import { createTableScratch, detectTable, learnClothInQuad, type ClothModel, type TableScratch } from './table-detect';
 import { createTracker, type LockStatus, type TrackedBall } from './tracker';
 
 export interface VisionResult {
@@ -48,6 +48,9 @@ export function createPipeline(config: PipelineConfig) {
       const det = detectTable(frame, scratch, cloth);
       if (det) cloth = det.cloth;
       const manual = cfg.manualCorners && cfg.manualCorners.length === 4 ? cfg.manualCorners : null;
+      // Manual corners where the automatic search found no cloth: learn the cloth inside the tapped quad
+      // (detectTable has already filled the scratch HSV planes for this frame).
+      if (!cloth && manual) cloth = learnClothInQuad(scratch, manual);
       const rawCorners = manual ?? det?.corners ?? null;
       const diag = Math.hypot(frame.width, frame.height);
       // Corners first, so calibration uses the smoothed quad.

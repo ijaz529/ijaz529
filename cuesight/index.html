@@ -3,58 +3,153 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#0f1a14" />
+    <meta name="theme-color" content="#070B14" />
+    <meta name="color-scheme" content="dark" />
     <meta name="description" content="Point your phone at a pool or snooker table: CueSight shows the aim line, power, spin and cue-ball path for any shot. Runs fully on-device." />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="CueSight" />
     <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icons/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="icon" href="./icon.svg" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="./icon.svg" />
+    <link rel="apple-touch-icon" href="./icons/icon-180.png" />
     <title>CueSight</title>
+    <style>
+      /* Critical splash styles: painted before the app bundle loads (FR-131). */
+      html,
+      body {
+        margin: 0;
+        background: #070b14;
+        color: #f4f6fb;
+      }
+      .splash {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: grid;
+        place-items: center;
+        pointer-events: none;
+        background: radial-gradient(90% 60% at 50% 40%, #12203a 0%, #0c1322 45%, #070b14 100%);
+        font-family: -apple-system, 'SF Pro Display', 'SF Pro Text', system-ui, 'Segoe UI', Roboto, sans-serif;
+        animation: splash-auto 0.4s ease 8s forwards;
+      }
+      .splash-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+        animation: splash-rise 0.6s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+      }
+      .splash-mark {
+        width: 92px;
+        height: 92px;
+        border-radius: 22px;
+        box-shadow:
+          0 0 0 1px rgba(255, 255, 255, 0.12),
+          0 18px 48px rgba(0, 0, 0, 0.55);
+      }
+      .splash-word {
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .splash-word b {
+        color: #56b4e9;
+      }
+      .splash-tag {
+        color: #a9b3c7;
+        font-size: 15px;
+        letter-spacing: 0.01em;
+      }
+      @keyframes splash-rise {
+        from {
+          opacity: 0;
+          transform: translateY(8px) scale(0.98);
+        }
+      }
+      @keyframes splash-auto {
+        to {
+          opacity: 0;
+          visibility: hidden;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .splash-inner {
+          animation: none;
+        }
+      }
+    </style>
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand"><img src="./icon.svg" alt="" width="26" height="26" /> CueSight</div>
-      <nav class="mode-switch" aria-label="Mode">
-        <button type="button" data-mode="camera" aria-pressed="false">📷 Camera</button>
-        <button type="button" data-mode="practice" aria-pressed="false">🎱 Practice</button>
-      </nav>
-      <button type="button" id="btn-settings" class="icon-btn" aria-label="Settings">⚙︎</button>
-    </header>
-    <main class="layout">
-      <section class="stage">
+    <div id="splash" class="splash" aria-hidden="true">
+      <div class="splash-inner">
+        <img class="splash-mark" src="./icon.svg" alt="" width="92" height="92" />
+        <div class="splash-word">Cue<b>Sight</b></div>
+        <div class="splash-tag">Line up every shot</div>
+      </div>
+    </div>
+
+    <div class="app">
+      <header class="topbar glass">
+        <h1 class="brand">
+          <img class="brand-mark" src="./icon.svg" alt="CueSight" width="34" height="34" />
+          <span class="wordmark" aria-hidden="true">Cue<b>Sight</b></span>
+        </h1>
+        <nav class="mode-switch" aria-label="Mode">
+          <button type="button" data-mode="camera" aria-pressed="false" data-icon="camera" data-icon-size="17">Live</button>
+          <button type="button" data-mode="snap" aria-pressed="false" data-icon="aperture" data-icon-size="17">Snap</button>
+          <button type="button" data-mode="practice" aria-pressed="false" data-icon="cube" data-icon-size="17">Practice</button>
+        </nav>
+        <button type="button" id="btn-settings" class="icon-btn" aria-label="Settings" data-icon="settings"></button>
+      </header>
+
+      <main class="stage" id="stage">
+        <canvas id="table3d" class="stage3d" role="img" aria-label="3D table: tap a ball, then a pocket; drag a ball to move it; drag the cloth to orbit, pinch to zoom"></canvas>
         <div class="view camera-view">
           <video id="video" playsinline muted autoplay></video>
           <canvas id="overlay" aria-label="Camera view with shot overlay"></canvas>
           <div id="status" class="status-pill" role="status" aria-live="polite"></div>
           <canvas id="minimap" class="minimap" aria-label="Top-down table map"></canvas>
           <div id="camera-msg" class="camera-msg" hidden>
+            <span class="msg-icon" data-icon="camera-off" data-icon-size="28"></span>
             <p></p>
             <div class="row">
-              <button type="button" id="btn-retry-camera">Try again</button>
-              <button type="button" id="btn-practice-fallback" class="secondary">Use practice table</button>
+              <button type="button" id="btn-retry-camera" class="btn secondary" data-icon="refresh" data-icon-size="18">Try again</button>
+              <button type="button" id="btn-practice-fallback" class="btn primary" data-icon="cube" data-icon-size="18">Use practice table</button>
             </div>
           </div>
         </div>
+
         <div class="view practice-view">
           <canvas id="table" aria-label="Practice table: tap a ball, then a pocket; drag balls to move them"></canvas>
         </div>
-        <div id="toolbar" class="toolbar"></div>
+
+        <section class="view snap-view" id="snap" aria-labelledby="snap-title" data-step="intro"></section>
+
+        <div id="view-controls" class="view-controls"></div>
+        <div id="toolbar" class="toolbar" role="toolbar" aria-label="Tools"></div>
         <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-      </section>
-      <aside class="panel">
-        <div id="suggestions"></div>
-        <div id="shot-card"></div>
-        <div id="stroke-controls"></div>
-        <details class="legend">
-          <summary>Legend</summary>
-          <ul>
-            <li><i class="sw aim"></i> Aim line: cue ball → ghost ball</li>
-            <li><i class="sw ghost"></i> Ghost ball (where the cue ball must be at contact)</li>
-            <li><i class="sw ob"></i> Object-ball path</li>
-            <li><i class="sw cb"></i> Cue-ball path · ✕ where it stops</li>
-          </ul>
-        </details>
+      </main>
+
+      <aside class="panel" id="panel" aria-label="Shot details">
+        <div class="sheet-body" id="sheet-body">
+          <div id="suggestions"></div>
+          <div id="shot-card"></div>
+          <div id="stroke-controls"></div>
+          <details class="legend">
+            <summary>Legend <span data-icon="chevron-down" data-icon-size="16"></span></summary>
+            <ul>
+              <li><i class="sw aim"></i> Aim line: cue ball → ghost ball</li>
+              <li><i class="sw ghost"></i> Ghost ball (where the cue ball must be at contact)</li>
+              <li><i class="sw ob"></i> Object-ball path</li>
+              <li><i class="sw cb"></i> Cue-ball path · ✕ where it stops</li>
+            </ul>
+          </details>
+        </div>
       </aside>
-    </main>
+    </div>
+
     <dialog id="settings"></dialog>
     <script type="module" src="/src/app/main.ts"></script>
   </body>

@@ -10,22 +10,26 @@ want to pocket, and it shows you **exactly how to play it**:
 - a margin of error and difficulty rating, plus a one-line coaching tip ("stun: the cue ball leaves on the
   tangent line, the 90° rule")
 
-All of it runs on your phone. No account, no upload. It also works offline once it has loaded.
+All of it runs on your phone. No account, no upload. It also works offline once it has loaded. Three
+modes share one planner: **Live** (camera AR), **Snap** (two photos: the table, then your view from behind
+the cue ball) and **Practice** (a 3D table you can orbit, drag balls on and replay shots).
 
-| Live camera (landscape) | Practice table (portrait) | Your stroke |
-|---|---|---|
-| ![camera](docs/screenshots/camera-landscape.jpg) | ![practice](docs/screenshots/practice-phone.jpg) | ![stroke](docs/screenshots/practice-stroke.jpg) |
+| Snap: your view, guided | 3D practice table | Player view | Live camera (landscape) |
+|---|---|---|---|
+| ![snap guide](docs/screenshots/snap-guide.jpg) | ![practice](docs/screenshots/practice-phone.jpg) | ![player view](docs/screenshots/practice-player-view.jpg) | ![camera](docs/screenshots/camera-landscape.jpg) |
 
-> The camera screenshot uses the built-in ray-traced synthetic table as the camera feed. The e2e tests
-> use the same feed.
+> The photos and the camera feed in these screenshots are the built-in ray-traced synthetic table. The
+> tests use the same images.
 
 ## Features
 
 | | |
 |---|---|
+| **Snap: two-photo guide** | Photograph the whole table, fix the detected layout and pick your ball. Then crouch behind the cue ball and photograph the shot: CueSight works out where you stood and draws the aim line, ghost ball and pocket on your photo, the strike dot on the cue ball, and the power |
+| **3D practice table** | WebGL2 table with lamp lighting and glossy numbered balls. Orbit, pinch and pan, presets (top, player's eye, broadcast), drag balls, a cue stick showing tip offset and power, and *Play shot* to replay the simulation. Falls back to the 2D table without WebGL2 |
 | **Live camera AR** | Detects any cloth colour automatically and locks onto the table. Draws the plan in perspective on the cloth, with a top-down mini-map |
 | **Freeze & calibrate** | Freeze the layout and walk around. Fall back to tapping four corners. Swap the long and short rails. Tap the cue ball if it wasn't found |
-| **Practice table** | No camera needed: drag balls around and use built-in drills (straight-in, 30° cut, rail ball, blocked, scratch risk, 9-ball) |
+| **Drills** | No camera needed: built-in practice layouts (straight-in, 30° cut, rail ball, blocked, scratch risk, 9-ball) |
 | **Physics-grounded plan** | Time-stepped rigid-ball simulator with sliding/rolling friction, frictional ball–ball impulse (throw), cushions and jaws |
 | **Your stroke** | Power slider and spin pad, plus presets (stun, draw, follow, left, right). Predictions update instantly |
 | **Position play** | Tap where the cue ball should finish. CueSight searches about 170 strokes and recommends the most forgiving one. Without a target spot it picks the stroke that leaves the easiest next shot |
@@ -37,10 +41,12 @@ All of it runs on your phone. No account, no upload. It also works offline once 
 ```bash
 cd cuesight
 npm install
-npm run dev          # http://localhost:5173  (practice table works in any desktop browser)
-npm test             # 98 unit + integration tests (physics, vision accuracy, planner, perf)
-npm run e2e          # Playwright: practice table + live camera fed by a synthetic table video
+npm run dev          # http://localhost:5173  (practice table and Snap work in any desktop browser)
+npm test             # unit + integration tests (physics, vision accuracy, Snap pose, planner, 3D maths, perf)
+npm run e2e          # Playwright (Chromium; Pixel 7, iPhone SE, iPad): 3D table, Snap, 2D fallback, offline, size budget, live camera
+npm run e2e:webkit   # the same flows in WebKit with an iPhone profile
 npm run build        # production PWA in dist/
+npm run cap:sync     # build + copy into the iOS project (then: npm run ios:open on a Mac)
 ```
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
@@ -49,6 +55,57 @@ Screen" to install it. Use a plain `http://192.168…` LAN address only for the 
 
 **Tips for the best lock:** get the whole cloth in view, stand at an end or a corner, and hold the phone
 high. An overhead angle is the most accurate. If the corners are hidden, use **⌖ Calibrate**.
+
+## 3D practice table
+
+| Overview | Player view | Broadcast | Your stroke |
+|---|---|---|---|
+| ![overview](docs/screenshots/practice-phone.jpg) | ![player](docs/screenshots/practice-player-view.jpg) | ![broadcast](docs/screenshots/practice-broadcast.jpg) | ![stroke](docs/screenshots/practice-stroke.jpg) |
+
+Practice opens on a hand-written WebGL2 table (`src/app/render3d/`, no 3D library). Tap a ball, then a
+pocket, as before. Drag a ball to move it, drag the cloth to orbit, pinch or scroll to zoom, and use two
+fingers to pan. Double-tap the cloth to go back to the last preset. The glass buttons on the right switch
+between **Top**, **Player** (eye low behind the cue ball, down the aim line) and **3D** (broadcast angle).
+**Play** replays the simulated shot in real time: the cue strikes, and the balls roll with the right
+rotation and drop into the pocket. Tap, **Skip** or Escape ends it.
+
+The plan uses the same colours and line styles as everywhere else: aim line, ghost ball, contact point,
+object-ball and cue-ball paths, pocket highlight, landing marker and position heatmap. The cue stick sits
+behind the cue ball at the recommended tip offset and is drawn back further for more power. Without
+WebGL2, or with `?renderer=2d`, the 2D table does everything the same way.
+
+## Snap guide
+
+| 1 · The whole table | Fix it, pick your ball | 2 · Your view |
+|---|---|---|
+| ![snap intro](docs/screenshots/snap-intro.jpg) | ![snap table](docs/screenshots/snap-table.jpg) | ![snap guide](docs/screenshots/snap-guide.jpg) |
+
+1. **Photograph the whole table** (the in-app camera, your photo library, or the bundled sample). The 001
+   vision pipeline finds the cloth and the balls. The layout appears on the 3D table, and **Photo** shows
+   what was detected over your picture. Drag a ball to fix it, use **Cue ball**, **Add** or **Remove**,
+   or tap the four corners when the table wasn't found. Then tap the ball you want to pocket and, if you
+   like, a pocket.
+2. **Crouch behind the cue ball** at table level, facing the shot, and take a second photo. CueSight works
+   out where the camera was from the known layout (a 6-DoF pose and focal-length fit,
+   `src/vision/player-view.ts`) and draws on your photo, in perspective:
+   - the aim line on the cloth to the ghost ball (**Aim here**), the object-ball path and the pocket;
+   - a bold **strike dot** with a crosshair on the cue ball's face, with the miscue ring and the centre
+     cross. A magnified cue ball shows it up close;
+   - power 1–10 with a speed word and a gauge, and the spin in words ("Strike ½ tip low");
+   - how sure it is ("Fit: good · 98 %").
+
+If the photo can't be lined up, CueSight says why and asks for two taps: the cue ball, then the target.
+Change the stroke, target or pocket and the guide redraws on the same photo. Both photos stay in memory
+on the device and are dropped when you start over or leave Snap.
+
+## iOS app
+
+The same web build is wrapped with [Capacitor 8](https://capacitorjs.com/) in `ios/` (dev dependency
+only; the web app still has zero runtime dependencies). GitHub Actions on macOS
+(`.github/workflows/cuesight-ios.yml`) builds it, runs it in the iOS Simulator with a screenshot tour,
+and runs the Playwright flows in WebKit on an iPhone profile. When the App Store Connect API key secrets
+are set, it archives a signed build and uploads it to **TestFlight**. Setup, secrets and local Mac builds
+are in [`docs/ios.md`](docs/ios.md).
 
 ## How it works
 
@@ -71,7 +128,8 @@ high. An overhead angle is the most accurate. If the corners are hidden, use **�
   ground-truth fixtures.
 - `src/workers/` holds the versioned message protocol and the two workers.
 - `src/app/` holds the DOM, camera, rendering and UI.
-- There are **zero runtime dependencies**. The main bundle is about 23 KB gzipped.
+- `src/app/render3d/` is the WebGL2 table, and `src/app/snap/` is the two-photo flow.
+- There are **zero runtime dependencies**.
 
 ## How accurate is this?
 
@@ -143,6 +201,9 @@ part of the repo:
    - [quickstart](specs/001-realtime-shot-guide/quickstart.md)
    - [tasks](specs/001-realtime-shot-guide/tasks.md), all done
    - [analysis](specs/001-realtime-shot-guide/analysis.md)
+5. [`specs/002-3d-visual-ios/`](specs/002-3d-visual-ios/): the 3D table, Snap, the Midnight Felt design
+   and the iOS app ([spec](specs/002-3d-visual-ios/spec.md), [plan](specs/002-3d-visual-ios/plan.md),
+   [contracts](specs/002-3d-visual-ios/contracts/), [tasks](specs/002-3d-visual-ios/tasks.md)).
 
 The Spec Kit skills (`/speckit-specify`, `/speckit-plan`, `/speckit-tasks`, `/speckit-implement`…) are
 installed in `.claude/skills` for the next feature.
@@ -155,13 +216,16 @@ installed in `.claude/skills` for the next feature.
 3. Shot-result tracking: record the actual paths after the stroke, compare them with the prediction,
    and auto-calibrate cloth and cushions.
 4. Rule-aware suggestions for 8-ball, 9-ball and snooker (ball numbers and colours).
-5. Drills with scoring. A Capacitor wrapper for app-store distribution.
+5. Drills with scoring. Snap "live" mode: keep the guide on the camera view after the first fit.
 
 ## Privacy
 
-Camera frames are processed in a Web Worker on your device and never stored or transmitted. The app
-makes no network requests after it loads (verified: zero external requests, and an offline reload works).
-Settings live in your browser's local storage.
+Camera frames and Snap photos are processed in a Web Worker on your device and never stored or
+transmitted. The app makes no network requests after it loads. On the first visit the service worker
+precaches the whole build (the list of built files is written into `sw.js` at build time by
+`scripts/sw-precache.ts`), so the app then starts and plans with no network at all.
+`tests/e2e/offline.spec.ts` checks this: zero requests to any other origin, then an offline reload, a
+plan, a Snap table photo and a cold start in a new tab. Settings live in your browser's local storage.
 
 ## References
 

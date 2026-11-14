@@ -22,6 +22,8 @@ export interface SynthCamera {
   target: Vec3;
   /** Horizontal field of view in degrees. */
   fovDeg: number;
+  /** Optional roll about the viewing axis in degrees (+ = image content turns clockwise). Default 0. */
+  rollDeg?: number;
 }
 
 export interface SynthScene {
@@ -74,8 +76,17 @@ const norm3 = (a: Vec3): Vec3 => {
 
 export function cameraModel(cam: SynthCamera, width: number, height: number): CameraModel {
   const fwd = norm3(sub3(cam.target, cam.pos));
-  const right = norm3(cross3(fwd, { x: 0, y: 0, z: 1 }));
-  const down = cross3(fwd, right);
+  let right = norm3(cross3(fwd, { x: 0, y: 0, z: 1 }));
+  let down = cross3(fwd, right);
+  if (cam.rollDeg) {
+    const a = (cam.rollDeg * Math.PI) / 180;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    const r0 = right;
+    const d0 = down;
+    right = { x: ca * r0.x + sa * d0.x, y: ca * r0.y + sa * d0.y, z: ca * r0.z + sa * d0.z };
+    down = { x: ca * d0.x - sa * r0.x, y: ca * d0.y - sa * r0.y, z: ca * d0.z - sa * r0.z };
+  }
   const f = width / 2 / Math.tan((cam.fovDeg * Math.PI) / 360);
   const cx = width / 2;
   const cy = height / 2;
@@ -107,6 +118,56 @@ export function cameraModel(cam: SynthCamera, width: number, height: number): Ca
       const s = 1 / H[8]!;
       return H.map((v) => v * s);
     },
+  };
+}
+
+export interface PlayerCameraOptions {
+  /** Cue-ball centre (table metres). */
+  cue: Vec2;
+  /** Point the player aims at (usually the target ball). Sets the shooting direction. */
+  aimAt: Vec2;
+  /** Horizontal distance from the cue-ball centre back to the camera (m). */
+  distance: number;
+  /** Camera height above the bed (m). */
+  height: number;
+  /** Rotate the camera position about the cue ball, off the aim line (deg, + = counter-clockwise). */
+  yawOffsetDeg?: number;
+  /** Extra heading change of the view direction (deg, + = turn left). */
+  headingOffsetDeg?: number;
+  /** Image row of the cue-ball centre as a fraction of the height (0.5 = centre). Default 0.72. */
+  cueRow?: number;
+  fovDeg: number;
+  /** Image size the camera will render (px). */
+  imageWidth: number;
+  imageHeight: number;
+  ballRadius: number;
+  rollDeg?: number;
+}
+
+/**
+ * A table-level "player view" camera (spec 002 R-24 test scenes): crouched behind the cue ball,
+ * facing the aim point horizontally and pitched so the cue ball sits at `cueRow` of the image.
+ */
+export function playerViewCamera(o: PlayerCameraOptions): SynthCamera {
+  const aim = Math.atan2(o.aimAt.y - o.cue.y, o.aimAt.x - o.cue.x);
+  const back = aim + ((o.yawOffsetDeg ?? 0) * Math.PI) / 180;
+  const pos = { x: o.cue.x - Math.cos(back) * o.distance, y: o.cue.y - Math.sin(back) * o.distance, z: o.height };
+  const psi = Math.atan2(o.aimAt.y - pos.y, o.aimAt.x - pos.x) + ((o.headingOffsetDeg ?? 0) * Math.PI) / 180;
+  const f = o.imageWidth / 2 / Math.tan((o.fovDeg * Math.PI) / 360);
+  const tau = ((o.cueRow ?? 0.72) * o.imageHeight - o.imageHeight / 2) / f;
+  // Cue-ball centre relative to the camera: along the heading (hh) and vertically (vz).
+  const vx = o.cue.x - pos.x;
+  const vy = o.cue.y - pos.y;
+  const hh = Math.cos(psi) * vx + Math.sin(psi) * vy;
+  const vz = o.ballRadius - pos.z;
+  // Pitch φ (down) with (down·v)/(fwd·v) = τ for a level (roll-free) camera.
+  const phi = Math.atan2(-vz - tau * hh, hh - tau * vz);
+  const fwd = { x: Math.cos(phi) * Math.cos(psi), y: Math.cos(phi) * Math.sin(psi), z: -Math.sin(phi) };
+  return {
+    pos,
+    target: { x: pos.x + fwd.x, y: pos.y + fwd.y, z: pos.z + fwd.z },
+    fovDeg: o.fovDeg,
+    ...(o.rollDeg ? { rollDeg: o.rollDeg } : {}),
   };
 }
 
@@ -158,26 +219,76 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
       holes.push({ x: sx * (hx + off), y: sy * (hy + off), r: g * 1.02 + off * 0.9 });
     }
   for (const sy of [-1, 1]) holes.push({ x: 0, y: sy * (hy + table.sideMouth * 0.45), r: table.sideMouth * 0.56 });
-  const inHole = (x: number, y: number) => holes.some((h) => (x - h.x) ** 2 + (y - h.y) ** 2 < h.r * h.r);
+  const nHoles = holes.length;
+  const holeX = new Float64Array(holes.map((h) => h.x));
+  const holeY = new Float64Array(holes.map((h) => h.y));
+  const holeR = new Float64Array(holes.map((h) => h.r));
+  const inHole = (x: number, y: number): boolean => {
+    for (let k = 0; k < nHoles; k++) if ((x - holeX[k]!) ** 2 + (y - holeY[k]!) ** 2 < holeR[k]! * holeR[k]!) return true;
+    return false;
+  };
 
   // Ball stripe axes (deterministic per index).
   const axes = scene.balls.map((_, i) => norm3({ x: Math.sin(i * 1.7), y: Math.cos(i * 2.3), z: 0.6 + 0.3 * Math.sin(i) }));
 
+  // Flat, allocation-free scene data for the per-ray loops. Every expression below reproduces the
+  // arithmetic of the original object-based tracer term by term, so frames are bit-identical.
+  const nBalls = scene.balls.length;
+  const ballX = new Float64Array(nBalls);
+  const ballY = new Float64Array(nBalls);
+  const axX = new Float64Array(nBalls);
+  const axY = new Float64Array(nBalls);
+  const axZ = new Float64Array(nBalls);
+  const ocX = new Float64Array(nBalls);
+  const ocY = new Float64Array(nBalls);
+  const ocZ = new Float64Array(nBalls);
+  const ocC = new Float64Array(nBalls);
+  const C = cam.C;
+  for (let i = 0; i < nBalls; i++) {
+    const b = scene.balls[i]!;
+    ballX[i] = b.pos.x;
+    ballY[i] = b.pos.y;
+    axX[i] = axes[i]!.x;
+    axY[i] = axes[i]!.y;
+    axZ[i] = axes[i]!.z;
+    // Primary rays all start at the camera centre.
+    ocX[i] = C.x - b.pos.x;
+    ocY[i] = C.y - b.pos.y;
+    ocZ[i] = C.z - R;
+    ocC[i] = ocX[i]! * ocX[i]! + ocY[i]! * ocY[i]! + ocZ[i]! * ocZ[i]! - R * R;
+  }
+  const nBoxes = boxes.length;
+  const bMin = new Float64Array(nBoxes * 3);
+  const bMax = new Float64Array(nBoxes * 3);
+  const bRail = new Uint8Array(nBoxes);
+  for (let k = 0; k < nBoxes; k++) {
+    const bx = boxes[k]!;
+    bMin[k * 3] = bx.min.x;
+    bMin[k * 3 + 1] = bx.min.y;
+    bMin[k * 3 + 2] = bx.min.z;
+    bMax[k * 3] = bx.max.x;
+    bMax[k * 3 + 1] = bx.max.y;
+    bMax[k * 3 + 2] = bx.max.z;
+    bRail[k] = bx.kind === 'rail' ? 1 : 0;
+  }
+  const oArr = [C.x, C.y, C.z];
+
   const frame = createFrame(width, height);
   const Rm = cam.R;
   const col: [number, number, number] = [0, 0, 0];
+  const dArr = [0, 0, 0];
 
-  const shade = (o: Vec3, d: Vec3): void => {
+  const shade = (dx: number, dy: number, dz: number): void => {
+    const ox = C.x;
+    const oy = C.y;
+    const oz = C.z;
     // Nearest sphere.
     let tBest = Infinity;
-    let hitKind = 0; // 0 none, 1 ball, 2 bed, 3 box face, 4 floor
+    let hitKind = 0; // 0 none, 1 ball, 2 bed, 3 box face, 4 floor, 5 pocket hole
     let ballIdx = -1;
-    for (let i = 0; i < scene.balls.length; i++) {
-      const b = scene.balls[i]!;
-      const oc = { x: o.x - b.pos.x, y: o.y - b.pos.y, z: o.z - R };
-      const bb = dot3(oc, d);
-      const cc = dot3(oc, oc) - R * R;
-      const disc = bb * bb - cc;
+    for (let i = 0; i < nBalls; i++) {
+      const bb = ocX[i]! * dx + ocY[i]! * dy + ocZ[i]! * dz;
+      const disc = bb * bb - ocC[i]!;
       if (disc < 0) continue;
       const t = -bb - Math.sqrt(disc);
       if (t > 1e-6 && t < tBest) {
@@ -186,26 +297,34 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
         ballIdx = i;
       }
     }
-    // Boxes (slab method), record the face normal.
-    let boxN: Vec3 = { x: 0, y: 0, z: 1 };
-    let boxKind: Box['kind'] = 'rail';
-    for (const bx of boxes) {
+    // Boxes (slab method), record the entering face: axis index and sign.
+    let boxAxis = 2;
+    let boxSign = 1;
+    let boxIsRail = 1;
+    dArr[0] = dx;
+    dArr[1] = dy;
+    dArr[2] = dz;
+    for (let k = 0; k < nBoxes; k++) {
       let t0 = -Infinity;
       let t1 = Infinity;
-      let nEnter: Vec3 = { x: 0, y: 0, z: 0 };
+      let enterAxis = -1;
+      let enterSign = 0;
       let ok = true;
-      for (const ax of ['x', 'y', 'z'] as const) {
-        const inv = 1 / d[ax];
-        let ta = (bx.min[ax] - o[ax]) * inv;
-        let tb = (bx.max[ax] - o[ax]) * inv;
+      for (let ax = 0; ax < 3; ax++) {
+        const inv = 1 / dArr[ax]!;
+        let ta = (bMin[k * 3 + ax]! - oArr[ax]!) * inv;
+        let tb = (bMax[k * 3 + ax]! - oArr[ax]!) * inv;
         let sign = -1;
         if (ta > tb) {
-          [ta, tb] = [tb, ta];
+          const tmp = ta;
+          ta = tb;
+          tb = tmp;
           sign = 1;
         }
         if (ta > t0) {
           t0 = ta;
-          nEnter = { x: 0, y: 0, z: 0, [ax]: sign } as Vec3;
+          enterAxis = ax;
+          enterSign = sign;
         }
         if (tb < t1) t1 = tb;
         if (t0 > t1) {
@@ -214,19 +333,19 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
         }
       }
       if (!ok || t0 <= 1e-6 || t0 >= tBest) continue;
-      const p = { x: o.x + d.x * t0, y: o.y + d.y * t0, z: o.z + d.z * t0 };
-      if (inHole(p.x, p.y)) continue;
+      if (inHole(ox + dx * t0, oy + dy * t0)) continue;
       tBest = t0;
       hitKind = 3;
-      boxN = nEnter;
-      boxKind = bx.kind;
+      boxAxis = enterAxis;
+      boxSign = enterSign;
+      boxIsRail = bRail[k]!;
     }
     // Bed plane z = 0.
-    if (d.z < 0) {
-      const t = -o.z / d.z;
+    if (dz < 0) {
+      const t = -oz / dz;
       if (t > 0 && t < tBest) {
-        const x = o.x + d.x * t;
-        const y = o.y + d.y * t;
+        const x = ox + dx * t;
+        const y = oy + dy * t;
         if (Math.abs(x) <= hx && Math.abs(y) <= hy) {
           tBest = t;
           hitKind = inHole(x, y) ? 5 : 2;
@@ -237,7 +356,7 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
           }
         }
       }
-      const tf = (-0.78 - o.z) / d.z;
+      const tf = (-0.78 - oz) / dz;
       if (hitKind === 0 && tf > 0) {
         tBest = tf;
         hitKind = 4;
@@ -249,16 +368,33 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
       col[2] = 34;
       return;
     }
-    const p = { x: o.x + d.x * tBest, y: o.y + d.y * tBest, z: o.z + d.z * tBest };
-    const toL = norm3(sub3(light, p));
+    const px = ox + dx * tBest;
+    const py = oy + dy * tBest;
+    const pz = oz + dz * tBest;
+    const lx0 = light.x - px;
+    const ly0 = light.y - py;
+    const lz0 = light.z - pz;
+    const ll = Math.hypot(lx0, ly0, lz0);
+    const lx = lx0 / ll;
+    const ly = ly0 / ll;
+    const lz = lz0 / ll;
     if (hitKind === 1) {
       const b = scene.balls[ballIdx]!;
-      const n = norm3({ x: p.x - b.pos.x, y: p.y - b.pos.y, z: p.z - R });
+      const nx0 = px - ballX[ballIdx]!;
+      const ny0 = py - ballY[ballIdx]!;
+      const nz0 = pz - R;
+      const nl = Math.hypot(nx0, ny0, nz0);
+      const nx = nx0 / nl;
+      const ny = ny0 / nl;
+      const nz = nz0 / nl;
       let base = b.color;
-      if (b.stripe && Math.abs(dot3(n, axes[ballIdx]!)) > 0.45) base = BALL_COLORS.cue!;
-      const lam = Math.max(0, dot3(n, toL));
-      const refl = sub3({ x: 2 * dot3(n, toL) * n.x, y: 2 * dot3(n, toL) * n.y, z: 2 * dot3(n, toL) * n.z }, toL);
-      const spec = Math.pow(Math.max(0, -dot3(refl, d)), 40) * 0.6;
+      if (b.stripe && Math.abs(nx * axX[ballIdx]! + ny * axY[ballIdx]! + nz * axZ[ballIdx]!) > 0.45) base = BALL_COLORS.cue!;
+      const dn = nx * lx + ny * ly + nz * lz;
+      const lam = Math.max(0, dn);
+      const rx = 2 * dn * nx - lx;
+      const ry = 2 * dn * ny - ly;
+      const rz = 2 * dn * nz - lz;
+      const spec = Math.pow(Math.max(0, -(rx * dx + ry * dy + rz * dz)), 40) * 0.6;
       const k = 0.35 + 0.7 * lam;
       col[0] = base[0] * k + 255 * spec;
       col[1] = base[1] * k + 255 * spec;
@@ -279,25 +415,29 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
     }
     // Shadow ray toward the light (balls only).
     let shadow = 1;
-    for (const b of scene.balls) {
-      const oc = { x: p.x - b.pos.x, y: p.y - b.pos.y, z: p.z - R };
-      const bb = dot3(oc, toL);
-      const cc = dot3(oc, oc) - R * R;
+    for (let i = 0; i < nBalls; i++) {
+      const sx = px - ballX[i]!;
+      const sy = py - ballY[i]!;
+      const sz = pz - R;
+      const bb = sx * lx + sy * ly + sz * lz;
+      const cc = sx * sx + sy * sy + sz * sz - R * R;
       if (bb < 0 && bb * bb - cc > 0) {
         shadow = 0.55;
         break;
       }
     }
-    const nz = hitKind === 2 ? { x: 0, y: 0, z: 1 } : boxN;
-    const lam = Math.max(0, dot3(nz, toL));
+    // Lambert term against the bed normal (0,0,1) or the entered box face (an axis vector).
+    const nzc = hitKind === 2 ? 1 : boxAxis === 2 ? boxSign : 0;
+    const dotL = hitKind === 2 ? lz : boxSign * (boxAxis === 0 ? lx : boxAxis === 1 ? ly : lz);
+    const lam = Math.max(0, dotL);
     let base: RGB = cloth;
     let k = (0.45 + 0.6 * lam) * shadow;
     if (hitKind === 3) {
-      if (boxKind === 'rail') base = rail;
-      else if (nz.z < 0.5) k *= 0.7; // cushion nose face
+      if (boxIsRail) base = rail;
+      else if (nzc < 0.5) k *= 0.7; // cushion nose face
       else k *= 0.92; // cushion top
     }
-    const nn = 1 + noise * (hash(Math.round(p.x * 2000), Math.round(p.y * 2000)) - 0.5) * 2;
+    const nn = 1 + noise * (hash(Math.round(px * 2000), Math.round(py * 2000)) - 0.5) * 2;
     col[0] = base[0] * k * nn;
     col[1] = base[1] * k * nn;
     col[2] = base[2] * k * nn;
@@ -306,6 +446,15 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
   const cx = width / 2;
   const cy = height / 2;
   const data = frame.data;
+  const r0x = Rm[0].x;
+  const r0y = Rm[0].y;
+  const r0z = Rm[0].z;
+  const r1x = Rm[1].x;
+  const r1y = Rm[1].y;
+  const r1z = Rm[1].z;
+  const r2x = Rm[2].x;
+  const r2y = Rm[2].y;
+  const r2z = Rm[2].z;
   for (let v = 0; v < height; v++) {
     for (let u = 0; u < width; u++) {
       let r = 0;
@@ -317,12 +466,11 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
           const py = v + (sy + 0.5) / ss;
           const xc = (px - cx) / cam.f;
           const yc = (py - cy) / cam.f;
-          const d = norm3({
-            x: Rm[0].x * xc + Rm[1].x * yc + Rm[2].x,
-            y: Rm[0].y * xc + Rm[1].y * yc + Rm[2].y,
-            z: Rm[0].z * xc + Rm[1].z * yc + Rm[2].z,
-          });
-          shade(cam.C, d);
+          const ex = r0x * xc + r1x * yc + r2x;
+          const ey = r0y * xc + r1y * yc + r2y;
+          const ez = r0z * xc + r1z * yc + r2z;
+          const el = Math.hypot(ex, ey, ez);
+          shade(ex / el, ey / el, ez / el);
           r += col[0];
           gg += col[1];
           bl += col[2];

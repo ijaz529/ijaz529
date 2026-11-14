@@ -1,0 +1,725 @@
+{
+  "description": "CueSight Snap fixtures (spec 002 US2): synthetic photos of one ball layout with exact ground truth. Regenerate with `npx tsx scripts/make-snap-fixtures.ts`.",
+  "units": "metres, table frame (origin at the bed centre, +x along the long rail, z up); image px with pixel (u, v) covering [u, u+1)×[v, v+1)",
+  "poseConvention": "X_cam = R·X_world + t; rows of R = camera right, down, forward; u = f·X/Z + cx, v = f·Y/Z + cy",
+  "table": "pool9",
+  "ballRadius": 0.028575,
+  "cueId": "cue",
+  "targetId": "1",
+  "pocketId": "TR",
+  "balls": [
+    {
+      "id": "cue",
+      "label": "cue",
+      "pos": {
+        "x": -0.7,
+        "y": -0.1
+      },
+      "rgb": [
+        245,
+        245,
+        238
+      ],
+      "stripe": false,
+      "isCue": true
+    },
+    {
+      "id": "1",
+      "label": "yellow",
+      "pos": {
+        "x": 0.3,
+        "y": 0.15
+      },
+      "rgb": [
+        236,
+        190,
+        20
+      ],
+      "stripe": false,
+      "isCue": false
+    },
+    {
+      "id": "2",
+      "label": "blue",
+      "pos": {
+        "x": 0.55,
+        "y": -0.32
+      },
+      "rgb": [
+        20,
+        60,
+        170
+      ],
+      "stripe": false,
+      "isCue": false
+    },
+    {
+      "id": "3",
+      "label": "red",
+      "pos": {
+        "x": -0.25,
+        "y": 0.4
+      },
+      "rgb": [
+        200,
+        25,
+        30
+      ],
+      "stripe": false,
+      "isCue": false
+    },
+    {
+      "id": "12",
+      "label": "purple stripe",
+      "pos": {
+        "x": 0.95,
+        "y": -0.05
+      },
+      "rgb": [
+        90,
+        30,
+        130
+      ],
+      "stripe": true,
+      "isCue": false
+    },
+    {
+      "id": "5",
+      "label": "orange",
+      "pos": {
+        "x": 1.00765,
+        "y": -0.05
+      },
+      "rgb": [
+        240,
+        110,
+        20
+      ],
+      "stripe": false,
+      "isCue": false
+    },
+    {
+      "id": "15",
+      "label": "maroon stripe",
+      "pos": {
+        "x": 0.05,
+        "y": -0.08
+      },
+      "rgb": [
+        120,
+        20,
+        30
+      ],
+      "stripe": true,
+      "isCue": false
+    },
+    {
+      "id": "8",
+      "label": "black",
+      "pos": {
+        "x": -0.45,
+        "y": -0.42
+      },
+      "rgb": [
+        18,
+        18,
+        20
+      ],
+      "stripe": false,
+      "isCue": false
+    },
+    {
+      "id": "9",
+      "label": "yellow stripe",
+      "pos": {
+        "x": 1.05,
+        "y": 0.25
+      },
+      "rgb": [
+        236,
+        190,
+        20
+      ],
+      "stripe": true,
+      "isCue": false
+    }
+  ],
+  "photos": {
+    "overview": {
+      "file": "snap-overview.png",
+      "width": 1280,
+      "height": 720,
+      "note": "Whole table from a corner; the 001 pipeline locks on it and finds all 9 balls.",
+      "camera": {
+        "pos": {
+          "x": -2.25,
+          "y": -1.5,
+          "z": 1.8
+        },
+        "target": {
+          "x": 0.15,
+          "y": 0.05,
+          "z": 0
+        },
+        "fovDeg": 66,
+        "f": 985.513576841333
+      },
+      "pose": {
+        "R": [
+          0.5425254314756647,
+          -0.840039377768771,
+          0,
+          -0.4477876475941022,
+          -0.28919618907119105,
+          -0.8460802484923284,
+          0.7107407254859427,
+          0.45902005187633804,
+          -0.5330555441144571
+        ],
+        "t": {
+          "x": -0.03937684583291112,
+          "y": 0.08162795659267474,
+          "z": 3.247196689563901
+        },
+        "f": 985.513576841333,
+        "cx": 640,
+        "cy": 360,
+        "width": 1280,
+        "height": 720
+      },
+      "clothCorners": [
+        {
+          "x": 550.15,
+          "y": 779.15
+        },
+        {
+          "x": 960.4,
+          "y": 272.48
+        },
+        {
+          "x": 662.29,
+          "y": 197.61
+        },
+        {
+          "x": 136.31,
+          "y": 527.99
+        }
+      ],
+      "ballsInView": [
+        {
+          "id": "cue",
+          "center": {
+            "x": 517.15,
+            "y": 506.56
+          },
+          "outlineCenter": {
+            "x": 517.14,
+            "y": 506.57
+          },
+          "radiusPx": 10.57
+        },
+        {
+          "id": "1",
+          "center": {
+            "x": 639.26,
+            "y": 326.27
+          },
+          "outlineCenter": {
+            "x": 639.26,
+            "y": 326.27
+          },
+          "radiusPx": 8.02
+        },
+        {
+          "id": "2",
+          "center": {
+            "x": 789.65,
+            "y": 332.7
+          },
+          "outlineCenter": {
+            "x": 789.65,
+            "y": 332.7
+          },
+          "radiusPx": 8.15
+        },
+        {
+          "id": "3",
+          "center": {
+            "x": 484.46,
+            "y": 376.35
+          },
+          "outlineCenter": {
+            "x": 484.45,
+            "y": 376.35
+          },
+          "radiusPx": 8.75
+        },
+        {
+          "id": "12",
+          "center": {
+            "x": 771.43,
+            "y": 270.31
+          },
+          "outlineCenter": {
+            "x": 771.44,
+            "y": 270.31
+          },
+          "radiusPx": 7.3
+        },
+        {
+          "id": "5",
+          "center": {
+            "x": 777.92,
+            "y": 264.77
+          },
+          "outlineCenter": {
+            "x": 777.92,
+            "y": 264.76
+          },
+          "radiusPx": 7.23
+        },
+        {
+          "id": "15",
+          "center": {
+            "x": 656.76,
+            "y": 377.75
+          },
+          "outlineCenter": {
+            "x": 656.76,
+            "y": 377.75
+          },
+          "radiusPx": 8.72
+        },
+        {
+          "id": "8",
+          "center": {
+            "x": 665.12,
+            "y": 497.87
+          },
+          "outlineCenter": {
+            "x": 665.12,
+            "y": 497.87
+          },
+          "radiusPx": 10.41
+        },
+        {
+          "id": "9",
+          "center": {
+            "x": 717.11,
+            "y": 243.22
+          },
+          "outlineCenter": {
+            "x": 717.12,
+            "y": 243.21
+          },
+          "radiusPx": 6.92
+        }
+      ]
+    },
+    "player": {
+      "file": "snap-player.png",
+      "width": 1280,
+      "height": 960,
+      "note": "Crouched 0.5 m behind the cue ball, 0.3 m above the bed, aimed at the 1 ball. The automatic fit succeeds.",
+      "targetId": "1",
+      "pocketId": "TR",
+      "camera": {
+        "pos": {
+          "x": -1.185071250072666,
+          "y": -0.2212678125181665,
+          "z": 0.3
+        },
+        "target": {
+          "x": -0.25547190322771585,
+          "y": 0.011132024193071022,
+          "z": 0.013931179185790343
+        },
+        "fovDeg": 65,
+        "f": 1004.5987693551938
+      },
+      "pose": {
+        "R": [
+          0.24253562503633297,
+          -0.9701425001453319,
+          0,
+          -0.2775275210383243,
+          -0.06938188025958107,
+          -0.9582090741367292,
+          0.92959934684495,
+          0.2323998367112375,
+          -0.28606882081420965
+        ],
+        "t": {
+          "x": 0.0727606875108999,
+          "y": -0.05677914091887115,
+          "z": 1.238884709775216
+        },
+        "f": 1004.5987693551938,
+        "cx": 640,
+        "cy": 480,
+        "width": 1280,
+        "height": 960
+      },
+      "ballsInView": [
+        {
+          "id": "cue",
+          "center": {
+            "x": 640,
+            "y": 691.2
+          },
+          "outlineCenter": {
+            "x": 640,
+            "y": 691.48
+          },
+          "radiusPx": 52.19
+        },
+        {
+          "id": "1",
+          "center": {
+            "x": 640,
+            "y": 364.33
+          },
+          "outlineCenter": {
+            "x": 640,
+            "y": 364.31
+          },
+          "radiusPx": 18.65
+        },
+        {
+          "id": "2",
+          "center": {
+            "x": 951.21,
+            "y": 350.72
+          },
+          "outlineCenter": {
+            "x": 951.25,
+            "y": 350.7
+          },
+          "radiusPx": 17.69
+        },
+        {
+          "id": "3",
+          "center": {
+            "x": 293.93,
+            "y": 440.85
+          },
+          "outlineCenter": {
+            "x": 293.81,
+            "y": 440.83
+          },
+          "radiusPx": 27.09
+        },
+        {
+          "id": "12",
+          "center": {
+            "x": 808.06,
+            "y": 315.45
+          },
+          "outlineCenter": {
+            "x": 808.07,
+            "y": 315.43
+          },
+          "radiusPx": 13.84
+        },
+        {
+          "id": "5",
+          "center": {
+            "x": 810.4,
+            "y": 312.08
+          },
+          "outlineCenter": {
+            "x": 810.41,
+            "y": 312.07
+          },
+          "radiusPx": 13.5
+        },
+        {
+          "id": "15",
+          "center": {
+            "x": 769.7,
+            "y": 406.18
+          },
+          "outlineCenter": {
+            "x": 769.74,
+            "y": 406.16
+          },
+          "radiusPx": 22.94
+        },
+        {
+          "id": "8",
+          "center": {
+            "x": 1161.54,
+            "y": 578.2
+          },
+          "outlineCenter": {
+            "x": 1161.95,
+            "y": 578.28
+          },
+          "radiusPx": 42.87
+        },
+        {
+          "id": "9",
+          "center": {
+            "x": 677.65,
+            "y": 305.72
+          },
+          "outlineCenter": {
+            "x": 677.66,
+            "y": 305.71
+          },
+          "radiusPx": 12.77
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "reason": null
+      }
+    },
+    "playerHard": {
+      "file": "snap-player-hard.png",
+      "width": 1280,
+      "height": 960,
+      "note": "Only the cue ball and the 8 ball in frame, no cushion: the automatic fit refuses (ok: false + reason); two taps (cue, then 8) succeed with confidence capped at 0.7.",
+      "targetId": "8",
+      "pocketId": "BM",
+      "camera": {
+        "pos": {
+          "x": -0.8846932125916945,
+          "y": 0.13640731211736898,
+          "z": 0.3
+        },
+        "target": {
+          "x": -0.3709954150436625,
+          "y": -0.5211258687441119,
+          "z": -0.2511485179699607
+        },
+        "fovDeg": 40,
+        "f": 1758.3855484509584
+      },
+      "pose": {
+        "R": [
+          -0.7880243737245634,
+          -0.6156440419723153,
+          0,
+          -0.3393113013300778,
+          0.4343184657024995,
+          -0.8344071614862351,
+          0.513697797548032,
+          -0.6575331808614809,
+          -0.5511485179699607
+        ],
+        "t": {
+          "x": -0.6131814658044258,
+          "y": -0.10910847130592216,
+          "z": 0.709501844034333
+        },
+        "f": 1758.3855484509584,
+        "cx": 640,
+        "cy": 480,
+        "width": 1280,
+        "height": 960
+      },
+      "ballsInView": [
+        {
+          "id": "cue",
+          "center": {
+            "x": 640,
+            "y": 748.8
+          },
+          "outlineCenter": {
+            "x": 640,
+            "y": 749.49
+          },
+          "radiusPx": 126.7
+        },
+        {
+          "id": "8",
+          "center": {
+            "x": 640,
+            "y": 92.8
+          },
+          "outlineCenter": {
+            "x": 640,
+            "y": 92.51
+          },
+          "radiusPx": 68.88
+        }
+      ],
+      "expect": {
+        "ok": false,
+        "reason": "I couldn't line up this photo. Tap the cue ball, then your target.",
+        "manualTaps": {
+          "cue": {
+            "x": 640,
+            "y": 749.49
+          },
+          "target": {
+            "x": 640,
+            "y": 92.51
+          }
+        },
+        "manualOk": true,
+        "manualConfidence": 0.7
+      }
+    },
+    "playerCut": {
+      "file": "snap-player-cut.png",
+      "width": 1280,
+      "height": 960,
+      "note": "Cue-ball centre on the bottom edge: the strike point (below the centre, on the back) is off the photo. The automatic fit succeeds.",
+      "targetId": "1",
+      "pocketId": "TR",
+      "camera": {
+        "pos": {
+          "x": -1.1227642368321145,
+          "y": -0.2541765223883321,
+          "z": 0.3
+        },
+        "target": {
+          "x": -0.1654590834926416,
+          "y": 0.017773149753190498,
+          "z": 0.2019682744627706
+        },
+        "fovDeg": 65,
+        "f": 1004.5987693551938
+      },
+      "pose": {
+        "R": [
+          0.27326591479320206,
+          -0.9619385322421773,
+          0,
+          -0.09430049417645041,
+          -0.026788729157687097,
+          -0.9951832900467095,
+          0.9573051533394729,
+          0.2719496721415226,
+          -0.09803172553722939
+        ],
+        "t": {
+          "x": 0.06231100539836604,
+          "y": 0.18586869862059544,
+          "z": 1.1733607294953916
+        },
+        "f": 1004.5987693551938,
+        "cx": 640,
+        "cy": 480,
+        "width": 1280,
+        "height": 960
+      },
+      "ballsInView": [
+        {
+          "id": "cue",
+          "center": {
+            "x": 570.41,
+            "y": 960
+          },
+          "outlineCenter": {
+            "x": 570.29,
+            "y": 960.88
+          },
+          "radiusPx": 64.17
+        },
+        {
+          "id": "1",
+          "center": {
+            "x": 640,
+            "y": 563.88
+          },
+          "outlineCenter": {
+            "x": 640,
+            "y": 563.9
+          },
+          "radiusPx": 19.19
+        },
+        {
+          "id": "2",
+          "center": {
+            "x": 964.72,
+            "y": 551.22
+          },
+          "outlineCenter": {
+            "x": 964.77,
+            "y": 551.23
+          },
+          "radiusPx": 18.31
+        },
+        {
+          "id": "3",
+          "center": {
+            "x": 262.53,
+            "y": 644.49
+          },
+          "outlineCenter": {
+            "x": 262.38,
+            "y": 644.55
+          },
+          "radiusPx": 28.74
+        },
+        {
+          "id": "12",
+          "center": {
+            "x": 819.88,
+            "y": 513.64
+          },
+          "outlineCenter": {
+            "x": 819.9,
+            "y": 513.64
+          },
+          "radiusPx": 14.01
+        },
+        {
+          "id": "5",
+          "center": {
+            "x": 822.66,
+            "y": 510.19
+          },
+          "outlineCenter": {
+            "x": 822.68,
+            "y": 510.19
+          },
+          "radiusPx": 13.65
+        },
+        {
+          "id": "15",
+          "center": {
+            "x": 768.38,
+            "y": 610
+          },
+          "outlineCenter": {
+            "x": 768.42,
+            "y": 610.04
+          },
+          "radiusPx": 24.19
+        },
+        {
+          "id": "8",
+          "center": {
+            "x": 1191.41,
+            "y": 819.04
+          },
+          "outlineCenter": {
+            "x": 1191.98,
+            "y": 819.4
+          },
+          "radiusPx": 50.39
+        },
+        {
+          "id": "9",
+          "center": {
+            "x": 688.69,
+            "y": 503.16
+          },
+          "outlineCenter": {
+            "x": 688.7,
+            "y": 503.16
+          },
+          "radiusPx": 12.8
+        }
+      ],
+      "expect": {
+        "ok": true,
+        "reason": null
+      }
+    }
+  }
+}

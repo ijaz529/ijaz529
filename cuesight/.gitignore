@@ -13,3 +13,6 @@ Thumbs.db
 .vscode/
 .idea/
 tests/fixtures/*.y4m
+
+# Tool downloads that must never be committed (lint helpers fetched during development)
+*.whl

@@ -92,6 +92,82 @@ export function learnCloth(sc: TableScratch): ClothModel | null {
   return { hue: mh, sat: ss[ss.length >> 1] ?? 0.5, val: vs[vs.length >> 1] ?? 0.5 };
 }
 
+/**
+ * Learn the cloth colour inside a quad the player tapped (manual calibration), for photos where the
+ * automatic search found no cloth in the central window. Same statistics as `learnCloth`, over the
+ * pixels inside the (convex) quad, sampled on a grid. `sc` must hold the frame's HSV (detectTable fills it).
+ */
+export function learnClothInQuad(sc: TableScratch, quad: Vec2[]): ClothModel | null {
+  if (quad.length !== 4) return null;
+  const { w, h, hue, sat, val } = sc;
+  const q = convexHull(quad);
+  if (q.length < 3) return null;
+  const inside = (x: number, y: number): boolean => {
+    let sign = 0;
+    for (let i = 0; i < q.length; i++) {
+      const a = q[i]!;
+      const b = q[(i + 1) % q.length]!;
+      const c = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+      if (c !== 0) {
+        const sg = c > 0 ? 1 : -1;
+        if (sign === 0) sign = sg;
+        else if (sg !== sign) return false;
+      }
+    }
+    return true;
+  };
+  let minX = w;
+  let minY = h;
+  let maxX = 0;
+  let maxY = 0;
+  for (const p of q) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  const x0 = Math.max(0, Math.floor(minX));
+  const y0 = Math.max(0, Math.floor(minY));
+  const x1 = Math.min(w - 1, Math.ceil(maxX));
+  const y1 = Math.min(h - 1, Math.ceil(maxY));
+  const step = Math.max(1, Math.floor(Math.sqrt(((x1 - x0) * (y1 - y0)) / 20000)));
+  const bins = new Float64Array(36);
+  let n = 0;
+  for (let y = y0; y <= y1; y += step)
+    for (let x = x0; x <= x1; x += step) {
+      if (!inside(x + 0.5, y + 0.5)) continue;
+      n++;
+      const i = y * w + x;
+      if (sat[i]! > 0.2 && val[i]! > 0.12) bins[Math.min(35, Math.floor(hue[i]! / 10))]! += 1;
+    }
+  let mode = 0;
+  for (let b = 1; b < 36; b++) if (bins[b]! > bins[mode]!) mode = b;
+  // The cloth must be the bulk of the quad (balls, pockets and shadows are the rest).
+  if (n === 0 || bins[mode]! + (bins[(mode + 35) % 36] ?? 0) + (bins[(mode + 1) % 36] ?? 0) < n * 0.35) return null;
+  const centre = mode * 10 + 5;
+  let sx = 0;
+  let sy = 0;
+  const ss: number[] = [];
+  const vs: number[] = [];
+  for (let y = y0; y <= y1; y += step)
+    for (let x = x0; x <= x1; x += step) {
+      if (!inside(x + 0.5, y + 0.5)) continue;
+      const i = y * w + x;
+      if (sat[i]! > 0.2 && val[i]! > 0.12 && hueDiff(hue[i]!, centre) < 20) {
+        const a = (hue[i]! * Math.PI) / 180;
+        sx += Math.cos(a);
+        sy += Math.sin(a);
+        ss.push(sat[i]!);
+        vs.push(val[i]!);
+      }
+    }
+  ss.sort((a, b) => a - b);
+  vs.sort((a, b) => a - b);
+  let mh = (Math.atan2(sy, sx) * 180) / Math.PI;
+  if (mh < 0) mh += 360;
+  return { hue: mh, sat: ss[ss.length >> 1] ?? 0.5, val: vs[vs.length >> 1] ?? 0.5 };
+}
+
 /** Andrew's monotone chain convex hull (counter-clockwise in a y-up sense). */
 export function convexHull(pts: Vec2[]): Vec2[] {
   const p = [...pts].sort((a, b) => a.x - b.x || a.y - b.y);
