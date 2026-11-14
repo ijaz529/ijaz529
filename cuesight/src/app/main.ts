@@ -8,8 +8,9 @@ import { powerToSpeed, speedReference } from '../core/shot/power';
 import { POCKET_NAMES, clampToTable } from '../core/table';
 import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, StrokeRisk, TableLayout, Vec2 } from '../core/types';
 import { dist } from '../core/vec';
-import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut, type VisionOut } from '../workers/protocol';
-import { FrameGrabber, describeCameraError, startCamera, stopCamera } from './camera';
+import { PROTOCOL_VERSION, type VisionOut } from '../workers/protocol';
+import { applyH, invert3 } from '../vision/homography';
+import { FrameGrabber, createCameraSession, describeCameraError } from './camera';
 import { DRILLS, cueBall, objectBall } from './drills';
 import { Overlay, containMapping, type OverlayData } from './render/overlay';
 import { rgbCss } from './render/palette';
@@ -18,6 +19,30 @@ import { loadSettings, physicsFor, saveSettings, tableFor, type Settings } from 
 import { createAnnouncer } from './announce';
 import { perspectivePocketNames, shooterPocketNames } from './pocket-names';
 import { createStore, type AppState, type Mode } from './store';
+import {
+  applyCueOverride,
+  bedPointFromProjection,
+  calibrationFeedback,
+  cameraHint,
+  clearSelection,
+  cornersPlausible,
+  explicitMode,
+  framesMatch,
+  liveGate,
+  nextSinceLocked,
+  pickNextAllowed,
+  pillMeta,
+  pillText,
+  probeCamera,
+  startMode,
+  tableSettingsChanged,
+  trackSelection,
+  unfreezeSelection,
+  visionConfigChanged,
+  CALIBRATION_MESSAGES,
+  STATUS_TEXT,
+} from './live-logic';
+import { createPlannerClient, recommendationOutcome, watchWorker } from './planner-client';
 import { createTable3D, type CameraPreset, type FrameInfo, type Pick3D, type Scene3DData, type Table3D } from './render3d';
 import { landscapeFrame } from './render3d/camera';
 import { createSnapController } from './snap/controller';
@@ -39,8 +64,10 @@ const settings = loadSettings();
 const table = tableFor(settings);
 const params = new URLSearchParams(location.search);
 const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
-const modeParam = params.get('mode');
-const initialMode: Mode = modeParam === 'practice' || modeParam === 'camera' || modeParam === 'snap' ? modeParam : coarse ? 'camera' : 'practice';
+// ?mode= wins; otherwise touch devices start in Live and desktops in Practice. A touch device without
+// a camera (iOS Simulator) is told apart at start-up with enumerateDevices(), before any getUserMedia.
+const modeOverride = explicitMode(params.get('mode'));
+const initialMode: Mode = modeOverride ?? startMode(coarse, null);
 const reducedMotion = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const store = createStore({
@@ -52,6 +79,8 @@ const store = createStore({
   vision: null,
   frozen: null,
   targetId: null,
+  targetMem: null,
+  cueMem: null,
   pocketId: null,
   strokeMode: 'recommended',
   myStroke: { power: 4, side: 0, vert: 0 },
@@ -81,7 +110,9 @@ const practiceView = new TableView($<HTMLCanvasElement>('#table'));
 const miniView = new TableView($<HTMLCanvasElement>('#minimap'));
 const card = $<HTMLElement>('#shot-card');
 const sugEl = $<HTMLElement>('#suggestions');
-const statusPill = $<HTMLElement>('#status');
+const statusPill = $<HTMLElement>('#status-pill');
+const statusText = $<HTMLElement>('#status');
+const statusMeta = $<HTMLElement>('#status-meta');
 const camMsg = $<HTMLElement>('#camera-msg');
 const toastEl = $<HTMLElement>('#toast');
 const settingsDlg = $<HTMLDialogElement>('#settings');
@@ -147,7 +178,7 @@ function sync3D(): void {
     view3d = createTable3D(
       canvas3d,
       {
-        onTap: (p) => on3DTap(p),
+        onTap: (p, ev) => on3DTap(p, ev),
         onBallDrag: (id, pos, phase) => moveBall(id, pos, phase),
         onCameraChange: (p) => {
           cameraPreset = p;
@@ -250,14 +281,16 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(queueInsets).observ
 // ---------------------------------------------------------------------------------------------
 // Layout helpers
 // ---------------------------------------------------------------------------------------------
+/** The live table may be planned on and drawn (locked, with a short grace after a lock; Constitution II). */
+function liveOpen(): boolean {
+  return !!S.vision && liveGate(S.vision.status, S.vision.sinceLocked, !!S.vision.calibration);
+}
+
 function cameraLayout(): TableLayout | null {
   if (S.frozen) return S.frozen.layout;
-  if (!S.vision || !S.vision.calibration) return null;
-  const balls: Ball[] = S.vision.balls.map((b) => ({ ...b }));
-  if (S.cueOverrideId && balls.some((b) => b.id === S.cueOverrideId)) {
-    for (const b of balls) b.kind = b.id === S.cueOverrideId ? 'cue' : 'object';
-  }
-  return { table: S.table, balls, source: 'camera', frozen: false };
+  if (!S.vision || !liveOpen()) return null;
+  const live: TableLayout = { table: S.table, balls: S.vision.balls, source: 'camera', frozen: false };
+  return S.cueOverrideId ? applyCueOverride(live, S.cueOverrideId) : { ...live, balls: live.balls.map((b) => ({ ...b })) };
 }
 
 /** Snap's confirmed (editable) layout from the table photo. */
@@ -360,64 +393,63 @@ function toast(msg: string, ms = 2600): void {
 // ---------------------------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------------------------
-let planner: Worker | null = null;
-let reqId = 0;
-const latest: Record<string, number> = {};
-
-function plannerWorker(): Worker {
-  if (!planner) {
-    planner = new Worker(new URL('../workers/planner.worker.ts', import.meta.url), { type: 'module' });
-    planner.onmessage = (ev: MessageEvent<PlannerOut>) => onPlanner(ev.data);
-  }
-  return planner;
-}
-
-function send(kind: 'recommend' | 'suggest' | 'heatmap', msg: Omit<PlannerIn, 'v' | 'id'>): number {
-  const id = ++reqId;
-  latest[kind] = id;
-  plannerWorker().postMessage({ ...msg, v: PROTOCOL_VERSION, id } as PlannerIn);
-  return id;
-}
-
-function onPlanner(m: PlannerOut): void {
-  if (m.type === 'recommendation') {
-    if (m.id !== latest.recommend) return; // stale
+// Requests, staleness and failures live in planner-client.ts; the app only applies accepted replies,
+// and only to the request still open in the state (the key / pending flag it was made for).
+const planner = createPlannerClient({
+  createWorker: () => new Worker(new URL('../workers/planner.worker.ts', import.meta.url), { type: 'module' }),
+  onRecommendation(key, m) {
+    let msg: string | null = null;
     store.update((s) => {
-      if (!s.recommended) return;
-      s.recommended = { ...s.recommended, stroke: Number.isFinite(m.score) ? m.stroke : null, pending: false, reachable: m.reachable, evaluated: m.evaluated, risks: m.risks ?? [] };
-      if (s.landing && !m.reachable) toast('That spot can’t be reached safely — showing the closest safe stroke.');
+      if (!s.recommended || s.recommended.key !== key || !s.recommended.pending) return;
+      const out = recommendationOutcome(m, !!s.landing);
+      s.recommended = { ...s.recommended, stroke: out.stroke, pending: false, reachable: m.reachable, evaluated: m.evaluated, risks: m.risks ?? [] };
+      msg = out.toast;
     });
+    if (msg) toast(msg, 3600);
     replan();
-  } else if (m.type === 'suggestions') {
-    if (m.id !== latest.suggest) return;
-    store.update((s) => (s.suggestions = { items: m.items, pending: false }));
-  } else if (m.type === 'heatmap') {
-    if (m.id !== latest.heatmap) return;
-    store.update((s) => s.heatmap && (s.heatmap = { ...s.heatmap, cols: m.cols, rows: m.rows, values: m.values, pending: false }));
-  } else if (m.type === 'error') {
-    console.warn('planner error', m.message);
-  }
-}
+  },
+  onSuggestions(m) {
+    store.update((s) => s.suggestions?.pending && (s.suggestions = { items: m.items, pending: false }));
+  },
+  onHeatmap(m) {
+    store.update((s) => s.heatmap?.pending && (s.heatmap = { ...s.heatmap, cols: m.cols, rows: m.rows, values: m.values, pending: false }));
+  },
+  onFailure(kind, key, message) {
+    console.warn('planner failed', kind, message);
+    if (kind === 'recommend') {
+      // Keep the key: the same inputs are not retried in a loop; any change asks again.
+      store.update((s) => {
+        if (s.recommended && s.recommended.key === key && s.recommended.pending) s.recommended = { ...s.recommended, stroke: null, pending: false };
+      });
+      replan();
+    } else if (kind === 'suggest') {
+      if (!S.suggestions?.pending) return;
+      store.update((s) => (s.suggestions = null));
+      toast('Couldn’t work out the best shots — try again.');
+    } else {
+      if (!S.heatmap?.pending) return;
+      store.update((s) => (s.heatmap = null));
+      toast('Couldn’t work out the zones — try again.');
+    }
+  },
+});
 
 function layoutKey(l: TableLayout): string {
   return l.balls.map((b) => `${b.id}:${Math.round(b.pos.x * 200)},${Math.round(b.pos.y * 200)}:${b.kind}`).join('|');
 }
 
-let recTimer = 0;
 function requestRecommendation(layout: TableLayout): void {
   if (!S.targetId) return;
   const key = `${layoutKey(layout)}#${S.targetId}#${S.pocketId}#${S.landing ? `${S.landing.x.toFixed(2)},${S.landing.y.toFixed(2)}` : ''}#${JSON.stringify(S.params)}`;
   if (S.recommended?.key === key) return;
   store.update((s) => (s.recommended = { key, stroke: null, pending: true, reachable: true, evaluated: 0 }));
-  window.clearTimeout(recTimer);
-  recTimer = window.setTimeout(() => {
-    send('recommend', {
-      type: 'recommend',
-      layout,
-      request: { targetId: S.targetId!, ...(S.pocketId ? { pocketId: S.pocketId } : {}), ...(S.landing ? { landing: S.landing } : {}) },
-      params: S.params,
-    } as Omit<PlannerIn, 'v' | 'id'>);
-  }, 180);
+  // The request is fixed now (debounced in the client): a later tap supersedes it, never rewrites it.
+  planner.recommend(key, {
+    type: 'recommend',
+    layout,
+    request: { targetId: S.targetId, ...(S.pocketId ? { pocketId: S.pocketId } : {}), ...(S.landing ? { landing: S.landing } : {}) },
+    params: S.params,
+  });
 }
 
 function replan(): void {
@@ -451,12 +483,24 @@ function replan(): void {
 // Selection & interactions (shared by the 3D/2D table, the mini-map, the AR overlay and Snap)
 // ---------------------------------------------------------------------------------------------
 function selectBall(b: Ball): void {
+  if (S.interaction === 'position') {
+    // Position mode places the landing spot: a tap near a ball never changes the target.
+    toast('Tap the cloth where the cue ball should stop (tap Position again to cancel).');
+    return;
+  }
   if (S.interaction === 'mark-cue') {
     if (S.mode === 'camera') {
       store.update((s) => {
         s.cueOverrideId = b.id;
+        s.cueMem = { id: b.id, pos: b.pos, ...(b.label ? { label: b.label } : {}) };
+        // A frozen layout is what is planned on: the marked cue ball must change it too.
+        if (s.frozen) s.frozen = { ...s.frozen, layout: applyCueOverride(s.frozen.layout, b.id) };
         s.interaction = 'select';
-        if (s.targetId === b.id) s.targetId = null;
+        if (s.targetId === b.id) {
+          s.targetId = null;
+          s.targetMem = null;
+        }
+        s.recommended = null;
       });
     } else {
       store.update((s) => {
@@ -476,6 +520,8 @@ function selectBall(b: Ball): void {
     return;
   }
   if (S.interaction === 'pick-next') {
+    // The next ball: neither the cue ball nor the one being potted (they have no "next shot" map).
+    if (!pickNextAllowed(b, S.targetId)) return toast('Pick a different object ball to play next.');
     requestHeatmap(b.id);
     return;
   }
@@ -483,15 +529,21 @@ function selectBall(b: Ball): void {
     toast('That’s the cue ball — tap the ball you want to pocket.');
     return;
   }
+  // Live, no cue ball found (spec 001 edge case): ask for it first, keeping the ball tapped as the target.
+  const shown = S.mode === 'camera' ? currentLayout() : null;
+  const noCue = !!shown && !shown.balls.some((x) => x.kind === 'cue');
   store.update((s) => {
     if (s.targetId !== b.id) {
       s.targetId = b.id;
+      s.targetMem = s.mode === 'camera' ? { id: b.id, pos: b.pos, ...(b.label ? { label: b.label } : {}) } : null;
       s.pocketId = null;
       s.landing = null;
       s.recommended = null;
       s.strokeMode = 'recommended';
     }
+    if (noCue) s.interaction = 'mark-cue';
   });
+  if (noCue) toast('I can’t find the cue ball — tap it first.', 3600);
   replan();
 }
 
@@ -531,7 +583,7 @@ function requestHeatmap(nextBallId: string): void {
     s.interaction = 'select';
     s.heatmap = { nextBallId, cols: 48, rows: 24, values: new Float32Array(48 * 24), pending: true };
   });
-  send('heatmap', { type: 'heatmap', layout, nextBallId, excludeIds: S.targetId ? [S.targetId] : [], params: S.params, cols: 48, rows: 24 } as Omit<PlannerIn, 'v' | 'id'>);
+  planner.send('heatmap', { type: 'heatmap', layout, nextBallId, excludeIds: S.targetId ? [S.targetId] : [], params: S.params, cols: 48, rows: 24 });
   toast(`Bright zones = easy shot on ${labelOf(nextBallId)} next.`);
 }
 
@@ -560,17 +612,22 @@ function moveBall(id: string, to: Vec2, phase: 'start' | 'move' | 'end' = 'move'
 }
 
 // 3D table taps: the same selection flow as the 2D table (FR-105).
-function on3DTap(p: Pick3D): void {
+function on3DTap(p: Pick3D, ev?: PointerEvent): void {
   if (!p) return;
   const layout = currentLayout();
   if (!layout) return;
+  if (S.interaction === 'position') {
+    // Every tap on the bed is a landing spot, even next to (or over) a ball.
+    const v = view3d;
+    const bed = v && ev ? bedPointFromProjection((q) => v.toScreen(q), { x: S.table.length / 2, y: S.table.width / 2 }, { x: ev.clientX, y: ev.clientY }) : null;
+    const spot = bed ?? (p.kind === 'cloth' ? p.pos : p.kind === 'pocket' ? S.table.pockets.find((q) => q.id === p.id)!.mouthCenter : null);
+    if (spot) tableTap(spot);
+    return;
+  }
   if (p.kind === 'ball') {
     const b = layout.balls.find((x) => x.id === p.id);
     if (b) selectBall(b);
-  } else if (p.kind === 'pocket') {
-    if (S.interaction !== 'position') selectPocket(p.id);
-    else tableTap(S.table.pockets.find((q) => q.id === p.id)!.mouthCenter);
-  } else tableTap(p.pos);
+  } else if (p.kind === 'pocket') selectPocket(p.id);
 }
 
 // 2D table (fallback): tap to select, drag to move balls.
@@ -598,7 +655,8 @@ function on3DTap(p: Pick3D): void {
   });
   canvas.addEventListener('pointerup', (e) => {
     const q = local(e);
-    if (drag && !drag.moved) {
+    if (drag && !drag.moved && S.interaction === 'position') tableTap(practiceView.toTable(q));
+    else if (drag && !drag.moved) {
       const b = currentLayout()?.balls.find((x) => x.id === drag!.id);
       if (b) selectBall(b);
     } else if (!drag) {
@@ -616,17 +674,18 @@ miniView.canvas.addEventListener('click', (e) => {
   const q = { x: e.clientX - r.left, y: e.clientY - r.top };
   const layout = currentLayout();
   if (!layout) return;
+  if (S.interaction === 'position') return tableTap(miniView.toTable(q));
   const b = miniView.ballAt(q, layout.balls);
   if (b) return selectBall(b);
   const pk = miniView.pocketAt(q);
-  if (pk && S.interaction !== 'position') return selectPocket(pk);
-  tableTap(miniView.toTable(q));
+  if (pk) selectPocket(pk);
 });
 
 // AR overlay taps.
 function overlayData(): OverlayData {
   const layout = currentLayout();
-  const cal = S.frozen ? (S.frozen.calibration && liveMatchesFrozen() ? S.vision!.calibration : null) : (S.vision?.calibration ?? null);
+  // Live: only a locked table is drawn (and hit-tested), so no stale pocket targets from old corners.
+  const cal = S.frozen ? (S.frozen.calibration && liveMatchesFrozen() ? S.vision!.calibration : null) : liveOpen() ? S.vision!.calibration : null;
   return {
     table: S.table,
     calibration: cal,
@@ -650,20 +709,35 @@ overlay.canvas.addEventListener('click', (e) => {
     const f = map.toFrame(tap);
     store.update((s) => s.calibTaps.push(f));
     if (S.calibTaps.length === 4) {
+      if (!cornersPlausible(S.calibTaps, frameSize.w, frameSize.h)) {
+        store.update((s) => (s.calibTaps = []));
+        toast(CALIBRATION_MESSAGES.badQuad, 4000);
+        return;
+      }
       store.update((s) => {
         s.manualCorners = s.calibTaps.slice();
         s.calibTaps = [];
         s.interaction = 'select';
       });
-      configureVision();
-      toast('Calibrated from your four corners.');
+      // Confirmed (or refused) by the first vision result computed with these corners (onVision).
+      const cleared = tableFrameChanged();
+      manualCheckFrom = frameId + 1;
+      toast(cleared ? 'Corners set — checking… The selection was cleared: the table frame changed.' : 'Corners set — checking…', 4000);
     } else toast(`Corner ${S.calibTaps.length}/4 — tap the next corner of the cloth.`);
     return;
   }
-  const hit = Overlay.hitTest(tap, overlayData(), map);
+  const d = overlayData();
+  if (S.interaction === 'position') {
+    // Every tap is a landing spot (the cloth point under it), even next to a ball.
+    if (d.calibration) {
+      const f = map.toFrame(tap);
+      tableTap(applyH(invert3(d.calibration.HR), f.x, f.y));
+    }
+    return;
+  }
+  const hit = Overlay.hitTest(tap, d, map);
   if (hit.ball) selectBall(hit.ball);
-  else if (hit.pocket && S.interaction !== 'position') selectPocket(hit.pocket);
-  else if (hit.table) tableTap(hit.table);
+  else if (hit.pocket) selectPocket(hit.pocket);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -675,59 +749,110 @@ let frameId = 0;
 let cameraOn = false;
 const grabber = new FrameGrabber(640);
 let frameSize = { w: 640, h: 480 };
+/** Consecutive live-frame `error` replies (3 in a row: detection is not working). */
+let visionErrors = 0;
+/** Table-frame generation: bumped by every vision config that rebuilds the tracker (new ball ids). */
+let frameGen = 0;
+/** Manual corners were just sent: the first result for a frame id ≥ this confirms or refuses them. */
+let manualCheckFrom: number | null = null;
+let lastReason = '';
+const VISION_FAILED = 'Table detection couldn’t start — it may not be available offline yet. Reconnect and tap “Try again”, or use the practice table.';
 
 function visionWorker(): Worker {
   if (!vision) {
-    vision = new Worker(new URL('../workers/vision.worker.ts', import.meta.url), { type: 'module' });
-    vision.onmessage = (ev: MessageEvent<VisionOut>) => onVision(ev.data);
-    vision.onerror = (ev) => console.warn('vision worker error', ev.message);
+    const w = new Worker(new URL('../workers/vision.worker.ts', import.meta.url), { type: 'module' });
+    vision = w;
+    w.onmessage = (ev: MessageEvent<VisionOut>) => onVision(ev.data);
+    watchWorker(w, (msg) => {
+      if (vision === w) visionFailed(msg);
+    });
+    frameGen++; // a new worker is a new tracker: ids start again
     configureVision();
   }
   return vision;
+}
+
+/** The vision worker cannot run (script not available offline, crashed): say so instead of waiting forever. */
+function visionFailed(message: string): void {
+  console.warn('vision worker failed', message);
+  try {
+    vision?.terminate();
+  } catch {
+    /* already gone */
+  }
+  vision = null; // recreated by "Try again" or by entering Live again
+  visionErrors = 0;
+  if (S.mode !== 'camera') return;
+  leaveCamera(); // without detection the camera has nothing to do
+  store.update((s) => {
+    s.cameraError = VISION_FAILED;
+    s.vision = null;
+  });
 }
 
 function configureVision(): void {
   vision?.postMessage({ v: PROTOCOL_VERSION, type: 'config', table: S.table, fovDeg: S.settings.fovDeg, manualCorners: S.manualCorners, swapAxes: S.swapAxes });
 }
 
-function liveMatchesFrozen(): boolean {
-  const a = S.frozen?.calibration?.corners;
-  const b = S.vision?.calibration?.corners;
-  if (!a || !b || S.vision?.status !== 'locked') return false;
-  const diag = Math.hypot(S.vision.frameW, S.vision.frameH);
-  return a.every((p) => b.some((q) => Math.hypot(p.x - q.x, p.y - q.y) < 0.03 * diag));
+/**
+ * Sends the vision config after a change of the table frame (Rotate, corners set or cleared, another
+ * table or field of view). The tracker restarts its ball ids, so a live selection no longer means the
+ * same balls: it is cleared (a frozen snapshot keeps its own ids; unfreezing checks `frameGen`).
+ * Returns whether something the player had selected was cleared.
+ */
+function tableFrameChanged(): boolean {
+  frameGen++;
+  configureVision();
+  if (S.mode !== 'camera' || S.frozen) return false;
+  let cleared = false;
+  store.update((s) => (cleared = clearSelection(s)));
+  planner.cancel('recommend');
+  planner.cancel('suggest');
+  planner.cancel('heatmap');
+  return cleared;
 }
 
+function liveMatchesFrozen(): boolean {
+  if (S.vision?.status !== 'locked') return false;
+  return framesMatch(S.frozen?.calibration?.corners, S.vision.calibration?.corners, Math.hypot(S.vision.frameW, S.vision.frameH));
+}
+
+const camSession = createCameraSession(video);
 async function enterCamera(): Promise<void> {
   if (cameraOn) return;
-  try {
-    const stream = await startCamera(video);
-    if (S.mode !== 'camera') {
-      stopCamera(video);
-      return;
-    }
-    cameraOn = true;
-    store.update((s) => (s.cameraError = null));
-    // The camera can stop under us (another app took it, permission revoked): say so.
-    stream.getVideoTracks()[0]?.addEventListener('ended', () => {
-      if (!cameraOn) return;
-      cameraOn = false;
-      store.update((s) => (s.cameraError = 'The camera stopped. Tap “Try again”, or use the practice table.'));
-    });
-    visionWorker();
-    pump();
-  } catch (e) {
-    store.update((s) => (s.cameraError = describeCameraError(e, isNativeShell())));
+  const r = await camSession.start();
+  if (r.kind === 'stale') return; // Live was left (or restarted) while the camera was starting
+  if (r.kind === 'error') {
+    if (S.mode === 'camera') store.update((s) => (s.cameraError = describeCameraError(r.error, isNativeShell())));
+    return;
   }
+  if (S.mode !== 'camera') {
+    camSession.stop();
+    return;
+  }
+  if (cameraOn) return; // the second caller of the same start
+  cameraOn = true;
+  store.update((s) => (s.cameraError = null));
+  // The camera can stop under us (another app took it, permission revoked): say so.
+  r.stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+    if (!cameraOn || camSession.stream() !== r.stream) return;
+    leaveCamera();
+    store.update((s) => (s.cameraError = 'The camera stopped. Tap “Try again”, or use the practice table.'));
+  });
+  visionWorker();
+  if (!pumpRaf) pump();
 }
 
 function leaveCamera(): void {
   cameraOn = false;
   inFlight = false;
-  stopCamera(video);
+  camSession.stop();
 }
 
+/** One frame-grab loop at a time (a second start must not add a second rAF chain). */
+let pumpRaf = 0;
 function pump(): void {
+  pumpRaf = 0;
   if (!cameraOn) return;
   if (!inFlight && vision && video.readyState >= 2) {
     const f = grabber.grab(video);
@@ -737,7 +862,7 @@ function pump(): void {
       vision.postMessage({ v: PROTOCOL_VERSION, type: 'frame', id: ++frameId, width: f.width, height: f.height, buffer: f.buffer }, [f.buffer]);
     }
   }
-  requestAnimationFrame(pump);
+  pumpRaf = requestAnimationFrame(pump);
 }
 
 let lastVisionKey = '';
@@ -747,9 +872,11 @@ function onVision(m: VisionOut): void {
   inFlight = false;
   if (m.type === 'error') {
     console.warn('vision error', m.message);
+    if (++visionErrors >= 3) visionFailed(m.message);
     return;
   }
   if (m.type !== 'result' || S.mode !== 'camera') return;
+  visionErrors = 0;
   const r = m.result;
   const balls: Ball[] = r.balls.map((b) => ({
     id: b.id,
@@ -760,16 +887,60 @@ function onVision(m: VisionOut): void {
     stripe: b.label.includes('stripe'),
     confidence: b.confidence,
   }));
+  const prev = S.vision?.balls;
+  const sinceLocked = nextSinceLocked(S.vision?.sinceLocked ?? Infinity, r.status);
   store.update((s) => {
-    s.vision = { status: r.status, calibration: r.calibration, balls, quality: r.quality, ms: r.ms, frameW: frameSize.w, frameH: frameSize.h };
+    s.vision = { status: r.status, calibration: r.calibration, balls, quality: r.quality, ms: r.ms, frameW: frameSize.w, frameH: frameSize.h, sinceLocked };
+    if (s.frozen) return;
+    // Tracker ids are volatile (an occlusion re-issues one): keep the marked cue ball and the target
+    // on the same physical balls, re-binding a lost id to a new track at the same spot.
+    const R = s.table.ballRadius;
+    const c = trackSelection(s.cueOverrideId, s.cueMem, prev, balls, R, { allowCue: true, exclude: [s.targetId] });
+    s.cueOverrideId = c.id;
+    s.cueMem = c.mem;
+    const seen = c.id ? applyCueOverride({ table: s.table, balls, source: 'camera', frozen: false }, c.id).balls : balls;
+    const t = trackSelection(s.targetId, s.targetMem, prev, seen, R, { exclude: [c.id] });
+    s.targetId = t.id;
+    s.targetMem = t.mem;
   });
+  checkManualCorners(m.id, r);
   if (!S.frozen) {
-    const key = balls.map((b) => `${b.id}:${Math.round(b.pos.x * 100)},${Math.round(b.pos.y * 100)}`).join('|');
+    // Replan when the balls move or the lock gate opens/closes (no plan on an unlocked table).
+    const key = `${liveOpen() ? 'open' : 'shut'}|${balls.map((b) => `${b.id}:${Math.round(b.pos.x * 100)},${Math.round(b.pos.y * 100)}`).join('|')}`;
     if (key !== lastVisionKey) {
       lastVisionKey = key;
       replan();
     }
   }
+}
+
+/** Says whether the four tapped corners worked, from the first result computed with them (not before). */
+function checkManualCorners(id: number, r: Extract<VisionOut, { type: 'result' }>['result']): void {
+  if (!S.manualCorners) {
+    manualCheckFrom = null;
+    return;
+  }
+  // `reason` is an optional field of newer vision pipelines ('bad-quad', 'cloth-unknown', 'moved').
+  const reason = 'reason' in r && typeof r.reason === 'string' ? r.reason : '';
+  if (manualCheckFrom !== null) {
+    if (id < manualCheckFrom) return; // a frame sent before the corners
+    const fb = calibrationFeedback({ status: r.status, calibration: r.calibration, cloth: r.cloth, reason });
+    if (!fb) return;
+    manualCheckFrom = null;
+    lastReason = reason;
+    toast(fb.message, 4000);
+    if (fb.retry) {
+      store.update((s) => {
+        s.manualCorners = null;
+        s.calibTaps = [];
+        s.interaction = 'calibrate';
+      });
+      tableFrameChanged();
+    }
+    return;
+  }
+  if (reason === 'moved' && lastReason !== 'moved') toast(CALIBRATION_MESSAGES.moved, 4000);
+  lastReason = reason;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -791,8 +962,15 @@ function setMode(mode: Mode, initial = false): void {
     s.heatmap = null;
     s.interaction = 'select';
     s.toast = null;
+    s.cueOverrideId = null;
+    s.targetMem = null;
+    s.cueMem = null;
+    // Entering Live: an old result (calibration, balls) is not shown as current until a new one arrives.
+    if (mode === 'camera' && prev !== 'camera') s.vision = null;
     if (mode !== 'snap') s.snap = snapReducer(s.snap, { type: 'reset' });
   });
+  for (const k of ['recommend', 'suggest', 'heatmap'] as const) planner.cancel(k);
+  if (mode === 'camera') lastVisionKey = '';
   document.body.dataset.mode = mode;
   if (mode === 'camera') void enterCamera();
   else leaveCamera();
@@ -811,25 +989,36 @@ function setMode(mode: Mode, initial = false): void {
 const actions = {
   freeze() {
     if (S.frozen) {
-      store.update((s) => (s.frozen = null));
-      toast('Live again.');
+      const fr = S.frozen;
+      let cleared = false;
+      store.update((s) => {
+        s.frozen = null;
+        if (fr.gen !== frameGen) cleared = clearSelection(s); // Rotate / Calibrate while frozen: other ids now
+        else unfreezeSelection(s, fr.layout, s.table.ballRadius);
+      });
+      lastVisionKey = '';
+      toast(cleared ? 'Live again. The selection was cleared: the table frame changed.' : 'Live again.');
     } else {
       const l = cameraLayout();
       if (!l || !S.vision?.calibration) return toast('Point at the table first — nothing to freeze yet.');
-      store.update((s) => (s.frozen = { layout: { ...l, frozen: true }, calibration: s.vision!.calibration }));
+      store.update((s) => (s.frozen = { layout: { ...l, frozen: true }, calibration: s.vision!.calibration, gen: frameGen }));
       toast('Layout frozen — move freely; the plan stays on the map.');
     }
     replan();
   },
   calibrate() {
     if (S.manualCorners || S.interaction === 'calibrate') {
+      const hadCorners = !!S.manualCorners;
       store.update((s) => {
         s.manualCorners = null;
         s.calibTaps = [];
         s.interaction = 'select';
       });
-      configureVision();
-      toast('Back to automatic table detection.');
+      manualCheckFrom = null;
+      // Only dropping real corners changes the table frame (and so the vision config).
+      const cleared = hadCorners && tableFrameChanged();
+      toast(cleared ? 'Back to automatic table detection. The selection was cleared: the table frame changed.' : 'Back to automatic table detection.');
+      replan();
       return;
     }
     store.update((s) => {
@@ -840,19 +1029,23 @@ const actions = {
   },
   swapAxes() {
     store.update((s) => (s.swapAxes = !s.swapAxes));
-    configureVision();
-    toast('Swapped long and short rails.');
+    const cleared = tableFrameChanged();
+    toast(cleared ? 'Swapped long and short rails. The selection was cleared: the table frame changed.' : 'Swapped long and short rails.');
+    replan();
   },
   markCue() {
     store.update((s) => (s.interaction = s.interaction === 'mark-cue' ? 'select' : 'mark-cue'));
     if (S.interaction === 'mark-cue') toast('Tap the cue ball.');
   },
   suggest() {
-    if (S.suggestions) return store.update((s) => (s.suggestions = null));
+    if (S.suggestions) {
+      planner.cancel('suggest'); // a reply still on its way is not shown after closing
+      return store.update((s) => (s.suggestions = null));
+    }
     const layout = currentLayout();
     if (!layout) return toast('No table yet.');
     store.update((s) => (s.suggestions = { items: [], pending: true }));
-    send('suggest', { type: 'suggest', layout, params: S.params, max: 3 } as Omit<PlannerIn, 'v' | 'id'>);
+    planner.send('suggest', { type: 'suggest', layout, params: S.params, max: 3 });
   },
   position() {
     if (S.landing) {
@@ -869,6 +1062,7 @@ const actions = {
   },
   zones() {
     if (S.heatmap || S.interaction === 'pick-next') {
+      planner.cancel('heatmap');
       store.update((s) => {
         s.heatmap = null;
         s.interaction = 'select';
@@ -1067,11 +1261,14 @@ const snapCtl = createSnapController($<HTMLElement>('#snap'), {
 buildSettings(settingsDlg, () => S.settings, (next: Settings) => {
   saveSettings(next);
   const t = tableFor(next);
-  const tableChanged = next.table !== S.settings.table || next.cushionWidthCm !== S.settings.cushionWidthCm;
+  const tableChanged = tableSettingsChanged(S.settings, next);
+  // Only camera-relevant changes reconfigure vision: every config rebuilds the tracker (new ball ids).
+  const visionChanged = visionConfigChanged(S.settings, next);
   if (tableChanged && S.mode === 'snap' && S.snap.step !== 'intro') {
     snapCtl.leave();
     toast('New table size: take the table photo again.');
   }
+  let cleared = false;
   store.update((s) => {
     s.settings = next;
     s.params = physicsFor(next);
@@ -1079,12 +1276,12 @@ buildSettings(settingsDlg, () => S.settings, (next: Settings) => {
     if (tableChanged) {
       s.table = t;
       s.practice = { table: t, balls: DRILLS[0]!.build(t), source: 'virtual', frozen: false };
-      s.targetId = null;
-      s.pocketId = null;
+      cleared = clearSelection(s) && s.mode === 'camera';
       s.frozen = null;
     }
   });
-  configureVision();
+  if (visionChanged) cleared = tableFrameChanged() || cleared;
+  if (cleared) toast('Selection cleared — the table frame changed.');
   sync3D();
   queueInsets();
   replan();
@@ -1098,7 +1295,6 @@ $<HTMLButtonElement>('#btn-retry-camera').addEventListener('click', () => void e
 // ---------------------------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------------------------
-const STATUS_TEXT = { searching: 'Looking for the table…', unstable: 'Table found — hold steady', locked: 'Table locked' } as const;
 
 /** HSV cloth model (from the Snap table photo) → an sRGB cloth colour for the 3D table. */
 function clothRgbOf(c: { hue: number; sat: number; val: number } | null | undefined): [number, number, number] | undefined {
@@ -1171,9 +1367,14 @@ function render(s: AppState): void {
   }
   if (s.mode === 'camera') {
     const live = s.vision;
-    const status = s.frozen ? 'Frozen layout' : live ? STATUS_TEXT[live.status] : 'Starting camera…';
-    statusPill.textContent = `${status}${live && !s.frozen ? ` · ${live.balls.length} balls · ${Math.round(live.ms)} ms` : ''}`;
-    statusPill.dataset.status = s.frozen ? 'frozen' : (live?.status ?? 'searching');
+    // The polite live region carries the lock state only, rewritten only when it changes; the
+    // per-frame counters sit beside it, hidden from assistive tech.
+    setText(statusText, pillText(live?.status ?? null, !!s.frozen));
+    const meta = pillMeta(live, !!s.frozen);
+    setText(statusMeta, meta);
+    if (statusMeta.hidden !== !meta) statusMeta.hidden = !meta;
+    const st = s.frozen ? 'frozen' : (live?.status ?? 'searching');
+    if (statusPill.dataset.status !== st) statusPill.dataset.status = st;
     camMsg.hidden = !s.cameraError;
     camMsg.querySelector('p')!.textContent = s.cameraError ?? '';
     overlay.draw(overlayData(), frameMapping());
@@ -1182,13 +1383,23 @@ function render(s: AppState): void {
   }
   if (s.mode === 'snap') snapCtl.render(s);
   viewControls.update(cameraPreset, !!s.plan && tableStageOn(s), !!view3d?.isPlaying());
+  const camHint =
+    s.mode === 'camera'
+      ? cameraHint({
+          error: !!s.cameraError,
+          status: s.vision?.status ?? null,
+          live: liveOpen(),
+          frozen: !!s.frozen,
+          balls: layout?.balls.length ?? 0,
+          hasCue: !!layout?.balls.some((b) => b.kind === 'cue'),
+          interaction: s.interaction,
+        })
+      : null;
   const hint =
     s.mode === 'snap'
       ? snapHint(s)
-      : s.mode === 'camera' && s.cameraError
-        ? 'The camera is off. Use photos (Snap) or the practice table instead.'
-        : s.mode === 'camera' && (!s.vision || s.vision.status === 'searching')
-        ? 'Point the camera at the table so the whole cloth is in view.'
+      : camHint !== null
+        ? camHint
         : s.interaction === 'calibrate'
           ? 'Tap the 4 corners where the cloth meets the rails.'
           : s.targetId
@@ -1235,8 +1446,12 @@ function render(s: AppState): void {
   });
   const rec = s.recommended?.stroke ?? null;
   strokeControls.update(s.plan?.stroke ?? s.myStroke, s.strokeMode === 'mine', rec);
-  toastEl.textContent = s.toast ?? '';
-  toastEl.hidden = !s.toast;
+  setText(toastEl, s.toast ?? '');
+  if (toastEl.hidden !== !s.toast) toastEl.hidden = !s.toast;
+}
+/** Writes only on change: a live region rewritten with the same text is announced again by some readers. */
+function setText(el: HTMLElement, text: string): void {
+  if (el.textContent !== text) el.textContent = text;
 }
 store.subscribe(render);
 
@@ -1345,12 +1560,18 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator && !nativeShell && (loc
 
 sync3D();
 update3DInsets();
-setMode(initialMode, true);
-mountOnboarding($<HTMLElement>('#stage'));
-requestAnimationFrame(() =>
-  requestAnimationFrame(() => {
-    hideSplash();
-    console.info(`[CueSight] ready mode=${S.mode} renderer=${view3d ? 'webgl2' : '2d'}`);
-    if (import.meta.env.VITE_CUESIGHT_TOUR === '1') void import('./tour').then((m) => m.runTour(hook));
-  }),
-);
+function start(mode: Mode): void {
+  setMode(mode, true);
+  mountOnboarding($<HTMLElement>('#stage'));
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      hideSplash();
+      console.info(`[CueSight] ready mode=${S.mode} renderer=${view3d ? 'webgl2' : '2d'}`);
+      if (import.meta.env.VITE_CUESIGHT_TOUR === '1') void import('./tour').then((m) => m.runTour(hook));
+    }),
+  );
+}
+// A touch device that would start in Live first checks a camera exists (enumerateDevices needs no
+// permission and opens nothing): without one (iOS Simulator, camera-less tablets) it starts in Practice.
+if (modeOverride || initialMode !== 'camera') start(initialMode);
+else void probeCamera(navigator.mediaDevices).then((has) => start(startMode(coarse, has)));

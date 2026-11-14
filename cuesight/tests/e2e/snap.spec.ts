@@ -102,7 +102,9 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await stepIs(page, ['guide', 'manual-taps']);
     expect((await H(page)).step).toBe('guide');
     await expect(page.locator('#snap-fit')).toContainText('Fit: good');
-    // How hard: n/10 plus a speed word; where to strike: tip offset in coaching words.
+    // How hard: n/10 plus a speed word; where to strike: tip offset in coaching words. The recommended
+    // stroke may still be on its way (it then replaces the provisional one): read the settled plan.
+    await page.waitForFunction(() => !(window as unknown as { __cuesight: { state: { recommended: { pending: boolean } | null } } }).__cuesight.state.recommended?.pending, null, { timeout: 15_000 });
     const plan = await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.plan!);
     const pw = plan.stroke.power;
     await expect(page.locator('#hud-power')).toHaveText(`${pw.toFixed(pw % 1 ? 1 : 0)}/10`);

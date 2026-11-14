@@ -2,24 +2,119 @@
  * Rear-camera capture with backpressured, downscaled frame grabs (Principle IV). Frames stay in
  * memory and are only ever transferred to the on-device vision worker (Principle V).
  */
-export async function startCamera(video: HTMLVideoElement): Promise<MediaStream> {
-  if (!navigator.mediaDevices?.getUserMedia) throw Object.assign(new Error('insecure'), { name: 'InsecureContext' });
-  const stream = await navigator.mediaDevices.getUserMedia({
+/** The part of a `<video>` element the camera code uses (a fake one in unit tests). */
+export interface VideoSink {
+  srcObject: MediaProvider | null;
+  muted: boolean;
+  playsInline: boolean;
+  play(): Promise<void>;
+}
+export type GetUserMedia = () => Promise<MediaStream>;
+
+/** The rear camera, asked for once per start. Throws `InsecureContext` where the API is missing. */
+export const requestRearCamera: GetUserMedia = () => {
+  if (!navigator.mediaDevices?.getUserMedia) return Promise.reject(Object.assign(new Error('insecure'), { name: 'InsecureContext' }));
+  return navigator.mediaDevices.getUserMedia({
     audio: false,
     video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
   });
+};
+
+function stopTracks(s: MediaProvider | null | undefined): void {
+  (s as MediaStream | null | undefined)?.getTracks?.().forEach((t) => t.stop());
+}
+
+/**
+ * Shows `stream` in `video`. The stream it replaces is stopped first; when `play()` fails, `stream`
+ * is stopped and detached before the error is rethrown, so a failed start never leaves a live camera.
+ */
+async function attach(video: VideoSink, stream: MediaStream): Promise<MediaStream> {
+  if (video.srcObject && video.srcObject !== stream) stopTracks(video.srcObject);
   video.srcObject = stream;
   video.muted = true;
   video.playsInline = true;
-  await video.play();
+  try {
+    await video.play();
+  } catch (e) {
+    stopTracks(stream);
+    if (video.srcObject === stream) video.srcObject = null;
+    throw e;
+  }
   return stream;
 }
 
-export function stopCamera(video: HTMLVideoElement): void {
-  const s = video.srcObject as MediaStream | null;
-  s?.getTracks().forEach((t) => t.stop());
+export async function startCamera(video: VideoSink, gum: GetUserMedia = requestRearCamera): Promise<MediaStream> {
+  return attach(video, await gum());
+}
+
+export function stopCamera(video: VideoSink): void {
+  stopTracks(video.srcObject);
   video.srcObject = null;
 }
+
+export type CameraStart = { kind: 'started'; stream: MediaStream } | { kind: 'stale' } | { kind: 'error'; error: unknown };
+
+/**
+ * One camera for Live mode, safe against overlapping starts and stops (Live → Practice → Live while
+ * the permission prompt or the sensor is still starting, a double "Try again"):
+ *  - a start while another is in flight returns that same start (one `getUserMedia` call);
+ *  - `stop()` invalidates every start in flight: a stream that arrives later is stopped at once and
+ *    the start resolves `stale` (as does the AbortError of an interrupted `play()`), never `error`.
+ */
+export function createCameraSession(video: VideoSink, gum: GetUserMedia = requestRearCamera) {
+  let gen = 0;
+  let starting: Promise<CameraStart> | null = null;
+  let stream: MediaStream | null = null;
+  const live = (s: MediaStream | null) => !!s && s.getVideoTracks().some((t) => t.readyState === 'live');
+
+  function stop(): void {
+    gen++;
+    starting = null;
+    stopTracks(stream);
+    stream = null;
+    stopCamera(video);
+  }
+
+  function start(): Promise<CameraStart> {
+    if (starting) return starting;
+    if (stream && live(stream) && video.srcObject === stream) return Promise.resolve({ kind: 'started', stream });
+    if (stream) stop();
+    const g = ++gen;
+    const run = (async (): Promise<CameraStart> => {
+      try {
+        const s = await gum();
+        if (g !== gen) {
+          stopTracks(s);
+          return { kind: 'stale' };
+        }
+        await attach(video, s);
+        if (g !== gen) {
+          stopTracks(s);
+          if (video.srcObject === s) video.srcObject = null;
+          return { kind: 'stale' };
+        }
+        stream = s;
+        return { kind: 'started', stream: s };
+      } catch (error) {
+        return g === gen ? { kind: 'error', error } : { kind: 'stale' };
+      }
+    })();
+    starting = run;
+    void run.then(() => {
+      if (starting === run) starting = null;
+    });
+    return run;
+  }
+
+  return {
+    start,
+    stop,
+    /** A started stream that is still capturing. */
+    active: () => live(stream),
+    stream: () => stream,
+  };
+}
+export type CameraSession = ReturnType<typeof createCameraSession>;
 
 /** `native`: running inside the iOS app (Capacitor), where the switch is in the Settings app, not a browser. */
 export function describeCameraError(e: unknown, native = false): string {

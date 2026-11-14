@@ -19,6 +19,18 @@ export interface LiveVision {
   ms: number;
   frameW: number;
   frameH: number;
+  /** Vision results since the last 'locked' one (0 = locked now; Infinity = never locked). */
+  sinceLocked: number;
+}
+
+/**
+ * Where a selected live ball was last seen. Tracker ids are volatile (a short occlusion re-issues
+ * one), so a selection whose id disappears is re-bound to a new track at the same spot.
+ */
+export interface SelectionMemory {
+  id: string;
+  pos: Vec2;
+  label?: string;
 }
 
 export interface AppState {
@@ -28,8 +40,12 @@ export interface AppState {
   params: PhysicsParams;
   practice: TableLayout;
   vision: LiveVision | null;
-  frozen: { layout: TableLayout; calibration: Calibration | null } | null;
+  /** `gen`: the table-frame generation the snapshot was taken in (main.ts bumps it on Rotate, Calibrate, …). */
+  frozen: { layout: TableLayout; calibration: Calibration | null; gen?: number } | null;
   targetId: string | null;
+  /** Live mode: where the target / the marked cue ball was last seen (re-binding after id churn). */
+  targetMem: SelectionMemory | null;
+  cueMem: SelectionMemory | null;
   pocketId: PocketId | null;
   strokeMode: 'recommended' | 'mine';
   myStroke: Stroke;
