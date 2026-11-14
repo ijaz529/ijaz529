@@ -298,12 +298,22 @@ describe('contact invariants hold at every step (frozen clusters)', () => {
     ['frozen line of 15 at 10 m/s', () => frozenLine(15, 0.3, 10)],
     ['frozen line of 8, last ball 1 mm off the foot rail, at 10 m/s', () => frozenLine(8, table.length / 2 - R - 0.001, 10)],
   ];
-  it('no round-off t = 0 contact loop: the default budget never runs out on a break (same result with a 10⁶ budget)', () => {
-    // Gap-1e-4 rack at 2 m/s: before the approach threshold a resting pair was "hit" again and
-    // again at t = 0 with an impulse lost in rounding, until the per-step cap cut it off.
-    for (const speed of [2, 8]) {
-      const a = simulate(table, rack(1e-4, speed), DEFAULT_PHYSICS, { record: false });
-      const b = simulate(table, rack(1e-4, speed), DEFAULT_PHYSICS, { record: false, maxContactsPerStep: 1e6 });
+  it('no round-off t = 0 contact loop: the default budget never runs out on a break (same result with a 10⁴ budget)', () => {
+    // Without the approach threshold (APPROACH_EPS) a resting pair whose closing speed is round-off
+    // is "hit" again and again at t = 0 with an impulse lost in rounding, until the per-step budget
+    // cuts it off. The 10 µm-gap racks show it: with APPROACH_EPS = 0 they give 6426 / 18958 'ball'
+    // events at the default budget and 60282 / 180526 at a 10⁴ budget; with the threshold, 168 / 226
+    // at both. (The 0.1 mm-gap racks do not loop either way; they are kept as plain break checks.)
+    for (const [gap, speed] of [
+      [1e-5, 2],
+      [1e-5, 1],
+      [1e-4, 2],
+      [1e-4, 8],
+    ] as const) {
+      const a = simulate(table, rack(gap, speed), DEFAULT_PHYSICS, { record: false });
+      const b = simulate(table, rack(gap, speed), DEFAULT_PHYSICS, { record: false, maxContactsPerStep: 1e4 });
+      const ballEvents = a.events.filter((e) => e.kind === 'ball').length;
+      expect(ballEvents).toBeLessThan(1000);
       expect(b.events.length).toBe(a.events.length);
       for (const id of Object.keys(a.final)) expect(b.final[id]!.pos).toEqual(a.final[id]!.pos);
     }
@@ -425,6 +435,45 @@ describe('per-step loop: determinism and no allocation (Constitution IV)', () =>
     // ≈260 k simulation steps: one 16-byte heap number per step alone would be ≈4 MB of garbage.
     expect(steps).toBeGreaterThan(200_000);
     expect(gcs).toBeLessThan(15);
+  });
+
+  it('≈3 M steps of a lone sliding, spinning ball, once warm, trigger at most 3 garbage collections', async () => {
+    // A pure step-loop probe: one ball, ~4 events per run, so every byte allocated per step shows
+    // (the 6-ball guard above cannot see a heap number or two per step: 4 collections before the
+    // `arg` buffer in simulate.ts, 0–1 after). Slow cloth (μs 0.002, μr 0.0005) keeps the ball
+    // sliding with back- and sidespin for ≈14 s of 1 ms steps, then rolling at 4 ms steps, so
+    // earliest(), drift() and every branch of friction() run ≈3 M times. Measured in a vitest
+    // worker: 0–2 collections; 5–6 with any single boxed double put back per step (friction()
+    // reading the captured `time`, earliest(rem) or friction(i, dt) taking a double argument, or —
+    // after the corner-pocket test above — the pocket event's time computed before the ball loop);
+    // 17–22 for the loop before the `arg` buffer. Unphysical cloth on purpose: this checks
+    // allocation, not physics. A window in which the JIT has just deoptimised the loop allocates
+    // too, so the best of up to three windows counts; a real per-step allocation shows in every
+    // window.
+    const p = withPhysics({ muSlide: 0.002, muRoll: 0.0005, spinDecel: 1, maxTime: 60 });
+    const lone: SimBallInit[] = [{ id: 'c', pos: v2(-1, 0), vel: v2(0.4, 0), omega: { x: 0, y: -20, z: 30 } }];
+    const run = (k: number) => {
+      let steps = 0;
+      for (let i = 0; i < k; i++) steps += simulate(table, lone, p, { record: false }).steps;
+      return steps;
+    };
+    run(20); // warm up (JIT)
+    let gcs = 0;
+    const obs = new PerformanceObserver((list) => {
+      gcs += list.getEntries().length;
+    });
+    obs.observe({ entryTypes: ['gc'] });
+    let best = Infinity;
+    for (let attempt = 0; attempt < 3 && best > 3; attempt++) {
+      await new Promise((r) => setTimeout(r, 20));
+      gcs = 0;
+      const steps = run(150);
+      await new Promise((r) => setTimeout(r, 20)); // GC entries are delivered asynchronously
+      expect(steps).toBeGreaterThan(2_700_000);
+      best = Math.min(best, gcs);
+    }
+    obs.disconnect();
+    expect(best).toBeLessThanOrEqual(3);
   });
 
   it('no Math.hypot on the simulation paths (it allocates in V8)', () => {

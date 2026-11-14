@@ -14,6 +14,12 @@
  *
  * Allocation (Constitution IV): the step loop allocates nothing except output records — SimEvent
  * objects (one per event), trajectory points when `record` is on, and FirstHit records (≤ n).
+ * Per-step and fallback helpers read their double inputs from the preallocated `arg` buffer, since
+ * V8 boxes a double passed to a closure it does not inline (or a captured `let` that is written).
+ * Only per-contact and per-event calls (resolveContact, resolveBallBall / resolveCushion, noteHit,
+ * pushEvent) and the optional onStep test hook still take double arguments; each of those calls
+ * comes with at least one SimEvent record anyway.
+ * Measured: ≈3 M steps of a lone sliding ball trigger 0–2 collections (17–22 before the buffer).
  *
  * Ball motion states:
  *  SLIDING  – contact-point slip u = v + ω×(−R ẑ) ≠ 0 → friction μs·g opposite û, slip decays at 7/2·μs·g
@@ -35,6 +41,13 @@ const EPS_U = 1e-4; // m/s slip
 const EPS_W = 0.05; // rad/s
 /** Gap (m) at which the budget fallback treats a pair / cushion as touching. */
 const TOUCH = 1e-9;
+// Slots of simulate()'s double-argument buffer `arg` (see there).
+const A_HORIZON = 0; // earliest(): search horizon (s)
+const A_DRIFT = 1; // drift(): time to drift (s)
+const A_DT = 2; // friction(): step length (s)
+const A_TIME = 3; // friction(), pocket event: simulation time at the start of the current step (s)
+const A_TC = 4; // budget fallback: time stamped on the contacts it resolves (s)
+const A_REST = 5; // guardedDrift(): rest of the step to drift (s)
 
 export interface SimBallInit {
   id: string;
@@ -130,6 +143,14 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
   const maxContacts = Math.max(1, opts.maxContactsPerStep ?? 64 * n);
   const onStep = opts.onStep;
   const pocketedFlag = new Uint8Array(n);
+  // The per-step helpers (earliest, drift, friction and the budget fallback) take their
+  // double-valued inputs from this buffer, not as arguments or captured `let`s: V8 boxes a double
+  // passed to (or returned from) a closure it does not inline, or written to a captured variable,
+  // as a fresh heap number on every call (Constitution IV). For the same reason a double handed to
+  // a per-event call inside a loop is read from `arg` at the call, not computed before the loop:
+  // the optimiser hoists the boxing of a loop-invariant value out of the loop, so it would run on
+  // every step even when no event happens (measured: one heap number per step after a pocketing).
+  const arg = new Float64Array(6);
 
   for (let i = 0; i < n; i++) {
     const b = init[i]!;
@@ -200,8 +221,9 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
 
   const contact: Contact = { t: Infinity, kind: 0, i: -1, j: -1 };
 
-  /** Find the earliest contact within [0, horizon]. */
-  function earliest(horizon: number): void {
+  /** Find the earliest contact within [0, arg[A_HORIZON]]. */
+  function earliest(): void {
+    const horizon = arg[A_HORIZON]!;
     contact.t = Infinity;
     contact.i = -1;
     const R2 = 4 * R * R;
@@ -291,7 +313,9 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     }
   }
 
-  function drift(dt: number): void {
+  /** Move every rolling / sliding ball along its velocity for arg[A_DRIFT] seconds. */
+  function drift(): void {
+    const dt = arg[A_DRIFT]!;
     for (let i = 0; i < n; i++) {
       if (st[i] === SLIDING || st[i] === ROLLING) {
         s.px[i] = s.px[i]! + s.vx[i]! * dt;
@@ -300,7 +324,10 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     }
   }
 
-  function friction(i: number, dt: number): void {
+  /** Cloth friction on ball i over one step of arg[A_DT] seconds starting at time arg[A_TIME]. */
+  function friction(i: number): void {
+    const dt = arg[A_DT]!;
+    const t0 = arg[A_TIME]!;
     // Sidespin decay (independent of translation for a level-cue model).
     const wz = s.wz[i]!;
     if (wz !== 0) {
@@ -330,7 +357,7 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         const v = Math.sqrt(s.vx[i]! * s.vx[i]! + s.vy[i]! * s.vy[i]!);
         st[i] = v > EPS_V ? ROLLING : STATIONARY;
         if (st[i] === STATIONARY) classify(i);
-        else if (record) pushEvent(time + dt - rem, 'roll', i);
+        else if (record) pushEvent(t0 + dt - rem, 'roll', i);
       }
     }
     if (st[i] === ROLLING && rem > 0) {
@@ -342,7 +369,7 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         s.wx[i] = 0;
         s.wy[i] = 0;
         st[i] = Math.abs(s.wz[i]!) > EPS_W ? SPINNING : STATIONARY;
-        pushEvent(time + dt, 'stop', i);
+        pushEvent(t0 + dt, 'stop', i);
       } else {
         const k = (sp - dv) / sp;
         s.vx[i] = s.vx[i]! * k;
@@ -404,21 +431,21 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     }
   }
 
-  /** Normal approach speed of the pair (i, j) along i→j, or −1 if they are not touching (gap > TOUCH). */
-  function pairApproach(i: number, j: number): number {
+  /** True if the pair (i, j) touches (gap ≤ TOUCH) and closes faster than APPROACH_EPS. */
+  function pairApproaching(i: number, j: number): boolean {
     const dx = s.px[j]! - s.px[i]!;
     const dy = s.py[j]! - s.py[i]!;
     const dd = Math.sqrt(dx * dx + dy * dy);
-    if (dd > 2 * R + TOUCH || dd === 0) return -1;
-    return ((s.vx[i]! - s.vx[j]!) * dx + (s.vy[i]! - s.vy[j]!) * dy) / dd;
+    if (dd > 2 * R + TOUCH || dd === 0) return false;
+    return ((s.vx[i]! - s.vx[j]!) * dx + (s.vy[i]! - s.vy[j]!) * dy) / dd > APPROACH_EPS;
   }
 
   /**
    * Resolve ball i against every cushion segment and jaw point it touches (gap ≤ TOUCH) and is
    * still approaching. With `pushOut`, a ball found inside a cushion or jaw is first moved back to
-   * the nose. Returns true if anything was resolved or moved.
+   * the nose. Contacts are stamped with time arg[A_TC]. Returns true if anything was resolved or moved.
    */
-  function railContacts(i: number, t: number, pushOut: boolean): boolean {
+  function railContacts(i: number, pushOut: boolean): boolean {
     let any = false;
     for (let k = 0; k < table.cushions.length; k++) {
       const cu = table.cushions[k]!;
@@ -434,7 +461,7 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         any = true;
       }
       if (s.vx[i]! * cu.n.x + s.vy[i]! * cu.n.y < -APPROACH_EPS) {
-        resolveContact(1, i, k, t);
+        resolveContact(1, i, k, arg[A_TC]!);
         any = true;
       }
     }
@@ -449,7 +476,7 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         any = true;
       }
       if ((dx * s.vx[i]! + dy * s.vy[i]!) / d < -APPROACH_EPS) {
-        resolveContact(2, i, k, t);
+        resolveContact(2, i, k, arg[A_TC]!);
         any = true;
       }
     }
@@ -459,21 +486,21 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
   /**
    * Budget fallback, part 1: resolve every touching, approaching contact in sequential-impulse
    * (Gauss–Seidel) sweeps until none is left (or n + 1 sweeps). Each impulse is the ordinary,
-   * dissipative pairwise one, so no energy is created.
+   * dissipative pairwise one, so no energy is created. Contacts are stamped with time arg[A_TC].
    */
-  function relaxContacts(t: number): void {
+  function relaxContacts(): void {
     for (let sweep = 0; sweep <= n && !stopNow; sweep++) {
       let any = false;
       for (let i = 0; i < n; i++) {
         if (st[i] === POCKETED) continue;
         for (let j = i + 1; j < n; j++) {
           if (st[j] === POCKETED) continue;
-          if (pairApproach(i, j) > APPROACH_EPS) {
-            resolveContact(0, i, j, t);
+          if (pairApproaching(i, j)) {
+            resolveContact(0, i, j, arg[A_TC]!);
             any = true;
           }
         }
-        if (moving(i) && railContacts(i, t, false)) any = true;
+        if (moving(i) && railContacts(i, false)) any = true;
       }
       if (!any) break;
     }
@@ -483,9 +510,12 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
    * Budget fallback, part 2: drift the rest of the step in sub-steps of at most R/8 of relative
    * travel; after each, push apart overlapping pairs and push balls out of cushions and jaws
    * (equal and opposite position corrections), resolving every contact that is still approaching.
-   * Contacts are never skipped, only resolved up to R/8 late.
+   * Contacts are never skipped, only resolved up to R/8 late. Drifts arg[A_REST] seconds from time
+   * arg[A_TC].
    */
-  function guardedDrift(dt: number, t: number): void {
+  function guardedDrift(): void {
+    const dt = arg[A_REST]!;
+    const t = arg[A_TC]!;
     let vmax = 0;
     for (let i = 0; i < n; i++) {
       if (!moving(i)) continue;
@@ -495,8 +525,9 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     const nsub = Math.max(1, Math.ceil((2 * vmax * dt) / (R / 8)));
     const h = dt / nsub;
     for (let k = 1; k <= nsub && !stopNow; k++) {
-      drift(h);
-      const tk = t + k * h;
+      arg[A_DRIFT] = h;
+      drift();
+      arg[A_TC] = t + k * h;
       // Position projection, sweeping in alternating index order so a correction travels the
       // whole length of a chain pressed against a rail in one pass.
       for (let pass = 0; pass < 4 * n + 32; pass++) {
@@ -505,10 +536,10 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         for (let a = 0; a < n; a++) {
           const i = fwd ? a : n - 1 - a;
           if (st[i] === POCKETED) continue;
-          if (railContacts(i, tk, true)) any = true;
+          if (railContacts(i, true)) any = true;
           for (let b = a + 1; b < n; b++) {
             const j = fwd ? b : n - 1 - b;
-            if (st[j] !== POCKETED && separatePair(i, j, tk)) any = true;
+            if (st[j] !== POCKETED && separatePair(i, j)) any = true;
           }
         }
         if (!any) break;
@@ -516,8 +547,11 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     }
   }
 
-  /** Push an overlapping pair apart (equal and opposite) and resolve it if still approaching. */
-  function separatePair(i: number, j: number, t: number): boolean {
+  /**
+   * Push an overlapping pair apart (equal and opposite) and resolve it, stamped with time
+   * arg[A_TC], if still approaching.
+   */
+  function separatePair(i: number, j: number): boolean {
     const dx = s.px[j]! - s.px[i]!;
     const dy = s.py[j]! - s.py[i]!;
     const dd = Math.sqrt(dx * dx + dy * dy);
@@ -528,13 +562,14 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
     s.py[i] = s.py[i]! - dy * half;
     s.px[j] = s.px[j]! + dx * half;
     s.py[j] = s.py[j]! + dy * half;
-    if (pairApproach(i, j) > APPROACH_EPS) resolveContact(0, i, j, t);
+    if (pairApproaching(i, j)) resolveContact(0, i, j, arg[A_TC]!);
     return true;
   }
 
   let time = 0;
   let steps = 0;
   while (time < maxTime) {
+    arg[A_TIME] = time; // friction() and the pocket event read the step's start time from here
     let anyMoving = false;
     let anySliding = false;
     for (let i = 0; i < n; i++) {
@@ -555,39 +590,44 @@ export function simulate(table: TableSpec, init: SimBallInit[], params: PhysicsP
         // Contact budget spent (a dense cluster of t = 0 contacts, or a forced test budget):
         // resolve every touching contact together, then go back to exact detection. If the budget
         // runs out again, finish the step with a drift that still detects every contact.
-        const tNow = time + (dt - rem);
+        arg[A_TC] = time + (dt - rem);
         if (relaxes < 2) {
           relaxes++;
-          relaxContacts(tNow);
+          relaxContacts();
           budget = maxContacts;
           continue;
         }
-        guardedDrift(rem, tNow);
+        arg[A_REST] = rem;
+        guardedDrift();
         rem = 0;
         break;
       }
       budget--;
-      earliest(rem);
+      arg[A_HORIZON] = rem;
+      earliest();
       if (contact.i < 0) {
-        drift(rem);
+        arg[A_DRIFT] = rem;
+        drift();
         rem = 0;
         break;
       }
-      drift(contact.t);
+      arg[A_DRIFT] = contact.t;
+      drift();
       rem -= contact.t;
       resolveContact(contact.kind, contact.i, contact.j, time + (dt - rem));
     }
     if (stopNow) break;
 
+    arg[A_DT] = dt;
     for (let i = 0; i < n; i++) {
       const k = st[i];
       if (k === STATIONARY || k === POCKETED) continue;
-      friction(i, dt);
+      friction(i);
       // Pocket capture: the centre can only leave the nose rectangle through a pocket gap.
       if (Math.abs(s.px[i]!) > hx || Math.abs(s.py[i]!) > hy) {
         pocketOf[i] = nearestPocket(s.px[i]!, s.py[i]!);
         pocketSpeed[i] = Math.sqrt(s.vx[i]! * s.vx[i]! + s.vy[i]! * s.vy[i]!);
-        pushEvent(time + dt, 'pocket', i, pocketOf[i]!);
+        pushEvent(arg[A_TIME]! + dt, 'pocket', i, pocketOf[i]!); // time read here: see `arg`
         st[i] = POCKETED;
         pocketedFlag[i] = 1;
         s.vx[i] = 0;
