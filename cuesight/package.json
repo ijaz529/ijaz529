@@ -1,0 +1,25 @@
+{
+  "name": "cuesight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real-time pool & snooker shot trainer in your pocket: point the camera, get aim, power, spin and cue-ball path.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fixtures": "tsx scripts/make-fake-camera.ts",
+    "e2e": "npm run fixtures && vite build && playwright test --trace off"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0"
+  }
+}

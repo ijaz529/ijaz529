@@ -60,8 +60,9 @@ pocket, and check that every plan element appears and matches reference physics 
    that ball and pocket, **Then** the plan shows a cut angle of 0°, a "full-ball" aim, no throw
    correction, and the cue ball stopping or following on the same line, depending on the spin shown.
 2. **Given** a 30° cut, **When** the plan is shown with stun (centre-ball at contact), **Then** the cue-ball
-   path leaves along the tangent line (90° to the object-ball path, within 1°). The coaching tip names
-   the tangent-line (90°) rule.
+   path leaves along the tangent line: 90° to the line of centres. That holds within 1° for ideal balls.
+   Real balls (restitution ≈ 0.95) leave up to ~4° forward of it, and the plan shows that real path.
+   The coaching tip names the tangent-line (90°) rule.
 3. **Given** a 30° cut, **When** the player chooses natural follow (rolling), **Then** the cue ball's
    deflection from its original line is about 33° (within 1°) and the tip names the 30° rule.
 4. **Given** another ball blocking the cue ball's path to the ghost ball, **When** the plan is shown,
@@ -302,7 +303,8 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   (median) and 2.5 cm (95th percentile) of the true positions. The table outline is within 1.5 % of the
   image diagonal.
 - **SC-004**: On reference shots, predicted aim, cue-ball deflection (stun and rolling), throw and squirt
-  match published billiards physics within 0.5°–1°.
+  match published billiards physics within 0.5°–1° in the ideal-ball limit the formulas assume. With
+  realistic ball properties, deviations from those idealised rules stay within 4°.
 - **SC-005**: Position-play recommendations are returned within 2 seconds. For reachable spots on
   reference layouts, the predicted rest position is within 15 cm of the requested spot.
 - **SC-006**: 90 % of test players can select a ball and pocket and correctly state the recommended aim,
