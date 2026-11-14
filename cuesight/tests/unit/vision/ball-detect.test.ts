@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { detectBalls } from '../../../src/vision/ball-detect';
 import { calibrationFromCorners } from '../../../src/vision/calibration';
-import { renderSyntheticTable } from '../../../src/vision/synth/render';
+import { cameraModel, renderSyntheticTable } from '../../../src/vision/synth/render';
 import { detectTable } from '../../../src/vision/table-detect';
 import type { Frame } from '../../../src/vision/image';
 import { POSES, scene } from '../../helpers/scenes';
@@ -53,6 +53,42 @@ describe('ball detection on video-like (4:2:0) frames', () => {
     const sign = sumErr(1) <= sumErr(-1) ? 1 : -1;
     const cue = balls.find((b) => b.isCue)!;
     expect(Math.hypot(cue.pos.x - sign * truth[0]!.x, cue.pos.y - sign * truth[0]!.y)).toBeLessThan(0.03);
+  });
+
+  // SC-003 on video frames too, with the automatic table calibration and with the camera's exact one
+  // (so a detector regression cannot hide behind, or be blamed on, the table fit).
+  it.each(['end', 'side', 'corner', 'overhead'] as const)('%s view: median ≤ 10 mm and p95 ≤ 25 mm (auto and exact calibration)', (pose) => {
+    const sc = scene(pose);
+    const frame = chroma420(renderSyntheticTable(sc));
+    const det = detectTable(frame)!;
+    const cam = cameraModel(sc.camera, sc.width, sc.height);
+    const t = sc.table;
+    const X = t.length / 2 + t.cushionWidth;
+    const Y = t.width / 2 + t.cushionWidth;
+    const exactCorners = [
+      [-X, -Y],
+      [X, -Y],
+      [X, Y],
+      [-X, Y],
+    ].map(([x, y]) => cam.project({ x: x!, y: y!, z: t.cushionHeight }));
+    for (const [name, corners] of [
+      ['auto', det.corners],
+      ['exact', exactCorners],
+    ] as const) {
+      const cal = calibrationFromCorners(corners, sc.table, frame.width, frame.height)!;
+      const balls = detectBalls(frame, cal, sc.table, det.cloth);
+      const truth = sc.balls.map((b) => b.pos);
+      const errFor = (sign: number) => truth.map((p) => Math.min(...balls.map((b) => Math.hypot(b.pos.x - sign * p.x, b.pos.y - sign * p.y))));
+      const e1 = errFor(1);
+      const e2 = errFor(-1);
+      const errs = (e1.reduce((a, b) => a + b, 0) <= e2.reduce((a, b) => a + b, 0) ? e1 : e2).map((e) => e * 1000).sort((a, b) => a - b);
+      const median = errs[Math.floor(errs.length / 2)]!;
+      const p95 = errs[Math.min(errs.length - 1, Math.ceil(errs.length * 0.95) - 1)]!;
+      console.log(`4:2:0 ${pose} (${name} calibration): errors mm ${errs.map((e) => e.toFixed(1)).join(' ')}`);
+      expect(balls.length, name).toBe(sc.balls.length);
+      expect(median, name).toBeLessThanOrEqual(10);
+      expect(p95, name).toBeLessThanOrEqual(25);
+    }
   });
 });
 

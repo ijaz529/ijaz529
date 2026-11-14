@@ -317,6 +317,48 @@ describe('cue-ball identification', () => {
     }
   });
 
+  it('a green stripe on green cloth is itself detected (not only kept from being the cue)', () => {
+    // Where its white cap meets its green band the pixels are white/green blends that read as cloth;
+    // they used to cut the ball into fragments that each failed the shape gate (0.3.0 detector: found
+    // in 2 of 40 band-facing frames). On 4:2:0 video the band's own chroma is also averaged with the
+    // caps', so part of the band reads as cloth: there the count is lower and is only reported.
+    const spots = [
+      [0.3, 0.3],
+      [-0.9, 0.35],
+      [0.6, 0.1],
+    ];
+    let rgbFacing = 0;
+    let anyAxis = 0;
+    let anyAxisN = 0;
+    const log: string[] = [];
+    for (const pose of ALL_POSES)
+      for (const [x, y] of spots)
+        for (const facing of [true, false]) {
+          const sc = fixture(pose, [{ pos: { x: x!, y: y! }, color: C.green!, stripe: true, ...(facing ? { axis: bandFacing(pose, x!, y!) } : {}) }]);
+          const f = render(sc);
+          for (const [nm, frame] of [
+            ['RGB', f],
+            ['4:2:0', chroma420(f)],
+          ] as const) {
+            const r = detect(sc, frame);
+            const m = r.match[9]!;
+            const ok = m.det >= 0 && m.err <= 0.015;
+            expect(r.fp, `${pose} ${nm}`).toHaveLength(0);
+            if (facing && nm === 'RGB' && ok) rgbFacing++;
+            if (!facing) {
+              anyAxisN++;
+              if (ok) anyAxis++;
+            }
+            if (!ok) log.push(`${pose} (${x}, ${y}) ${facing ? 'facing' : 'default axis'} ${nm}: ${m.det >= 0 ? `${(m.err * 1000).toFixed(0)} mm` : 'missed'}`);
+          }
+        }
+    console.log(`green stripe found: band facing RGB ${rgbFacing}/12, default axes ${anyAxis}/${anyAxisN}\n  ${log.join('\n  ')}`);
+    // Measured: band facing RGB 11/12, renderer-default axes 15/24 (0.3.0 detector over a wider set:
+    // 2 of 40 band-facing frames, 20 of 40 default-axis frames).
+    expect(rgbFacing, log.join('\n')).toBeGreaterThanOrEqual(10);
+    expect(anyAxis, log.join('\n')).toBeGreaterThanOrEqual(14);
+  });
+
   it('green-band stripe in any orientation: almost never taken for the cue (was 14 of 16 frames)', () => {
     // With its band edge-on and in shadow, a green stripe is a white cap over a dark rim, as the cue
     // ball is; then no ball (ambiguous) or, rarely, the stripe is flagged. Count those over 16 frames.
@@ -343,6 +385,148 @@ describe('cue-ball identification', () => {
     expect(real).toBeGreaterThanOrEqual(12);
   });
 
+  it('snooker, 4:2:0 video: the real cue ball is flagged among the colours (cue at 6 spots × 4 poses)', () => {
+    // Video chroma bleed dilates the coloured balls' masks by about a pixel but not the white ball's
+    // (its rim is set by luma). The cue's completeness must not be judged against the coloured balls'
+    // dilated size (the 0.3.0 detector lost the cue in 10 of these 24 frames, the 0.2.x one in none).
+    let found = 0;
+    const lost: string[] = [];
+    for (const pose of ALL_POSES)
+      for (const [x, y] of [
+        [-1.2, 0.15],
+        [-0.6, -0.5],
+        [0.3, 0.4],
+        [1.0, -0.3],
+        [-1.5, -0.6],
+        [1.4, 0.5],
+      ]) {
+        const base = snookerColours(pose);
+        const sc = { ...base, balls: [{ pos: { x: x!, y: y! }, color: C.cue! }, ...base.balls.slice(1)] };
+        const r = detect(sc, chroma420(render(sc)));
+        const ci = cueIndex(r);
+        expect(ci === 0 || ci === -1, `${pose} (${x}, ${y}): a wrong ball is the cue (${ci})`).toBe(true);
+        if (ci === 0) found++;
+        else lost.push(`${pose} (${x}, ${y}): ${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')}`);
+      }
+    expect(found, lost.join('\n')).toBeGreaterThanOrEqual(22);
+  });
+
+  it.each(['side', 'corner', 'end'] as Pose[])('%s view: a lone cue ball frozen near the camera-side cushion is still the cue (RGB and 4:2:0)', (pose) => {
+    // The near cushion hides the lower part of the ball from the camera: that part is occluded, not
+    // missing, and must not fail the cue's completeness test (0.3.0 detector: 10 of 36 found on 4:2:0).
+    const t = pool9;
+    const bad: string[] = [];
+    for (const gap of [0.0005, 0.005, 0.015])
+      for (const s of [-0.3, 0.7]) {
+        const cuePos = pose === 'end' ? { x: -(t.length / 2 - R9 - gap), y: s * 0.5 } : { x: s, y: -(t.width / 2 - R9 - gap) };
+        const sc = mk('pool9', POSES[pose]!, [
+          { pos: cuePos, color: C.cue! },
+          { pos: { x: 0.3, y: 0.25 }, color: C.red! },
+          { pos: { x: -0.4, y: 0.3 }, color: C.yellow! },
+          { pos: { x: 0.8, y: 0.1 }, color: C.blue! },
+        ]);
+        const f = render(sc);
+        for (const [nm, frame] of [
+          ['RGB', f],
+          ['4:2:0', chroma420(f)],
+        ] as const) {
+          const r = detect(sc, frame);
+          if (cueIndex(r) !== 0) bad.push(`${nm} gap ${gap * 1000} mm at ${s}: ${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')}`);
+        }
+      }
+    expect(bad, bad.join('\n')).toEqual([]);
+  });
+
+  it('dim frames (gain 0.65 and 0.5): the real cue ball is still flagged', () => {
+    // The white test is relative to the ball's own brightness: with an absolute V threshold the cue's
+    // shaded half stops counting as white and a dim frame has no cue ball at all (0.2.x detector: none in
+    // 10 of these 16 frames).
+    let real = 0;
+    const log: string[] = [];
+    for (const pose of ALL_POSES)
+      for (const g of [0.65, 0.5])
+        for (const [nm, frame] of [
+          ['RGB', gain(fixtureFrame(pose), g)],
+          ['4:2:0', gain(chroma420(fixtureFrame(pose)), g)],
+        ] as const) {
+          const r = detect(fixture(pose), frame);
+          const ci = cueIndex(r);
+          expect([0, -1], `${pose} ${nm} gain ${g}: a wrong ball is the cue`).toContain(ci);
+          if (ci === 0) real++;
+          else log.push(`${pose} ${nm} gain ${g}: ${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')}`);
+        }
+    expect(real, log.join('\n')).toBeGreaterThanOrEqual(15);
+  });
+
+  it('two equally white balls (a second cue ball, mirror-placed): neither is flagged', () => {
+    // The cue must be CLEARLY the whitest ball. Two white balls placed mirror-symmetrically about the
+    // plane through the camera and the lamp look alike; picking either would be a coin toss, so the
+    // player is asked to tap the cue ball instead.
+    const others: SynthBall[] = [
+      { pos: { x: 0.35, y: 0.18 }, color: C.yellow! },
+      { pos: { x: 0.55, y: -0.3 }, color: C.blue! },
+      { pos: { x: 0.9, y: 0.05 }, color: C.red! },
+    ];
+    for (const [pose, a, b] of [
+      ['end', { x: -0.4, y: 0.25 }, { x: -0.4, y: -0.25 }],
+      ['end', { x: 0.6, y: 0.4 }, { x: 0.6, y: -0.4 }],
+      ['overhead', { x: -0.5, y: 0.1 }, { x: 0.5, y: 0.1 }],
+    ] as const) {
+      const sc = mk('pool9', POSES[pose]!, [{ pos: a, color: C.cue! }, { pos: b, color: C.cue! }, ...others]);
+      const f = render(sc);
+      for (const frame of [f, chroma420(f)]) {
+        const r = detect(sc, frame);
+        expect(r.match[0]!.det >= 0 && r.match[1]!.det >= 0, `${pose}: both white balls found`).toBe(true);
+        expect(cueIndex(r), `${pose}: ${r.balls.map((x) => `${x.label}:${x.white.toFixed(2)}`).join(' ')}`).toBe(-1);
+      }
+    }
+  });
+
+  it('cue ball frozen to a red along the view (either one in front): the nearer ball owns the overlap', () => {
+    // Where two silhouettes overlap, the pixels belong to the ball nearer the camera (it hides the other):
+    // assigning them to the nearest centre instead mixes the red into the cue ball's colour and white
+    // score and the cue into the red's (measured: real cue 15/32 and red 13/32 that way, 25 and 27 here).
+    let cue = 0;
+    let red = 0;
+    const log: string[] = [];
+    for (const pose of ALL_POSES) {
+      const cam = POSES[pose]!.pos;
+      for (const cueFar of [true, false])
+        for (const [cx, cy] of [
+          [-0.3, 0.1],
+          [0.5, -0.2],
+        ]) {
+          const a = Math.atan2(cy! - cam.y, cx! - cam.x);
+          const g = R9 + 0.0002;
+          const near = { x: cx! - g * Math.cos(a), y: cy! - g * Math.sin(a) };
+          const far = { x: cx! + g * Math.cos(a), y: cy! + g * Math.sin(a) };
+          const sc = mk('pool9', POSES[pose]!, [
+            { pos: cueFar ? far : near, color: C.cue! },
+            { pos: cueFar ? near : far, color: C.red! },
+            { pos: { x: 0.9, y: 0.3 }, color: C.yellow! },
+            { pos: { x: -0.8, y: -0.3 }, color: C.blue! },
+          ]);
+          const f = render(sc);
+          for (const [nm, frame] of [
+            ['RGB', f],
+            ['4:2:0', chroma420(f)],
+          ] as const) {
+            const r = detect(sc, frame);
+            const ci = cueIndex(r);
+            expect([0, -1], `${pose} ${nm}: a wrong ball is the cue`).toContain(ci);
+            if (ci === 0) cue++;
+            if (labelOf(r, 1) === 'red') red++;
+            else log.push(`${pose} cue ${cueFar ? 'behind' : 'in front'} ${nm}: red→${labelOf(r, 1)}`);
+          }
+        }
+    }
+    expect(cue, log.join('\n')).toBeGreaterThanOrEqual(22);
+    expect(red, log.join('\n')).toBeGreaterThanOrEqual(24);
+    // Never another colour's name for the red: 'ball' is the honest name when its hue or brightness is
+    // ambiguous.
+    for (const l of log) expect(l).toMatch(/red→(ball|MISSED)$/);
+  });
+
   it('dim 4:2:0 corner view: a stripe is never chosen as the cue ball', () => {
     const sc = fixture('corner');
     const f = chroma420(fixtureFrame('corner'));
@@ -355,14 +539,17 @@ describe('cue-ball identification', () => {
 });
 
 describe('touching clusters', () => {
-  // Seen from low down, a pack's interior balls can sit wholly inside their neighbours' silhouettes:
-  // nothing in the outline says they are there, so the detector does not invent them (Constitution II).
-  // Those few are the only misses allowed (the 0.2.x detector missed 3–7 per pack and placed the rest
-  // 25–35 mm off); where every silhouette shows, every ball must be found. Never a phantom ball.
+  // Seen from low down, a pack's interior balls can sit (almost) wholly inside their neighbours'
+  // silhouettes: rendering each such ball in and out adds 0–13 % of its own silhouette to the outline,
+  // too little to say it is there, so the detector does not invent it (Constitution II). Not every
+  // allowed miss is that: with the automatic table fit (~10 mm off at the far end in the end view) the
+  // 15-ball end view loses #2 and #6, which the camera's exact calibration finds (it misses #5 and #8,
+  // both hidden). The 15-ball side view now finds every ball (0.3.0 missed #14, 28–47 % in view).
+  // (The 0.2.x detector missed 3–7 per pack and placed the rest 25–35 mm off.) Never a phantom ball.
   const cases: [string, (p: Pose) => SynthScene, Partial<Record<Pose, number>>][] = [
     ['3-ball row', (p) => rack(3, p), {}],
     ['9-ball diamond', (p) => rack(9, p), { end: 1, corner: 1 }],
-    ['15-ball triangle', (p) => rack(15, p), { end: 3, side: 1, corner: 2 }],
+    ['15-ball triangle', (p) => rack(15, p), { end: 3, corner: 2 }],
     ['snooker 15-red pack', snookerPack, { end: 2, corner: 3 }],
   ];
   for (const [name, build, hidden] of cases)
@@ -376,7 +563,9 @@ describe('touching clusters', () => {
       expect(r.fp, 'phantom balls').toHaveLength(0);
       expect(missed).toBeLessThanOrEqual(hidden[pose] ?? 0);
       expect(s.median).toBeLessThanOrEqual(10);
-      // Next to an uncounted ball the neighbours' fits absorb a little of its silhouette.
+      // Next to an uncounted ball the neighbours' fits absorb a little of its silhouette, so the tail is
+      // allowed to 30 mm there (measured 25–30 mm in the 15-ball end/corner and snooker end/corner views);
+      // SC-003's 25 mm holds wherever every ball is counted.
       expect(s.p95).toBeLessThanOrEqual(missed ? 30 : 25);
     });
 });
@@ -392,6 +581,20 @@ describe('touching pairs side by side across the view', () => {
       for (const ti of [1, 3]) expect(labelOf(r, ti), msg).toBe('red');
       for (const ti of [2, 4]) expect(labelOf(r, ti), msg).toBe('blue');
     }
+  });
+
+  it.each(['end', 'corner'] as Pose[])('%s view, 4:2:0 video, the cue the only isolated ball: no phantom ball at any angle', (pose) => {
+    // Chroma bleed dilates the pairs' masks by about a pixel and the white cue's not at all, so with no
+    // coloured single ball in view the frame cannot tell the pairs' dilation; the ring must still not
+    // be fitted as extra balls (0.3.0 detector: 6–8 balls for these 5 in the corner view).
+    const bad: string[] = [];
+    for (const deg of [0, 30, 45, 60, 75, 90]) {
+      const sc = pairs(pose, deg);
+      const r = detect(sc, chroma420(render(sc)));
+      const msg = `${deg}°: ${r.balls.length} balls, errors mm ${fmt(r.match.map((m) => m.err * 1000))}, labels ${r.balls.map((b) => b.label).join(',')}`;
+      if (r.balls.length !== 5 || r.fp.length > 0 || r.match.some((m) => m.err > 0.015)) bad.push(msg);
+    }
+    expect(bad, bad.join('\n')).toEqual([]);
   });
 
   it('640×360 end view, pairs square to the view (exact calibration)', () => {
@@ -458,6 +661,37 @@ describe('shape gate: glare and a cue stick are not balls', () => {
     }
   });
 
+  it('end view: a cue stick along the line of sight (butt raised 4° or 8°) adds no phantom ball (exact calibration)', () => {
+    // Seen from behind the player, the stick points away from the camera: in the ball-centre plane it
+    // is a long strip about as wide as the butt (≤ 30 mm, ~1R), which is a chain of "balls" to the disc
+    // model unless each disc's width across the view is checked (0.3.0 detector: 1–4 phantoms here).
+    // Known limit: at 225° / 8° (butt toward the camera's left, over the near corner pocket) one piece of
+    // the butt, cut off by the cushion's occluded strip, still passes as a ball with the camera's exact
+    // calibration (with the automatic one it does not).
+    const bad: string[] = [];
+    for (const [rel, elDeg] of [
+      [0, 4],
+      [0, 8],
+      [45, 4],
+      [45, 8],
+      [225, 4],
+    ] as const) {
+        const base = fixture('end');
+        const cb = base.balls[0]!.pos;
+        const cam = POSES.end!.pos;
+        const a = Math.atan2(cb.y - cam.y, cb.x - cam.x) + (rel * Math.PI) / 180; // rel 0: butt away from the camera
+        const el = (elDeg * Math.PI) / 180;
+        const L = 1.2;
+        const tip = { x: cb.x + Math.cos(a) * (R9 + 0.01), y: cb.y + Math.sin(a) * (R9 + 0.01), z: R9 };
+        const butt = { x: tip.x + Math.cos(a) * L * Math.cos(el), y: tip.y + Math.sin(a) * L * Math.cos(el), z: R9 + L * Math.sin(el) };
+        const sc = { ...base, sticks: [{ tip, butt, tipRadius: 0.0065, buttRadius: 0.015 }] };
+        const r = detect(sc, render(sc), { exact: true });
+        const missed = r.match.filter((m) => m.det < 0).length;
+        if (r.fp.length || missed || cueIndex(r) !== 0) bad.push(`${rel}° / ${elDeg}°: ${r.fp.length} phantom, ${missed} missed, cue ${cueIndex(r)}: ${r.balls.map((b) => b.label).join(',')}`);
+    }
+    expect(bad, bad.join('\n')).toEqual([]);
+  });
+
   it.each(ALL_POSES)('%s view: a cue stick behind the cue ball adds no phantom ball', (pose) => {
     const sc = withStick(pose);
     const r = detect(sc, render(sc));
@@ -514,6 +748,72 @@ describe('colour names', () => {
     expect(maroon, seen.join('; ')).toBe(4);
   });
 
+  it('exposure changes (gain 0.65 and 1.25) never swap red and maroon; the orange stays "orange"', () => {
+    // Red and maroon share a hue and differ only in brightness, so the split must be relative to the
+    // frame's own white (the cue ball, a stripe's cap), not an absolute V (0.3.0 detector: the red was
+    // 'maroon' at gain 0.65 and the maroon stripe 'red stripe' at gain 1.25).
+    const bad: string[] = [];
+    let orange = 0;
+    for (const pose of ALL_POSES) {
+      const sc = fixture(pose);
+      for (const g of [0.65, 1, 1.25])
+        for (const [nm, frame] of [
+          ['RGB', gain(fixtureFrame(pose), g)],
+          ['4:2:0', gain(chroma420(fixtureFrame(pose)), g)],
+        ] as const) {
+          const r = detect(sc, frame);
+          const red = labelOf(r, 3);
+          const maroon = labelOf(r, 7);
+          if (red.startsWith('maroon') || maroon.startsWith('red')) bad.push(`${pose} ${nm} gain ${g}: red→${red}, maroon stripe→${maroon}`);
+          if (g === 1 && labelOf(r, 5) === 'orange') orange++;
+          if (g === 1 && labelOf(r, 5) !== 'orange') bad.push(`${pose} ${nm}: orange→${labelOf(r, 5)}`);
+        }
+    }
+    expect(bad.filter((b) => !b.includes('orange→')), bad.join('\n')).toEqual([]);
+    expect(orange, bad.join('\n')).toBeGreaterThanOrEqual(7);
+  });
+
+  it('stripes with the band in view: "<colour> stripe", never a solid\'s name, red and maroon never swapped', () => {
+    // A stripe shows its white caps whenever its band faces the camera; a solid shows only a specular
+    // highlight. (0.3.0 detector: the yellow stripe was the bare 'yellow' — the 1-ball's name — in 22 of
+    // 24 such frames, and the maroon stripe 'red stripe' in 17.)
+    const bad: string[] = [];
+    let named = 0;
+    let total = 0;
+    for (const pose of ALL_POSES) {
+      const cam = POSES[pose]!.pos;
+      for (const [nm, col] of [
+        ['yellow', C.yellow!],
+        ['red', C.red!],
+        ['maroon', C.maroon!],
+      ] as const) {
+        const balls: SynthBall[] = [{ pos: { x: -0.75, y: -0.12 }, color: C.cue! }];
+        for (const [x, y] of [
+          [0.35, 0.18],
+          [-0.2, 0.42],
+          [0.55, -0.3],
+        ]) {
+          void cam;
+          balls.push({ pos: { x: x!, y: y! }, color: col, stripe: true, axis: bandFacing(pose, x!, y!) });
+        }
+        const sc = mk('pool9', POSES[pose]!, balls);
+        const f = render(sc);
+        for (const frame of [f, chroma420(f)]) {
+          const r = detect(sc, frame);
+          for (let i = 1; i < balls.length; i++) {
+            const lab = labelOf(r, i);
+            total++;
+            if (lab === `${nm} stripe`) named++;
+            const other = nm === 'red' ? 'maroon' : nm === 'maroon' ? 'red' : 'none';
+            if (lab === nm || lab.startsWith(other)) bad.push(`${pose} ${nm} stripe #${i}: ${lab}`);
+          }
+        }
+      }
+    }
+    expect(bad, bad.join('\n')).toEqual([]);
+    expect(named, `${named}/${total}`).toBeGreaterThanOrEqual(Math.ceil(0.85 * total));
+  });
+
   it.each(['end', 'side', 'corner'] as Pose[])('snooker %s view: pink, brown and black have their own names', (pose) => {
     const sc = snookerColours(pose);
     const r = detect(sc, render(sc, `snooker-colours-${pose}`));
@@ -545,7 +845,10 @@ describe('per-frame scratch (Constitution IV)', () => {
     expect(b).toEqual(a);
   });
 
-  it('allocates no typed arrays and < 2 MB of JS heap per call once warm', () => {
+  it('allocates no typed arrays and < 256 KB of JS heap per call once warm', () => {
+    // Per-pixel and per-edge-point loops must not allocate: Math.hypot, a closure or a per-pixel call
+    // with double arguments (boxed) each cost MBs per frame here (0.3.0: 0.5 MB, with a boxed per-pixel
+    // call 7 MB). What remains is per-blob bookkeeping (a few KB).
     const { det, cal } = setup();
     for (let i = 0; i < 5; i++) detectBalls(frame(), cal, sc.table, det.cloth);
     let maxBuf = -Infinity;
@@ -560,6 +863,6 @@ describe('per-frame scratch (Constitution IV)', () => {
     }
     console.log(`detectBalls per call: ArrayBuffers +${(maxBuf / 1024).toFixed(0)} KB, heap +${(maxHeap / 1024).toFixed(0)} KB (max of 20)`);
     expect(maxBuf).toBeLessThan(64 * 1024);
-    expect(maxHeap).toBeLessThan(2 * 1024 * 1024);
+    expect(maxHeap).toBeLessThan(256 * 1024);
   });
 });

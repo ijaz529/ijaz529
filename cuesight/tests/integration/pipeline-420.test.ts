@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Frame } from '../../src/vision/image';
 import { createPipeline } from '../../src/vision/pipeline';
-import { renderSyntheticTable } from '../../src/vision/synth/render';
+import { BALL_COLORS, renderSyntheticTable, type SynthBall } from '../../src/vision/synth/render';
 import { scene } from '../helpers/scenes';
 
 /** Simulate video chroma subsampling (YUV 4:2:0): full-res luma, 2×2-averaged chroma. */
@@ -40,6 +40,72 @@ function chroma420(f: Frame): Frame {
     }
   return { width: w, height: h, data: out };
 }
+
+describe('vision pipeline on 4:2:0 video frames: touching pairs, the cue the only isolated ball', () => {
+  it('tracks exactly the five balls (no phantom from the chroma ring)', () => {
+    const base = scene('corner');
+    const cam = base.camera.pos;
+    const R = base.table.ballRadius;
+    const balls: SynthBall[] = [{ pos: { x: -0.75, y: -0.12 }, color: BALL_COLORS.cue! }];
+    for (const [cx, cy] of [
+      [0.3, 0.1],
+      [0.8, 0.35],
+    ]) {
+      const a = Math.atan2(cy! - cam.y, cx! - cam.x) + Math.PI / 2; // side by side, square to the view
+      const g = R + 0.0002;
+      balls.push({ pos: { x: cx! - g * Math.cos(a), y: cy! - g * Math.sin(a) }, color: BALL_COLORS.red! });
+      balls.push({ pos: { x: cx! + g * Math.cos(a), y: cy! + g * Math.sin(a) }, color: BALL_COLORS.blue! });
+    }
+    const frame = chroma420(renderSyntheticTable({ ...base, balls }));
+    const p = createPipeline({ table: base.table });
+    let r = p.process(frame);
+    for (let i = 1; i < 8; i++) r = p.process(frame);
+    expect(r.status).toBe('locked');
+    expect(r.balls.map((b) => `${b.pos.x.toFixed(2)},${b.pos.y.toFixed(2)}`)).toHaveLength(balls.length);
+    expect(r.balls.filter((b) => b.isCue)).toHaveLength(1);
+  });
+
+  it('racked 15 in the end view: the full pipeline costs at most ~1.5× the 9-ball fixture frame', () => {
+    // Constitution IV / SC-002: 100 ms per frame on the device. A 15-ball pack is the costliest scene for
+    // the disc model; the guard is relative to the fixture frame timed interleaved with it, so a loaded
+    // CI machine slows both alike (0.3.0 detector: ~1.7×; the 0.2.x one ~1.0×), plus the same generous
+    // absolute cap as the 640×480 pipeline test.
+    const base = scene('end');
+    const R = base.table.ballRadius;
+    const cols = ['yellow', 'blue', 'red', 'purple', 'orange', 'green', 'maroon', 'black'];
+    const balls: SynthBall[] = [{ pos: { x: -0.635, y: 0.1 }, color: BALL_COLORS.cue! }];
+    const g = R + 0.0001;
+    let idx = 0;
+    for (let row = 0; row < 5; row++)
+      for (let k = 0; k <= row; k++) {
+        balls.push({ pos: { x: 0.635 + row * Math.sqrt(3) * g, y: (k - row / 2) * 2 * g }, color: BALL_COLORS[cols[idx % cols.length]!]!, ...(idx >= 8 ? { stripe: true } : {}) });
+        idx++;
+      }
+    const rack = renderSyntheticTable({ ...base, balls });
+    const fix = renderSyntheticTable(base);
+    const pr = createPipeline({ table: base.table });
+    const pf = createPipeline({ table: base.table });
+    for (let i = 0; i < 3; i++) {
+      pr.process(rack);
+      pf.process(fix);
+    }
+    const tr: number[] = [];
+    const tf: number[] = [];
+    for (let i = 0; i < 9; i++) {
+      let t0 = performance.now();
+      pr.process(rack);
+      tr.push(performance.now() - t0);
+      t0 = performance.now();
+      pf.process(fix);
+      tf.push(performance.now() - t0);
+    }
+    tr.sort((a, b) => a - b);
+    tf.sort((a, b) => a - b);
+    console.log(`pipeline, end view: racked 15 median ${tr[4]!.toFixed(1)} ms, fixture ${tf[4]!.toFixed(1)} ms (×${(tr[4]! / tf[4]!).toFixed(2)})`);
+    expect(tr[4]! / tf[4]!).toBeLessThan(1.5);
+    expect(tr[4]!).toBeLessThan(250);
+  });
+});
 
 describe('vision pipeline on 4:2:0 video frames (corner view, the fake-camera scene)', () => {
   it('locks and tracks the REAL cue ball within 3 cm', () => {
