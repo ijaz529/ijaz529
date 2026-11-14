@@ -147,7 +147,8 @@ Each decision lists what was chosen, why, and what was rejected.
   - Score = objective − penalties.
     - Objective: next-shot quality from the CB rest position (best log-tolerance over remaining
       balls and pockets), or −distance to the player's target spot.
-    - Penalties: speed, spin magnitude, OB not pocketed, any kiss.
+    - Penalties: speed (0.06·power + 0.1·max(0, power − 6)², a coach's bias toward controllable
+      pace), spin magnitude, OB not pocketed, any kiss.
     - Hard rejection: scratch.
   - Robustness: each finalist is re-simulated at ±12 % speed and scored by its worst case.
 - **Rationale**: transparent, deterministic, and fast enough in a worker (~200–600 short sims). The

@@ -126,7 +126,8 @@ src/
 ├── vision/                     # Pure TS image algorithms on typed arrays
 │   ├── image.ts                # RGBA/HSV helpers, integral images
 │   ├── homography.ts           # DLT, apply/invert, focal estimation, pose, plane-at-height
-│   ├── table-detect.ts         # Cloth model, mask, components, hull, quad line fit
+│   ├── table-detect.ts         # Cloth model, mask, components, hull, max-area quad, line refit
+│   ├── calibration.ts          # Corner ordering, axis choice, focal estimate, pose → H0 / HR
 │   ├── ball-detect.ts          # Rectify @ ball height, disk/ring score, NMS, classify
 │   ├── tracker.ts              # Temporal smoothing + lock state
 │   ├── pipeline.ts             # processFrame()
@@ -140,6 +141,7 @@ src/
     ├── store.ts                # Tiny observable app state
     ├── camera.ts               # getUserMedia + backpressured frame capture
     ├── settings.ts             # Persisted settings (guarded localStorage)
+    ├── drills.ts               # Practice-table layouts
     ├── render/
     │   ├── palette.ts          # Okabe–Ito colours + dash styles
     │   ├── overlay.ts          # Perspective AR overlay on the camera view
@@ -157,6 +159,7 @@ tests/
 └── e2e/…                       # Playwright (virtual table + fake camera)
 
 scripts/make-fake-camera.ts     # Renders synthetic table frames → tests/fixtures/table.y4m
+scripts/screenshots.cjs         # README screenshots (fake camera)
 public/                         # manifest.webmanifest, sw.js, icon.svg
 index.html
 ```

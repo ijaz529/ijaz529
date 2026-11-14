@@ -168,7 +168,9 @@ Display: 1 tip ≈ 0.25 R, so "½ tip low" means `vert = −0.125`.
 
 ### DetectedBall
 
-`{ pos (table m), image (px), isCue, score 0..1, rgb [r,g,b], label }`
+`{ pos (table m), image (px), isCue, score 0..1, rgb [r,g,b], label, white (cue-likelihood score), px (blob pixel count) }`
+
+Two detections closer than 1.7 R are merged: real balls can't be closer than 2R.
 
 ### VisionResult
 
