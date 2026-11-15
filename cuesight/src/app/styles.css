@@ -1021,6 +1021,24 @@ body[data-mode='snap'] .toolbar {
   white-space: normal;
   overflow-wrap: anywhere;
 }
+/* On the bottom sheet the headline keeps to its row whatever the font: the difficulty chip stays
+   beside the title, and a pocket name too long for the room left wraps to a second line instead
+   (up to 400 px wide in 16 px type on 18 px lines, so two lines fit the row's 36 px). With a 180 px
+   basis for the title a wide fallback font (DejaVu Sans on Linux, about a fifth wider than SF Pro,
+   Inter or Roboto) sent the chip to a row of its own at 375 px, and those 28 px pushed the cut
+   numeral and the spin tile out of the peek. The chip still drops below the title when that would
+   leave it under 130 px. */
+@media not ((orientation: landscape) or (min-width: 900px)) {
+  .title {
+    flex-basis: 130px;
+    line-height: 1.125;
+  }
+}
+@media (orientation: portrait) and (max-width: 400px) {
+  .title {
+    font-size: 16px;
+  }
+}
 .ball-chip {
   position: relative;
   flex: 0 0 auto;
@@ -3003,6 +3021,21 @@ body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
   /* centred on the first line (16 px icon, 13 px × 1.3 line) */
   margin-top: 0.5px;
   color: #ff9b66;
+}
+/* Up to 400 px wide the line gives its frame a little, so the 85-character frozen warning ("Cue ball
+   is frozen … with follow.") shows in full in the peek's two lines in a wide fallback font too:
+   DejaVu Sans sets it in 564 px, two lines of 305 px at 375 px (at 13 px in a 299 px line it took
+   three). */
+@media (orientation: portrait) and (max-width: 400px) {
+  .head-warn {
+    gap: 6px;
+    padding: 6px 8px;
+    font-size: 12.5px;
+  }
+  .head-warn .icon {
+    /* centred on the first line (16 px icon, 12.5 px × 1.3 line) */
+    margin-top: 0;
+  }
 }
 .panel[data-sheet='peek'] .shot.has-warn .hero {
   margin-top: 6px;

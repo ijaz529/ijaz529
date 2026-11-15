@@ -335,6 +335,108 @@ for (const viewport of [
   });
 }
 
+/**
+ * Switches the app's font stack to DejaVu Sans, the font a Linux machine without Inter (GitHub's
+ * ubuntu runner) falls back to for system-ui and sans-serif: about a fifth wider than SF Pro, Inter
+ * or Roboto. False (nothing changed) where DejaVu Sans is not installed.
+ */
+async function wideFallbackFont(page: Page): Promise<boolean> {
+  const installed = await page.evaluate(() => {
+    const c = document.createElement('canvas').getContext('2d')!;
+    const width = (font: string) => ((c.font = font), c.measureText('mmmm iiii WWWW 0123').width);
+    return width('700 20px "DejaVu Sans", monospace') !== width('700 20px monospace');
+  });
+  if (installed) await page.addStyleTag({ content: `:root { --font: 'DejaVu Sans', sans-serif; }` });
+  return installed;
+}
+
+// CI run 43718867091: on the ubuntu runner (DejaVu Sans) the difficulty chip dropped to a row of its
+// own at 375 px, and that 28 px pushed the cut numeral and the two-line spin tile out of the peek; the
+// 85-character frozen warning took three lines there. A wide font must cost the peek nothing: the chip
+// stays beside the title (the pocket name wraps inside the row's height instead), the warning keeps to
+// two lines, and the numerals and the stroke name stay in view. Forced here, so any Linux machine
+// checks it whatever its own UI font.
+for (const viewport of [
+  { width: 375, height: 667 },
+  { width: 393, height: 852 },
+]) {
+  test.describe(`the peek with a wide fallback font at ${viewport.width}×${viewport.height}`, () => {
+    test.use({ viewport });
+    test('one headline row, the warning in two lines, the cut numeral and the stroke name in view (DejaVu Sans)', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice&renderer=2d');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      test.skip(!(await wideFallbackFont(page)), 'DejaVu Sans is not installed');
+      const peek = () =>
+        page.evaluate(() => {
+          const card = document.querySelector('#shot-card')!;
+          const box = (sel: string) => card.querySelector(sel)!.getBoundingClientRect();
+          const span = card.querySelector<HTMLElement>('.head-warn span');
+          const spin = card.querySelector<HTMLElement>('.hero-stat.spin .s')!;
+          const title = box('.title');
+          const chip = box('[data-testid="difficulty"]');
+          const cut = box('[data-testid="cut"]');
+          const s = spin.getBoundingClientRect();
+          return {
+            sheet: document.querySelector<HTMLElement>('.panel')!.dataset.sheet,
+            font: getComputedStyle(card).fontFamily,
+            // The chip beside the title, not under it; the row no taller than the chip and ball need.
+            chipBeside: chip.top < title.bottom && chip.left >= title.right,
+            head: Math.round(box('.shot-head').height * 10) / 10,
+            warn: span ? { clippedX: span.scrollWidth - span.clientWidth, clippedY: span.scrollHeight - span.clientHeight, onScreen: box('.head-warn').top >= 0 && box('.head-warn').bottom <= innerHeight } : null,
+            cutInView: cut.top >= 0 && cut.bottom <= innerHeight,
+            stroke: spin.textContent!.replace(/\s+/g, ' ').trim(),
+            strokeClipped: [...spin.querySelectorAll<HTMLElement>('span')].some((e) => e.scrollWidth > e.clientWidth),
+            strokeInView: s.width > 4 && s.top >= 0 && s.bottom <= innerHeight,
+            hero: box('.hero').height,
+          };
+        });
+
+      // The headline warning at the peek (power 2: "Too soft … Use power 3.5+."), then the 85-character
+      // frozen one in its place.
+      await hookEval(page, (h) => h.selectBall('b1'));
+      await hookEval(page, (h) => h.selectPocket('TR'));
+      await expect(page.getByTestId('cut')).toHaveText('30.0°');
+      await page.locator('#power').evaluate((r: HTMLInputElement) => {
+        r.value = '2';
+        r.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await expect(page.locator('#shot-card .head-warn')).toContainText('Use power');
+      await sheetSettled(page);
+      const warned = await peek();
+      expect(warned.font).toContain('DejaVu Sans');
+      expect(warned).toMatchObject({ sheet: 'peek', chipBeside: true, warn: { clippedX: 0, clippedY: 0, onScreen: true }, cutInView: true });
+      expect(warned.head, 'the headline row keeps its height').toBeLessThanOrEqual(36.5);
+      await page.evaluate(() => {
+        document.querySelector<HTMLElement>('#shot-card .head-warn span')!.textContent = 'Cue ball is frozen to the object ball: expect extra throw; hit it softly with follow.';
+      });
+      expect(await peek(), 'the 85-character frozen warning').toMatchObject({ warn: { clippedX: 0, clippedY: 0, onScreen: true }, cutInView: true });
+
+      // The spin tile naming a stroke with side on two lines ("Follow," / "right english").
+      const stroke = (side: number) =>
+        page.evaluate((side) => {
+          const h = (window as unknown as { __cuesight: PlanHook & { state: { myStroke: unknown; strokeMode: string } } }).__cuesight;
+          h.state.myStroke = { power: 3, side, vert: 0.3 };
+          h.state.strokeMode = 'mine';
+          h.selectPocket('TR');
+        }, side);
+      await stroke(0);
+      await expect(page.locator('#shot-card .head-warn')).toHaveCount(0);
+      await expect(page.locator('#shot-card .hero-stat.spin .s')).not.toContainText('english');
+      await sheetSettled(page);
+      const plain = await peek();
+      await stroke(0.25);
+      await expect(page.locator('#shot-card .hero-stat.spin .s')).toContainText('right english');
+      await sheetSettled(page);
+      const side = await peek();
+      expect(side.stroke).toMatch(/^[A-Z][a-z-]+( shot)?, right english$/);
+      expect(side, JSON.stringify(side)).toMatchObject({ sheet: 'peek', chipBeside: true, cutInView: true, strokeClipped: false, strokeInView: true });
+      expect(side.head, 'the headline row keeps its height').toBeLessThanOrEqual(36.5);
+      expect(side.hero, 'the hero no taller').toBeLessThanOrEqual(plain.hero + 0.5);
+    });
+  });
+}
+
 test.describe('re-renders keep keyboard focus', () => {
   test('a store flush keeps the focused suggestion (the same element), and picking a pocket by keyboard keeps focus on it', async ({ page }) => {
     await practiceWithPlan(page);
