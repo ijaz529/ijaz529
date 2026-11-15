@@ -9,7 +9,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { makeTable } from '../../src/core/table';
 import type { TablePresetId, TableSpec } from '../../src/core/types';
 import type { Frame } from '../../src/vision/image';
-import { estimatePlayerView, projectPoint, type CameraPose, type KnownBall, type PlayerViewInput, type PlayerViewResult } from '../../src/vision/player-view';
+import { estimatePlayerView, PLAYER_VIEW_REASONS, projectPoint, type CameraPose, type KnownBall, type PlayerViewInput, type PlayerViewResult } from '../../src/vision/player-view';
 import { BALL_COLORS, cameraModel, fixtureBalls, playerViewCamera, renderSyntheticTable, type SynthBall, type SynthCamera } from '../../src/vision/synth/render';
 import { PROTOCOL_VERSION, isSupported, type VisionIn, type VisionOut } from '../../src/workers/protocol';
 import { createVisionHandler } from '../../src/workers/vision.worker';
@@ -288,16 +288,21 @@ describe('player-view honesty: no guide from a photo it cannot read (Principle I
   });
 
   it("a neutral (grey) overview cloth hint carries no hue: it never turns a red floor into the cloth, and changes nothing on green", () => {
-    // The overview pipeline now locks grey cloth with ClothModel {kind: 'neutral', hue: 0}. Read as a
-    // hue, that hint made this photo's cloth the red floor (reason "can't see enough balls" instead of
-    // the no-hint "too dark").
+    // The overview pipeline locks grey cloth with ClothModel {kind: 'neutral', hue: 0}. Read as a hue,
+    // that hint made this photo's cloth the red floor. This test used to also require ok: false on the
+    // grey photo, because the matcher was hue-only and could not read a grey cloth at all (it failed
+    // with "too dark"); the player photo now reads grey cloth (neutral models, as in table-detect), so
+    // the same photo fits, with and without the hint, to the same pose.
     const neutral = { hue: 0, sat: 0.06, val: 0.47, kind: 'neutral' as const };
     const grey = renderSyntheticTable({ table: base.table, balls: base.balls, camera: base.cam, width: W, height: H, ss: 1, cloth: [110, 116, 124], floor: [170, 40, 35] });
     const without = run(base, {}, grey);
     const withHint = run(base, { clothHint: neutral }, grey);
-    expect(without.ok).toBe(false);
-    expect(withHint.ok).toBe(false);
-    expect(withHint.reason).toBe(without.reason);
+    for (const r of [without, withHint]) {
+      expect(r.ok, r.reason).toBe(true);
+      const e = poseErrors(poseOf(base.cam, W, H), r.pose!, base.table, base.balls[0]!.pos, base.balls[base.targetIdx]!.pos);
+      expect(e.ghostW).toBeLessThan(0.015);
+    }
+    expect(withHint.pose).toEqual(without.pose);
     const green = run(base, { clothHint: neutral });
     expect(green.ok).toBe(true);
     expect(green.pose).toEqual(run(base).pose);
@@ -430,7 +435,10 @@ describe('Snap fixtures through the vision worker (protocol v2)', () => {
     const auto = send({ v: PROTOCOL_VERSION, type: 'player-view', id: 3, input: { frame, table, balls: layout, cueId, targetId } });
     if (auto.type !== 'player-view') throw new Error(auto.type);
     expect(auto.result.ok).toBe(false);
-    expect(auto.result.reason).toMatch(/Tap the cue ball/);
+    // The photo shows two balls (the cue ball and the black) and one cushion line. This used to read
+    // "I couldn't line up this photo. Tap the cue ball, …"; the true cause, which the reason now names,
+    // is that fewer than three balls are in view (the app still offers the two taps on any failure).
+    expect(auto.result.reason).toBe(PLAYER_VIEW_REASONS.tooFewBalls);
     const taps = ph.expect!.manualTaps!;
     const manual = send({ v: PROTOCOL_VERSION, type: 'player-view', id: 4, input: { frame, table, balls: layout, cueId, targetId, manualTaps: taps } });
     if (manual.type !== 'player-view') throw new Error(manual.type);
