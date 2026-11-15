@@ -164,8 +164,8 @@ independent sweeps):
   fits 45 of 48, with no ok fit off tolerance.
 - Grey cloth: tinted greys fit; untinted greys (S ≤ 0.06) fit in ≈ 30 % and otherwise fail honestly
   (R-24 known limits).
-- CPU per 960×720 photo: p95 < 250 ms, guarded over the envelope and over a set of mostly failing
-  photos.
+- CPU per 960×720 photo: p95 < 250 ms on a device. The tests guard it over the envelope and over a set
+  of mostly failing photos, relative to fits measured in the same run, with a 500 ms CI backstop.
 
 ## Unit invariants (tested)
 

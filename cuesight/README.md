@@ -63,8 +63,8 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
 **Test status** (release branch, 2026-11-15): `npx vitest run` runs **1032 tests in 68 files**, all
-passing; the two player-view CPU guards (p95 < 250 ms per photo) sit close to their limit on a slow or
-busy CPU, so re-run them alone before concluding. `npm run e2e` runs **137 tests**, all passing.
+passing (timing guards compare against work measured in the same run, so a busy CPU does not fail them).
+`npm run e2e` runs **137 tests**, all passing, also with a wide fallback font (DejaVu Sans, as on CI).
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
 HTTPS host (GitHub Pages, Netlify, Cloudflare Pages) and open it on the phone. Then use "Add to Home
@@ -226,7 +226,7 @@ are looser than the device budgets:
 | Vision pipeline per frame (640×480) | ~30–85 ms | — | 150 ms |
 | Full shot plan, 22 balls | ~7–20 ms | 50 ms | 100 ms |
 | Position search (264 simulations on the test layout; at most 324) | ~0.6 s | 1.5 s | 3 s |
-| Snap player-photo fit (960×720) | median ~104 ms, p95 ~250 ms | 1.5 s | p95 < 250 ms CPU, 500 ms at 1280 px |
+| Snap player-photo fit (960×720) | median ~104 ms, p95 ~250 ms | 1.5 s | p95 < 4 × a successful fit's median and < 500 ms CPU (device budget 250 ms) |
 
 A frame with a snooker pack spends about 10–20 ms more in ball detection than before the cluster fix
 (about 45–56 ms against 35–40 ms on Node): a pack seen small is fitted again on a finer window. Pool

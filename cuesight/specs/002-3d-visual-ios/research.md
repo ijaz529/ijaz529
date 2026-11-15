@@ -350,7 +350,7 @@ The step-by-step contract is [contracts/player-view-api.md](./contracts/player-v
     the table photo: no ok fit with a wrong guide in 160 runs; static photos never "moved" in the
     envelope tests.
   - Time per 960×720 photo: median ≈ 104 ms, p95 ≈ 250 ms (wall, Node; before: 61 and 140 ms). The
-    tests guard p95 < 250 ms CPU over the envelope and over a set of mostly failing photos; a 1280 px
+    the device budget is 250 ms per 960×720 photo; the tests guard it relative to fits measured in the same run (failing photos p95 < 4 × the successful-fit median, envelope p95 < 2.75 × its median) with a 500 ms CI backstop (device budget × the CI factor 2 of perf.test.ts); a 1280 px
     photo stays inside SC-109's 500 ms. The slow tail is wide-angle and snooker photos (5–6 k
     hypotheses).
 - **Known limits** (Constitution II):

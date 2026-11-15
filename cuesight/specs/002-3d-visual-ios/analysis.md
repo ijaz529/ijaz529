@@ -59,7 +59,7 @@ This is the `/speckit-analyze` cross-artifact pass for feature 002 (T172), dated
 | R-25 | II / SC-107 | — | player-view.ts | Low ultra-wide photos (5–9 cm up, 92–100°) with 2–3 balls returned ok fits 5–9 % off at high confidence | Resolved by the release verification. Cushion lines count as crossing only at ≥ 10° in the photo. The s101053-neighbourhood tests (44 + 44 photos, green and grey) now give 0 ok fits off tolerance |
 | R-26 | FR-118 | — | snap/session.ts | Dark, grainy and no-cloth photos looped on the two taps | Resolved: taps are offered once (dark, grainy) or refused (no cloth, moved), and a better photo is asked for (snap.spec) |
 | R-27 | FR-121 | LOW | player-view.ts | A target moved along the line of sight still fitted "good" | Resolved for moves of ≥ 0.4 R in the photo. Smaller moves are a known limit (README) |
-| R-24 | Risk | LOW | player-view CPU guards | p95 sits near the 250 ms per-photo budget on a slow (2.1 GHz) or busy CPU | Accepted. The guards measure process CPU time; on CI runners and current phones the tail is lower. Re-run alone before concluding |
+| R-24 | Risk | LOW | player-view CPU guards | p95 sat near the 250 ms per-photo budget on a slow or busy CPU, and failed on a CI runner (352 ms) | Resolved: the device budget is 250 ms per 960×720 photo; the tests guard it relative to fits measured in the same run (failing photos p95 < 4 × the successful-fit median, envelope p95 < 2.75 × its median) with a 500 ms CI backstop (device budget × the CI factor 2 of perf.test.ts). Re-run alone before concluding |
 
 ## Coverage
 
