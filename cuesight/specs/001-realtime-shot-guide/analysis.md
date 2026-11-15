@@ -260,7 +260,9 @@ the same docs pass.
 <!-- RELEASE: the test counts below are the README "Test status" figures; update both together. -->
 **Tests on `fix2b/app`**: `npx vitest run` 887 tests in 61 files, 881 pass and 6 fail (the same
 `ball-detect-edge.test.ts` cases as P-C1). `npm run e2e` 125 tests, all passing. `tsc --noEmit` is
-clean.
+clean. **On the release branch** (after the vision merge and the polish pass): 1024 tests in 68 files,
+all passing (P-C1 resolved; the player-view CPU guards are load-sensitive near 250 ms), and 132 e2e
+tests, all passing.
 
 | ID | Status on `fix2b/app` | Evidence |
 |---|---|---|

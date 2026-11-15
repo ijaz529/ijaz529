@@ -62,10 +62,9 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 "Starting camera…". Timing tests can fail on a busy CPU; re-run them alone before concluding.
 
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
-**Test status** (as of `fix2b/app`, 00f722d): `npx vitest run` runs **887 tests in 61 files**; 881
-pass and **6 known vision failures** remain in `tests/unit/vision/ball-detect-edge.test.ts` (touching
-clusters ×5 and the 4:2:0 corner-pair phantom), pending the vision branch. `npm run e2e` runs **125
-tests**, all passing.
+**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1024 tests in 68 files**, all
+passing; the two player-view CPU guards (p95 < 250 ms per photo) sit close to their limit on a slow or
+busy CPU, so re-run them alone before concluding. `npm run e2e` runs **132 tests**, all passing.
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
 HTTPS host (GitHub Pages, Netlify, Cloudflare Pages) and open it on the phone. Then use "Add to Home
@@ -329,7 +328,8 @@ part of the repo:
    - [analysis](specs/001-realtime-shot-guide/analysis.md), with the post-review status
 5. [`specs/002-3d-visual-ios/`](specs/002-3d-visual-ios/): the 3D table, Snap, the Midnight Felt design
    and the iOS app ([spec](specs/002-3d-visual-ios/spec.md), [plan](specs/002-3d-visual-ios/plan.md),
-   [contracts](specs/002-3d-visual-ios/contracts/), [tasks](specs/002-3d-visual-ios/tasks.md)).
+   [contracts](specs/002-3d-visual-ios/contracts/), [tasks](specs/002-3d-visual-ios/tasks.md),
+   [analysis](specs/002-3d-visual-ios/analysis.md)).
 
 The Spec Kit skills (`/speckit-specify`, `/speckit-plan`, `/speckit-tasks`, `/speckit-implement`…) are
 installed in `.claude/skills` for the next feature.

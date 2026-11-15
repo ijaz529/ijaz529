@@ -15,12 +15,12 @@ playback, scene-data, gestures) and through Playwright with SwiftShader.
 
 **Organization**: tasks are grouped by user story, so each story can be built and demoed on its own.
 
-**Status (2026-11-15, `rc/release` = 9a162bf)**: 68 of 72 tasks are done. The player-photo merge
+**Status (2026-11-15, release branch)**: 69 of 72 tasks are done. The player-photo merge
 (`0a30cf5`) split the photo detection into `src/vision/player-detect.ts` with its own unit tests, so
 T133 is done. Open: T134 (the `lm.ts` split was not made: the Levenberg–Marquardt solver is still
 inside `src/vision/player-view.ts`, so there is no `lm.test.ts`), T168 (TestFlight needs the owner's
-App Store Connect secrets), T171 (the device frame rate needs a phone) and T172 (the `analysis.md`
-report). Where the build differs from a task's text, an **On `fix2b/app`** (or **On `rc/release`**)
+App Store Connect secrets) and T171 (the device frame rate needs a phone). T172 is done
+(`analysis.md`). Where the build differs from a task's text, an **On `fix2b/app`** (or **On `rc/release`**)
 line under the task says how. The 6 `ball-detect-edge.test.ts` cases that failed on `fix2b/app` were
 001 vision tests (001 T074); they pass since the ball-cluster merge (`360b268`).
 
@@ -394,8 +394,8 @@ the build reaches TestFlight.
   - device frame rate during orbit and replay recorded
 
   (pkg: integrate)
-- [ ] T172 Run the quickstart validation (Q101–Q127) and `/speckit-analyze` for 002, writing the results to `specs/002-3d-visual-ios/analysis.md`, and fix the inconsistencies (pkg: coordinator)
-  - **On `fix2b/app`**: in part. The quickstart scenarios were driven in the built app by the wave-2a and wave-2b final verifications, and the 2026-11-15 docs pass fixed the inconsistencies they and the review found (spec, plan, research, data model, contracts, quickstart and these tasks). The cross-check report itself, `analysis.md`, is still to be added.
+- [X] T172 Run the quickstart validation (Q101–Q127) and `/speckit-analyze` for 002, writing the results to `specs/002-3d-visual-ios/analysis.md`, and fix the inconsistencies (pkg: coordinator)
+  - **On `fix2b/app`**: in part. The quickstart scenarios were driven in the built app by the wave-2a and wave-2b final verifications, and the 2026-11-15 docs pass fixed the inconsistencies they and the review found (spec, plan, research, data model, contracts, quickstart and these tasks). The cross-check report is `analysis.md` (first run on `fix2b/app`, re-checked on the release branch after the vision merges).
 
 ---
 
