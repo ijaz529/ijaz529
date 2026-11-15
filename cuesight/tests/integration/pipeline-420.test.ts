@@ -3,6 +3,7 @@
  * the tracked cue ball must be the real cue ball, not merely "some ball flagged as the cue".
  */
 import { describe, expect, it } from 'vitest';
+import { detectBalls } from '../../src/vision/ball-detect';
 import type { Frame } from '../../src/vision/image';
 import { createPipeline } from '../../src/vision/pipeline';
 import { BALL_COLORS, renderSyntheticTable, type SynthBall } from '../../src/vision/synth/render';
@@ -65,11 +66,17 @@ describe('vision pipeline on 4:2:0 video frames: touching pairs, the cue the onl
     expect(r.balls.filter((b) => b.isCue)).toHaveLength(1);
   });
 
-  it('racked 15 in the end view: the full pipeline costs at most ~1.5× the 9-ball fixture frame', () => {
+  it('racked 15 in the end view: ball detection costs at most ~2.25× the 9-ball fixture frame’s, the pipeline stays under the cap', () => {
     // Constitution IV / SC-002: 100 ms per frame on the device. A 15-ball pack is the costliest scene for
     // the disc model; the guard is relative to the fixture frame timed interleaved with it, so a loaded
-    // CI machine slows both alike (0.3.0 detector: ~1.7×; the 0.2.x one ~1.0×), plus the same generous
-    // absolute cap as the 640×480 pipeline test.
+    // CI machine slows both alike, plus the same generous absolute cap as the 640×480 pipeline test.
+    // The relative guard times the ball-detection stage it protects, not the whole pipeline: the
+    // pipeline ratio also moves with every other stage's cost. (Wave-1 integration: the prior-first
+    // table detection cut the rest of the pipeline from ≈29 to ≈12 ms per frame, so the whole-pipeline
+    // ratio rose from 1.33–1.39× to 1.63–1.66× while both frames got faster: rack 69–73 → 56–63 ms,
+    // fixture 51–53 → 35–38 ms.) detectBalls on the pack vs the fixture, fastest of 15 interleaved runs:
+    // current detector 1.82–1.90× (alone and beside a full vitest load), the 0.3.0 detector 2.45–2.46×
+    // (which this guard was written to catch).
     const base = scene('end');
     const R = base.table.ballRadius;
     const cols = ['yellow', 'blue', 'red', 'purple', 'orange', 'green', 'maroon', 'black'];
@@ -85,24 +92,46 @@ describe('vision pipeline on 4:2:0 video frames: touching pairs, the cue the onl
     const fix = renderSyntheticTable(base);
     const pr = createPipeline({ table: base.table });
     const pf = createPipeline({ table: base.table });
-    for (let i = 0; i < 3; i++) {
-      pr.process(rack);
-      pf.process(fix);
+    let lr = pr.process(rack);
+    let lf = pf.process(fix);
+    for (let i = 1; i < 3; i++) {
+      lr = pr.process(rack);
+      lf = pf.process(fix);
     }
     const tr: number[] = [];
     const tf: number[] = [];
     for (let i = 0; i < 9; i++) {
       let t0 = performance.now();
-      pr.process(rack);
+      lr = pr.process(rack);
       tr.push(performance.now() - t0);
       t0 = performance.now();
-      pf.process(fix);
+      lf = pf.process(fix);
       tf.push(performance.now() - t0);
     }
-    tr.sort((a, b) => a - b);
-    tf.sort((a, b) => a - b);
-    console.log(`pipeline, end view: racked 15 median ${tr[4]!.toFixed(1)} ms, fixture ${tf[4]!.toFixed(1)} ms (×${(tr[4]! / tf[4]!).toFixed(2)})`);
-    expect(tr[4]! / tf[4]!).toBeLessThan(1.5);
+    // The ball-detection stage alone, on each frame's own (pipeline) calibration and cloth, alternated
+    // call by call; each frame's fastest run is its cost with the least interference from other work
+    // on a shared machine (medians of 9 swung to 2.47× in a loaded full run).
+    expect(lr.calibration && lr.cloth && lf.calibration && lf.cloth, 'both frames calibrated').toBeTruthy();
+    const dr = () => detectBalls(rack, lr.calibration!, base.table, lr.cloth!);
+    const df = () => detectBalls(fix, lf.calibration!, base.table, lf.cloth!);
+    dr();
+    df();
+    const br: number[] = [];
+    const bf: number[] = [];
+    for (let i = 0; i < 15; i++) {
+      let t0 = performance.now();
+      dr();
+      br.push(performance.now() - t0);
+      t0 = performance.now();
+      df();
+      bf.push(performance.now() - t0);
+    }
+    for (const a of [tr, tf, br, bf]) a.sort((x, y) => x - y);
+    console.log(
+      `pipeline, end view: racked 15 median ${tr[4]!.toFixed(1)} ms, fixture ${tf[4]!.toFixed(1)} ms (×${(tr[4]! / tf[4]!).toFixed(2)}); ` +
+        `detectBalls racked 15 min ${br[0]!.toFixed(1)} / median ${br[7]!.toFixed(1)} ms, fixture ${bf[0]!.toFixed(1)} / ${bf[7]!.toFixed(1)} ms (×${(br[0]! / bf[0]!).toFixed(2)} / ×${(br[7]! / bf[7]!).toFixed(2)})`,
+    );
+    expect(br[0]! / bf[0]!).toBeLessThan(2.25);
     expect(tr[4]!).toBeLessThan(250);
   });
 });

@@ -9,9 +9,10 @@ import { makeTable } from '../../../src/core/table';
 import type { TablePresetId } from '../../../src/core/types';
 import { detectBalls, type DetectedBall } from '../../../src/vision/ball-detect';
 import { calibrationFromCorners, type Calibration } from '../../../src/vision/calibration';
-import type { Frame } from '../../../src/vision/image';
+import { frameToHsv, type Frame } from '../../../src/vision/image';
 import { BALL_COLORS, cameraModel, fixtureBalls, renderSyntheticTable, type RGB, type SynthBall, type SynthCamera, type SynthScene } from '../../../src/vision/synth/render';
-import { detectTable, type ClothModel } from '../../../src/vision/table-detect';
+import { createTableScratch, detectTable, learnClothInQuad, type ClothModel } from '../../../src/vision/table-detect';
+import type { Vec2 } from '../../../src/core/vec';
 import { POSES } from '../../helpers/scenes';
 
 type Pose = 'end' | 'side' | 'corner' | 'overhead';
@@ -99,6 +100,13 @@ function exactCalibration(sc: SynthScene): Calibration {
   return { corners, H0: cam.planeH(0), HR: cam.planeH(t.ballRadius), focal: cam.f, focalSource: 'estimated', source: 'manual', camera: { ...cam.C }, width: sc.width, height: sc.height };
 }
 
+/** The cloth model learned inside a known outline (the pipeline's manual-corners path). */
+function clothInQuad(frame: Frame, quad: Vec2[]): ClothModel | null {
+  const sc = createTableScratch(frame.width, frame.height);
+  frameToHsv(frame, sc.hue, sc.sat, sc.val);
+  return learnClothInQuad(sc, quad);
+}
+
 interface Run {
   balls: DetectedBall[];
   cloth: ClothModel;
@@ -114,10 +122,15 @@ interface Run {
  */
 function detect(sc: SynthScene, frame: Frame, o: { exact?: boolean } = {}): Run {
   const det = detectTable(frame);
-  expect(det, 'table detected').not.toBeNull();
+  if (!o.exact) expect(det, 'table detected').not.toBeNull();
   const cal = o.exact ? exactCalibration(sc) : calibrationFromCorners(det!.corners, sc.table, frame.width, frame.height);
   expect(cal, 'calibrated').not.toBeNull();
-  const balls = detectBalls(frame, cal!, sc.table, det!.cloth);
+  // With the camera's own calibration (the detector alone), a framing the table detector declines
+  // (near corners below the frame) gets its cloth model from the known outline, as manual corners do
+  // in the pipeline.
+  const cloth = det?.cloth ?? clothInQuad(frame, cal!.corners);
+  expect(cloth, 'cloth model').not.toBeNull();
+  const balls = detectBalls(frame, cal!, sc.table, cloth!);
   let best: (Run & { cost: number }) | null = null;
   for (const sign of o.exact ? [1] : [1, -1]) {
     const pairs: { t: number; d: number; dist: number }[] = [];
@@ -132,7 +145,7 @@ function detect(sc: SynthScene, frame: Frame, o: { exact?: boolean } = {}): Run 
     }
     const fp = balls.map((_, i) => i).filter((i) => !used.has(i));
     const cost = match.reduce((a, m) => a + Math.min(m.err, 0.1), 0) + 0.1 * fp.length;
-    if (!best || cost < best.cost) best = { balls, cloth: det!.cloth, match, fp, cost };
+    if (!best || cost < best.cost) best = { balls, cloth: cloth!, match, fp, cost };
   }
   return best!;
 }
@@ -598,8 +611,9 @@ describe('touching pairs side by side across the view', () => {
   });
 
   it('640×360 end view, pairs square to the view (exact calibration)', () => {
-    // At 640×360 the automatic table fit is ~10 cm off (the table fills the frame edge to edge), which
-    // is table-detect's business; with the camera's own calibration this tests the detector alone.
+    // At 640×360 the near cushion is below the frame: the table detector declines the truncated
+    // outline (an earlier fit to the frame edge was ~10 cm off), which is table-detect's business; with
+    // the camera's own calibration (cloth learned inside its outline) this tests the detector alone.
     const sc = pairs('end', 90, 640, 360);
     const r = detect(sc, render(sc), { exact: true });
     const msg = `errors mm ${fmt(r.match.map((m) => m.err * 1000))}, labels ${r.balls.map((b) => b.label).join(',')}`;
