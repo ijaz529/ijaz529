@@ -1,5 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPlannerClient, recommendationOutcome, recommendedFromReply, watchWorker, type PlannerKind, type RecommendationReply } from '../../../src/app/planner-client';
+import {
+  cardDetailsShown,
+  cardPlanOf,
+  createPlannerClient,
+  fullPlanOptions,
+  planRequestKey,
+  recommendationOutcome,
+  recommendedFromReply,
+  watchWorker,
+  type PlannerKind,
+  type RecommendationReply,
+} from '../../../src/app/planner-client';
+import { renderShotCard, type CardContext } from '../../../src/app/ui/shot-card';
+import { DEFAULT_PHYSICS } from '../../../src/core/physics/params';
+import { planShot } from '../../../src/core/shot/planner';
+import { advisePower } from '../../../src/core/shot/power';
+import { makeTable } from '../../../src/core/table';
+import type { ShotRequest, TableLayout } from '../../../src/core/types';
 import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut } from '../../../src/workers/protocol';
 
 /** A planner worker the test answers by hand. */
@@ -337,7 +354,8 @@ describe('recommendationOutcome: what the app shows for a recommendation', () =>
     // Core types.ts: −Infinity only when no stroke pots the ball. The app falls back to the basic stroke.
     expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 30, reachable: false }), false)).toEqual({
       stroke: null,
-      toast: 'None of the strokes tried pots this ball — showing the basic stroke.',
+      // position.ts evaluate drops a stroke that scratches as well as one that misses: "without a scratch".
+      toast: 'None of the strokes tried pots this ball without a scratch — showing the basic stroke.',
     });
   });
 });
@@ -361,6 +379,111 @@ describe('recommendedFromReply: what the app keeps of a recommendation (wave-1 R
   it('the stroke is the outcome’s (null = the basic stroke when nothing pots it)', () => {
     const none = recReply(1, { score: -Infinity, evaluated: 30, reachable: false });
     expect(recommendedFromReply(none, recommendationOutcome(none, false)).stroke).toBeNull();
+  });
+});
+
+/** The merge-coherence top-right chain: the cue ball frozen to the 1 (pool9), too soft at power 1 with draw. */
+const T9 = makeTable('pool9');
+const frozenTR: TableLayout = {
+  table: T9,
+  balls: [
+    { id: 'cue', kind: 'cue', pos: { x: -0.2451160266459315, y: 0.23962167347191393 }, label: 'cue' },
+    { id: 'b1', kind: 'object', pos: { x: -0.1891063642501831, y: 0.25098126053810116 }, label: '1' },
+  ],
+  source: 'virtual',
+  frozen: false,
+};
+const softDraw: ShotRequest = { targetId: 'b1', stroke: { power: 1, side: 0, vert: -0.4 } };
+
+describe('the full-plan request carries only what planShot reads (verifier r1: no flicker when a recommendation lands)', () => {
+  // planShot ignores opts.recommended whenever the request has a stroke (planner.ts: request.stroke ??
+  // opts.recommended ?? default). Keyed with it, a recommendation reply landing after the player set
+  // a stroke re-keyed the same plan: the full plan was thrown away, asked for again, and the card flickered.
+  const rec = { power: 6, side: 0.1, vert: 0.2 };
+  const names = { TR: 'far right corner' };
+  it('a stroke the player set: the recommended stroke is in neither the options sent nor the key', () => {
+    expect(fullPlanOptions(softDraw, { names, recommended: rec })).toEqual({ names });
+    expect(planRequestKey(frozenTR, softDraw, DEFAULT_PHYSICS, { names, recommended: rec })).toBe(planRequestKey(frozenTR, softDraw, DEFAULT_PHYSICS, { names }));
+    // And the plan is indeed the same: what the key leaves out does not change it.
+    const a = planShot(frozenTR, softDraw, DEFAULT_PHYSICS, { names, recommended: rec, advice: false });
+    const b = planShot(frozenTR, softDraw, DEFAULT_PHYSICS, { names, advice: false });
+    expect(a).toEqual(b);
+  });
+  it('no stroke set: the recommended stroke is the stroke planned, so it stays in both', () => {
+    const req: ShotRequest = { targetId: 'b1' };
+    expect(fullPlanOptions(req, { names, recommended: rec })).toEqual({ names, recommended: rec });
+    expect(planRequestKey(frozenTR, req, DEFAULT_PHYSICS, { names, recommended: rec })).not.toBe(planRequestKey(frozenTR, req, DEFAULT_PHYSICS, { names }));
+  });
+  it('tables are told apart by their size, not only by the preset id', () => {
+    const wider: TableLayout = { ...frozenTR, table: { ...T9, width: T9.width + 0.01 } };
+    expect(planRequestKey(wider, softDraw, DEFAULT_PHYSICS, {})).not.toBe(planRequestKey(frozenTR, softDraw, DEFAULT_PHYSICS, {}));
+  });
+});
+
+describe('the shot card never shows a power minimum the frozen advice has not worked out (verifier r1)', () => {
+  // Without the advice, minPower is the minimum for the stroke angle at the played power — not the
+  // power to play (harder throws less, so the angle and the minimum move). Drawn as "Minimum x" it
+  // differed from the advice's figure on 55 of 72 frozen soft plans, for 0.1–1.2 s, or for good when
+  // the worker failed.
+  const ctx = (over: Partial<CardContext> = {}): CardContext => ({ targetLabel: '1', pocketName: 'far right corner', status: null, recommendedPending: false, showDetails: true, hint: '', ...over });
+  const stub = () => {
+    let html = '';
+    const el = {
+      dataset: {} as Record<string, string>,
+      get innerHTML() {
+        return html;
+      },
+      set innerHTML(v: string) {
+        html = v;
+      },
+      closest: () => null,
+      contains: () => false,
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      addEventListener: () => {},
+    };
+    return el as unknown as HTMLElement;
+  };
+  const meterLabel = (html: string) => /class="power-meter" role="img" aria-label="([^"]*)"/.exec(html)?.[1] ?? '';
+  const quick = planShot(frozenTR, softDraw, DEFAULT_PHYSICS, { advice: false });
+  const full = planShot(frozenTR, softDraw, DEFAULT_PHYSICS);
+
+  it('a plan whose advice is still coming: no minimum on the meter, no "NaN", no details row with a figure', () => {
+    expect(quick.adviceSkipped).toBe(true);
+    expect(quick.warnings.find((w) => w.code === 'too-soft')!.message).toBe('Too soft — object ball stops short.');
+    // Why it is withheld: the advice-off minimum is not the figure the advice gives (2.5 against 4.3
+    // here), so a card that drew it would tell the player a wrong power.
+    expect(Number.isFinite(quick.minPower)).toBe(true);
+    expect(advisePower(quick.minPower)).not.toBe(advisePower(full.minPower));
+    // As main.ts hands it to the card: no figure until the advice is known.
+    const el = stub();
+    renderShotCard(el, cardPlanOf(quick), ctx({ showDetails: cardDetailsShown(quick, true) }));
+    expect(meterLabel(el.innerHTML)).toMatch(/^Power 1 of 10, /);
+    expect(meterLabel(el.innerHTML)).not.toMatch(/Minimum|full power/);
+    expect(el.innerHTML).not.toMatch(/NaN|Infinity/);
+    expect(el.innerHTML).not.toContain('Min power');
+    expect(el.innerHTML).toContain('Too soft — object ball stops short.');
+    // Everything else is the plan as planned.
+    const { minPowerCapture: _c, ...rest } = quick;
+    expect({ ...cardPlanOf(quick)!, minPower: 0, minPowerSafe: 0 }).toEqual({ ...rest, minPower: 0, minPowerSafe: 0 });
+  });
+  it('the full plan, and any plan with nothing skipped, goes to the card as it is (its minimum is the advice’s)', () => {
+    expect(full.adviceSkipped).toBeUndefined();
+    expect(cardPlanOf(full)).toBe(full);
+    expect(cardDetailsShown(full, true)).toBe(true);
+    expect(cardDetailsShown(full, false)).toBe(false);
+    expect(cardDetailsShown(quick, false)).toBe(false);
+    expect(cardDetailsShown(null, true)).toBe(true);
+    expect(cardPlanOf(null)).toBeNull();
+    const el = stub();
+    renderShotCard(el, cardPlanOf(full), ctx());
+    expect(full.warnings.find((w) => w.code === 'too-soft')!.message, 'this layout has a working band').toMatch(/Use power [\d.]+/);
+    expect(meterLabel(el.innerHTML)).toMatch(/Minimum [\d.]+/);
+    expect(el.innerHTML).toContain('Min power');
+  });
+  it('the same plan gives the same card plan (the card redraws only for a new plan object)', () => {
+    expect(cardPlanOf(quick)).toBe(cardPlanOf(quick));
+    expect(cardPlanOf(quick)).not.toBe(quick);
   });
 });
 

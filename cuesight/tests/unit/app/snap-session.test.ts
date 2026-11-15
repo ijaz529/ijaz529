@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
+import { CALIBRATION_MESSAGES } from '../../../src/app/live-logic';
 import { clothRgbOf } from '../../../src/app/snap/photo';
 import { detectionUsable, initialSnap, snapAimText, snapGuideInstruction, snapReducer, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
 import { planShot } from '../../../src/core/shot/planner';
@@ -86,6 +87,48 @@ describe('four tapped corners the still pipeline refuses say why (VisionResult.r
     return snapReducer(s, { type: 'overview-result', vision, balls: [] });
   };
   const result = (o: Partial<VisionResult>): VisionResult => ({ status: 'searching', calibration: null, balls: [], quality: 0, cloth: null, ms: 1, ...o }) as VisionResult;
+
+  it('four taps that cannot be a table outline are refused before the photo is processed again, in Live’s words', () => {
+    // Verifier r1: the still pipeline answers such taps 'cloth-unknown', so Snap said "Couldn’t tell
+    // the cloth…" where Live (live-logic cornersPlausible) says "Those four taps aren’t the cloth
+    // corners". The same check now runs on Snap's taps (photo px), before any still is sent.
+    expect(SNAP_MESSAGES.badCorners).toBe(CALIBRATION_MESSAGES.badQuad);
+    const bad = {
+      'three on one rail': [
+        { x: 100, y: 100 },
+        { x: 450, y: 105 },
+        { x: 800, y: 110 },
+        { x: 60, y: 440 },
+      ],
+      'two on one spot': [
+        { x: 100, y: 100 },
+        { x: 105, y: 102 },
+        { x: 850, y: 450 },
+        { x: 60, y: 440 },
+      ],
+      'a sliver': [
+        { x: 100, y: 100 },
+        { x: 800, y: 110 },
+        { x: 800, y: 125 },
+        { x: 100, y: 118 },
+      ],
+    };
+    for (const [what, taps] of Object.entries(bad)) {
+      let s = run([{ type: 'overview-photo', photo }, { type: 'overview-result', vision: result({}), balls: [] }, { type: 'start-corners' }]);
+      for (const p of taps) s = snapReducer(s, { type: 'corner-tap', p });
+      expect(s.step, what).toBe('overview-error');
+      expect(s.error, what).toBe(SNAP_MESSAGES.badCorners);
+      expect(s.corners, what).toBeNull(); // nothing for the controller to send (runStill needs corners)
+      expect(s.cornerTaps, what).toEqual([]);
+      // "Tap the 4 corners" again starts a fresh set.
+      expect(snapReducer(s, { type: 'start-corners' })).toMatchObject({ step: 'corners', cornerTaps: [], error: null });
+    }
+    // A real outline, in any tap order, is sent as before.
+    let s = run([{ type: 'overview-photo', photo }, { type: 'overview-result', vision: result({}), balls: [] }, { type: 'start-corners' }]);
+    for (const p of [corners[0]!, corners[2]!, corners[1]!, corners[3]!]) s = snapReducer(s, { type: 'corner-tap', p });
+    expect(s.step).toBe('overview-processing');
+    expect(s.corners).toHaveLength(4);
+  });
 
   it("'bad-quad': the taps cannot be the cloth corners — tap them again", () => {
     const s = tapped(result({ reason: 'bad-quad', cloth: { hue: 140, sat: 0.6, val: 0.5 } }));

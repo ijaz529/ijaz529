@@ -6,6 +6,7 @@
 import type { Ball, ShotPlan, Stroke, Vec2 } from '../../core/types';
 import type { VisionResult } from '../../vision/pipeline';
 import type { PlayerViewResult } from '../../vision/player-view';
+import { cornersPlausible } from '../live-logic';
 
 export type PhotoSource = 'camera' | 'library' | 'sample';
 
@@ -77,7 +78,7 @@ export const SNAP_MESSAGES = {
    * helps when all four are in it.
    */
   noTable: 'The whole table must be in the photo — step back or turn the phone and retake it. All four corners already in view? Tap them.',
-  /** Four tapped corners that cannot be a table outline (VisionResult.reason 'bad-quad'). */
+  /** Four tapped corners that cannot be a table outline (refused locally, or VisionResult.reason 'bad-quad'); Live's words. */
   badCorners: 'Those four taps aren’t the cloth corners — tap them again.',
   /** No cloth colour could be learned inside the tapped corners (reason 'cloth-unknown'). */
   clothUnknown: 'Couldn’t tell the cloth from its surroundings — tap the four cloth corners again, or retake the photo.',
@@ -148,6 +149,10 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
       if (s.step !== 'corners') return s;
       const cornerTaps = [...s.cornerTaps, e.p];
       if (cornerTaps.length < 4) return { ...s, cornerTaps };
+      // Taps that cannot be a table outline (three on one rail, two on one spot, a sliver) are refused
+      // here, with Live's check and words (live-logic cornersPlausible): the still pipeline would only
+      // say it could not tell the cloth. Nothing is sent; "Tap the 4 corners" starts again.
+      if (s.overview && !cornersPlausible(cornerTaps, s.overview.width, s.overview.height)) return { ...s, step: 'overview-error', corners: null, cornerTaps: [], error: SNAP_MESSAGES.badCorners };
       return { ...s, step: 'overview-processing', corners: cornerTaps, cornerTaps: [] };
     }
     case 'cancel-corners':

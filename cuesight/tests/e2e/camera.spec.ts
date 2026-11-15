@@ -221,7 +221,9 @@ test.describe('live camera (US2) — synthetic table as the fake camera', () => 
     });
     await pressTool(page, 'calibrate');
     for (const c of corners) await page.mouse.click(c.x, c.y);
-    await expect(page.locator('#toast')).toContainText('Corners set', { timeout: 5_000 });
+    // "Corners set — checking…", which the first result with these corners replaces with "Calibrated
+    // from your four corners." — under load often before this line looks (seen: only the second).
+    await expect(page.locator('#toast')).toContainText(/Corners set|Calibrated from your four corners/, { timeout: 5_000 });
     await expect(page.locator('#toast')).toContainText('Kept your selection', { timeout: 20_000 });
     const after = await targetNow(page);
     expect(after.id).not.toBe(before.id);

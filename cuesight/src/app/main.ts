@@ -51,7 +51,7 @@ import {
   STATUS_TEXT,
   type FrameMemory,
 } from './live-logic';
-import { createPlannerClient, planRequestKey, recommendationOutcome, recommendedFromReply, watchWorker } from './planner-client';
+import { cardDetailsShown, cardPlanOf, createPlannerClient, fullPlanOptions, planRequestKey, recommendationOutcome, recommendedFromReply, watchWorker } from './planner-client';
 import { createTable3D, type CameraPreset, type FrameInfo, type Pick3D, type Scene3DData, type Table3D } from './render3d';
 import { landscapeFrame } from './render3d/camera';
 import { createSnapController } from './snap/controller';
@@ -508,9 +508,12 @@ function replan(): void {
         // in the planner worker and its plan replaces this one (Constitution IV: < 10 ms here).
         plan = planShot(layout, request, S.params, { ...opts, advice: false });
         if (plan.adviceSkipped) {
-          const key = planRequestKey(layout, request, S.params, opts);
+          // Only what planShot reads: with the player's own stroke the recommended one is ignored, so a
+          // recommendation landing later neither re-keys this plan nor throws its full plan away.
+          const fullOpts = fullPlanOptions(request, opts);
+          const key = planRequestKey(layout, request, S.params, fullOpts);
           if (lastFullPlan?.key === key) plan = lastFullPlan.plan;
-          else full = { key, request, opts };
+          else full = { key, request, opts: fullOpts };
         }
       } catch (e) {
         console.warn(e);
@@ -817,6 +820,12 @@ let lastReason = '';
 let visionAnswered = false;
 /** Corner pockets of the live table outside the frame (live-logic nextCornersOut), for the status pill. */
 let cornersOut = 0;
+/**
+ * First frame id of the current table frame (tableFrameChanged), and the last such id a result has
+ * started: the new frame's first result counts its lock afresh (live-logic nextSinceLocked).
+ */
+let tableFrameFrom = 0;
+let tableFrameSeen = 0;
 
 function visionWorker(): Worker {
   if (!vision) {
@@ -873,6 +882,7 @@ function configureVision(): void {
  */
 function tableFrameChanged(): boolean {
   configureVision();
+  tableFrameFrom = frameId + 1;
   const cleared = liveIdsChanged();
   if (remap) {
     remap.fromFrame = frameId + 1;
@@ -1035,7 +1045,11 @@ function onVision(m: VisionOut): void {
     confidence: b.confidence,
   }));
   const prev = S.vision?.balls;
-  const sinceLocked = nextSinceLocked(S.vision?.sinceLocked ?? Infinity, r.status);
+  // The new table frame's first result gets no grace from the old frame's lock: nothing is restored,
+  // planned or drawn on it before it locks itself (results still in flight from the old frame count on).
+  const newFrame = m.id >= tableFrameFrom && tableFrameSeen !== tableFrameFrom;
+  if (newFrame) tableFrameSeen = tableFrameFrom;
+  const sinceLocked = nextSinceLocked(S.vision?.sinceLocked ?? Infinity, r.status, newFrame);
   cornersOut = nextCornersOut(cornersOut, r.calibration?.corners, r.calibration?.width ?? frameSize.w, r.calibration?.height ?? frameSize.h);
   store.update((s) => {
     s.vision = { status: r.status, calibration: r.calibration, balls, quality: r.quality, ms: r.ms, frameW: frameSize.w, frameH: frameSize.h, sinceLocked };
@@ -1558,14 +1572,16 @@ function render(s: AppState): void {
   const tb = s.targetId ? layout?.balls.find((b) => b.id === s.targetId) : undefined;
   const cueB = layout?.balls.find((b) => b.kind === 'cue');
   const alt = s.plan && !s.plan.makeable ? s.plan.alternatives[0] : undefined;
-  renderShotCard(card, s.plan, {
+  // A frozen plan whose power advice is still coming (or failed) shows no power minimum: the one it
+  // carries is not the power to play (planner-client cardPlanOf).
+  renderShotCard(card, cardPlanOf(s.plan), {
     ...(tb?.color ? { targetColor: tb.color } : {}),
     targetStripe: !!tb?.stripe,
     targetLabel: s.targetId ? labelOf(s.targetId) : '',
     pocketName: s.plan ? names[s.plan.pocketId] : '',
     status: s.mode === 'camera' && s.vision ? STATUS_TEXT[s.vision.status] : null,
     recommendedPending: !!s.recommended?.pending,
-    showDetails: s.settings.showDetails,
+    showDetails: cardDetailsShown(s.plan, s.settings.showDetails),
     hint,
     speedRef: s.plan ? speedReference(s.plan.obPocketSpeed, s.table.length, s.params) : null,
     altPocket: alt ? { id: alt.pocketId, name: names[alt.pocketId] } : null,

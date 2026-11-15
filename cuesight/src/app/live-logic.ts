@@ -188,8 +188,14 @@ export function applyCueOverride(layout: TableLayout, id: string): TableLayout {
 /** Results after a lock during which a single missed quad does not hide the plan. */
 export const LOCK_GRACE = 2;
 
-export function nextSinceLocked(prev: number, status: LockStatus): number {
-  return status === 'locked' ? 0 : prev + 1;
+/**
+ * Results since the last lock. `newFrame`: the first result computed in a new table frame (Rotate,
+ * corners set or cleared, another table or field of view): the old frame's lock gives it no grace,
+ * so the gate stays shut until the new frame locks.
+ */
+export function nextSinceLocked(prev: number, status: LockStatus, newFrame = false): number {
+  if (status === 'locked') return 0;
+  return newFrame ? Infinity : prev + 1;
 }
 
 /** The live layout may be planned on and drawn: locked, or locked a result or two ago, with a calibration. */

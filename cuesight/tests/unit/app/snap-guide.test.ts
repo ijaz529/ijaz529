@@ -291,10 +291,19 @@ describe('Snap session state machine', () => {
     expect(s.step).toBe('overview-error');
     expect(s.error).toBe(SNAP_MESSAGES.noTable);
     s = snapReducer(s, { type: 'start-corners' });
-    for (let i = 0; i < 3; i++) s = snapReducer(s, { type: 'corner-tap', p: { x: i, y: i } });
+    // A real cloth outline on the 960×540 photo. (The four taps here were (0,0), (1,1), (2,2), (9,9):
+    // one line a few px long, which the reducer now refuses locally as Live does — snap-session.test.ts
+    // "four taps that cannot be a table outline…".)
+    const outline = [
+      { x: 100, y: 100 },
+      { x: 800, y: 110 },
+      { x: 850, y: 450 },
+      { x: 60, y: 440 },
+    ];
+    for (let i = 0; i < 3; i++) s = snapReducer(s, { type: 'corner-tap', p: outline[i]! });
     expect(s.step).toBe('corners');
     expect(s.cornerTaps).toHaveLength(3);
-    s = snapReducer(s, { type: 'corner-tap', p: { x: 9, y: 9 } });
+    s = snapReducer(s, { type: 'corner-tap', p: outline[3]! });
     expect(s.step).toBe('overview-processing');
     expect(s.corners).toHaveLength(4);
     expect(s.cornerTaps).toHaveLength(0);

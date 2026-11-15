@@ -250,6 +250,21 @@ describe('liveGate: the live plan is computed and drawn only on a locked table',
     n = nextSinceLocked(nextSinceLocked(n, 'unstable'), 'unstable');
     expect(n).toBe(2);
   });
+  it('the first result of a new table frame (Rotate, corners set or cleared) gets no grace from the old lock', () => {
+    // Verifier r1: the old frame locked one result ago, so its grace would open the gate on the new
+    // frame's first unstable results — a selection restored (or a plan drawn) on an unlocked frame.
+    const old = nextSinceLocked(Infinity, 'locked');
+    expect(liveGate('unstable', nextSinceLocked(old, 'unstable'), true)).toBe(true); // same frame: the grace holds
+    const first = nextSinceLocked(old, 'unstable', true);
+    expect(first).toBe(Infinity);
+    expect(liveGate('unstable', first, true)).toBe(false);
+    expect(liveGate('unstable', nextSinceLocked(first, 'unstable'), true)).toBe(false);
+    // Its own lock opens it, with the usual grace after.
+    const locked = nextSinceLocked(first, 'locked');
+    expect(liveGate('locked', locked, true)).toBe(true);
+    expect(liveGate('unstable', nextSinceLocked(locked, 'unstable'), true)).toBe(true);
+    expect(nextSinceLocked(old, 'locked', true)).toBe(0);
+  });
 });
 
 describe('status pill and hints', () => {

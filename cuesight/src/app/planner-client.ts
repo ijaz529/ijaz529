@@ -16,7 +16,7 @@
  *    drag asks once, where it settles) and accepted only for the key the app still shows; while one is
  *    awaited the worker is not restarted.
  */
-import type { PhysicsParams, Recommendation, ShotRequest, Stroke, TableLayout } from '../core/types';
+import type { PhysicsParams, Recommendation, ShotPlan, ShotRequest, Stroke, TableLayout } from '../core/types';
 import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut, type PlannerPerEvalMs, type PlannerPlanOptions } from '../workers/protocol';
 
 export type PlannerKind = 'recommend' | 'suggest' | 'heatmap' | 'plan';
@@ -239,7 +239,11 @@ export function recommendationOutcome(m: RecommendationReply, hasLanding: boolea
   // tried and a non-finite score: none of them pots the ball (core types.ts), so say so.
   if (!found) {
     if (m.evaluated <= 0) return { stroke: null, toast: null };
-    return { stroke: null, toast: hasLanding ? 'No stroke reaches that spot cleanly — showing the basic stroke.' : 'None of the strokes tried pots this ball — showing the basic stroke.' };
+    // position.ts drops a stroke that scratches as well as one that misses: "without a scratch".
+    return {
+      stroke: null,
+      toast: hasLanding ? 'No stroke reaches that spot cleanly — showing the basic stroke.' : 'None of the strokes tried pots this ball without a scratch — showing the basic stroke.',
+    };
   }
   // `fragile` (core types.ts): no candidate was verified against ±6/±12 % speed errors — one scratched
   // or missed at some speed, or the budget ran out first. So: "may", and both ways it can go wrong.
@@ -284,9 +288,54 @@ export function recommendedFromReply(m: RecommendationReply, out: { stroke: Stro
 }
 
 /**
- * The identity of a plan request (`plan` messages): the exact ball positions (not rounded: the worker's
- * plan replaces the shown one as is), the request, the physics and the options.
+ * The options of a plan request as planShot reads them: a request with a stroke (the player's own)
+ * plays that stroke and ignores `recommended` (planner.ts: request.stroke ?? opts.recommended ??
+ * the default), so it is not sent and not keyed. Kept in, a recommendation reply landing after the
+ * player set a stroke changed the key of the very same plan: the worker's full plan was thrown away
+ * and asked for again, and the card flickered back to the plan without the power figure.
+ */
+export function fullPlanOptions(request: ShotRequest, opts: PlannerPlanOptions): PlannerPlanOptions {
+  if (!request.stroke || opts.recommended === undefined) return opts;
+  const { recommended: _ignored, ...rest } = opts;
+  return rest;
+}
+
+/**
+ * The identity of a plan request (`plan` messages): the table (its size, not only its preset id),
+ * the exact ball positions (not rounded: the worker's plan replaces the shown one as is), the
+ * request, the physics and the options planShot reads (fullPlanOptions).
  */
 export function planRequestKey(layout: TableLayout, request: ShotRequest, params: PhysicsParams, opts: PlannerPlanOptions): string {
-  return JSON.stringify([layout.table.id, layout.balls.map((b) => [b.id, b.kind, b.pos.x, b.pos.y]), request, params, opts]);
+  return JSON.stringify([layout.table, layout.balls.map((b) => [b.id, b.kind, b.pos.x, b.pos.y]), request, params, fullPlanOptions(request, opts)]);
+}
+
+/** The card plan of each plan whose frozen power advice is still coming (one object per plan). */
+const cardPlans = new WeakMap<ShotPlan, ShotPlan>();
+
+/**
+ * The plan as the shot card gets it. A frozen cue ball's plan made without the power advice
+ * (ShotPlan.adviceSkipped: the worker's full plan is on its way, or it failed) carries the minimum
+ * for the stroke angle at the played power, not the power to play — harder throws less, so the
+ * angle and the minimum move with the power. The card must not draw it as "Minimum x": it gets the
+ * plan with a non-finite minPower (shot-card / power-meter draw no tick and no figure for one) and no
+ * capture minimum. Any other plan goes as it is. The same plan gives the same object, so the card
+ * (which redraws only for a new plan object) keeps its focus.
+ */
+export function cardPlanOf(plan: ShotPlan | null): ShotPlan | null {
+  if (!plan?.adviceSkipped) return plan;
+  let shown = cardPlans.get(plan);
+  if (!shown) {
+    const { minPowerCapture: _unknown, ...rest } = plan;
+    shown = { ...rest, minPower: Number.NaN, minPowerSafe: Number.NaN };
+    cardPlans.set(plan, shown);
+  }
+  return shown;
+}
+
+/**
+ * Whether the card shows its details list (Settings → details): not for a plan whose power advice
+ * is still coming, whose "Min power" row would print the figure cardPlanOf withholds.
+ */
+export function cardDetailsShown(plan: ShotPlan | null, showDetails: boolean): boolean {
+  return showDetails && !plan?.adviceSkipped;
 }
