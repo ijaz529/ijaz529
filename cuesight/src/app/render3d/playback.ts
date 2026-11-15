@@ -2,10 +2,11 @@
  * Shot playback (pure): turns recorded simulator trajectories (polylines + timed events) into
  * time-parameterised tracks and samples position + orientation for any time.
  *
- * Timing: every recorded point that coincides with a simulator event gets that event's exact time.
- * Points in between are distributed by distance assuming a constant deceleration (the ball slows
- * between events; a span that ends the motion ends at zero speed, i.e. an ease-out). Spans with no
- * time information at all fall back to distance with an ease-out.
+ * Timing: when the simulator recorded each point's time (planShot does), those times are used as
+ * they are. Otherwise every point that coincides with a simulator event (within EVENT_MATCH_M) gets
+ * that event's exact time, and points in between are distributed by distance assuming a constant
+ * deceleration (the ball slows between events; a span that ends the motion ends at zero speed, i.e.
+ * an ease-out). Spans with no time information at all fall back to distance with an ease-out.
  *
  * Rotation: when the simulator recorded each point's time and angular velocity ω (planShot does),
  * the ball turns by ω·Δt over each recorded span, so a draw shot visibly slides with backspin and a
@@ -72,8 +73,23 @@ export function rollBall(q: Quat, dx: number, dy: number, R: number): Quat {
   return quatNormalize(quatMultiply(rollingQuat(dx, dy, R), q));
 }
 
+/**
+ * An event's position matches a recorded point within this distance (m). The simulator pushes the
+ * event position itself as a point, but a position that went through arithmetic of its own (or a
+ * serialisation) can differ by float noise; an exact test would then drop the event's time.
+ */
+export const EVENT_MATCH_M = 1e-6;
+
 function samePoint(a: Vec2, b: Vec2): boolean {
-  return Math.abs(a.x - b.x) < 1e-9 && Math.abs(a.y - b.y) < 1e-9;
+  return Math.abs(a.x - b.x) <= EVENT_MATCH_M && Math.abs(a.y - b.y) <= EVENT_MATCH_M;
+}
+
+/** The simulator's own time for every recorded point, when it recorded them (planShot does) and they are usable. */
+function recordedTimes(tr: Trajectory, n: number): Float64Array | null {
+  const rec = tr.times;
+  if (!rec || rec.length !== n || tr.points.length !== n) return null;
+  for (let i = 0; i < n; i++) if (!Number.isFinite(rec[i]!) || (i > 0 && rec[i]! < rec[i - 1]!)) return null;
+  return Float64Array.from(rec);
 }
 
 /**
@@ -156,7 +172,9 @@ export interface TrackOpts {
 export function buildTrack(tr: Trajectory, R: number, opts: TrackOpts = {}): PlaybackTrack {
   const pts = tr.points.length > 0 ? tr.points : tr.rest ? [tr.rest] : [];
   const n = pts.length;
-  const t = assignTimes(pts, tr.events, opts.decel);
+  // Recorded runs carry the simulated time of every point: the replay passes each point (and so each
+  // event) exactly when the simulation did (SC-103). Hand-built tracks are timed from their events.
+  const t = recordedTimes(tr, n) ?? assignTimes(pts, tr.events, opts.decel);
   const x = new Float64Array(n);
   const y = new Float64Array(n);
   const q = new Float64Array(4 * n);

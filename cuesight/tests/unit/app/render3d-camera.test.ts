@@ -17,6 +17,7 @@ import {
 } from '../../../src/app/render3d/camera';
 import { tableGeom } from '../../../src/app/render3d/geom';
 import { project, type V3 } from '../../../src/app/render3d/math3d';
+import { cuePose } from '../../../src/app/render3d/scene-data';
 
 const table = makeTable('pool9');
 const g = tableGeom(table);
@@ -100,6 +101,32 @@ describe('render3d camera presets', () => {
     const qg = ndc(o, aspect, [ghost.x, ghost.y, g.R]);
     for (const q of [qc, qg]) expect(Math.max(Math.abs(q.x), Math.abs(q.y))).toBeLessThan(0.95);
     expect(qc.y).toBeLessThan(qg.y);
+  });
+
+  it('player view with the cue ball frozen to a rail: the eye stays behind the ball, above the rail and the raised cue (spec edge case)', () => {
+    // Cue ball against the top cushion, shooting away from it (the cue must clear the rail).
+    const cue = { x: 0.2, y: g.hy - g.R };
+    const aim = { x: 0.3, y: -1 };
+    const ghost = { x: 0.45, y: -0.2 };
+    const pose = cuePose(g, cue, aim, { power: 5, side: 0, vert: 0 });
+    expect(pose.elevation, 'the cue is raised over the rail').toBeGreaterThan((5 * Math.PI) / 180);
+    const o = playerOrbit(g, cue, aim, ghost, 852 / 393, { cueElevation: pose.elevation });
+    const b = orbitBasis(o);
+    const al = Math.hypot(aim.x, aim.y);
+    const back = { x: cue.x - b.eye[0], y: cue.y - b.eye[1] };
+    const dBack = Math.hypot(back.x, back.y);
+    expect((back.x * aim.x + back.y * aim.y) / (dBack * al), 'behind the cue ball, down the aim line').toBeGreaterThan(0.999);
+    expect(b.eye[2], 'above the rail top').toBeGreaterThan(g.railTop + 0.05);
+    // Above the cue's own line at the eye's distance (the chin over the cue).
+    expect(b.eye[2]).toBeGreaterThan(pose.strike[2] + Math.tan(pose.elevation) * dBack);
+    // The cue ball's top half is seen over the cushion: the sight line to the top of the ball clears
+    // the cushion where it crosses the nose line.
+    const top: V3 = [cue.x, cue.y, 2 * g.R];
+    const s = (g.hy - cue.y) / (b.eye[1] - cue.y);
+    expect(top[2] + (b.eye[2] - top[2]) * s).toBeGreaterThan(g.cushionTop);
+    // And the ball is in frame.
+    const q = ndc(o, 852 / 393, [cue.x, cue.y, g.R]);
+    expect(Math.max(Math.abs(q.x), Math.abs(q.y))).toBeLessThan(1);
   });
 
   it('player view keeps the target pocket and the object-ball path end clear of the controls', () => {

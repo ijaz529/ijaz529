@@ -10,9 +10,9 @@ import { makeTable } from '../../../src/core/table';
 import type { Ball, TablePresetId, TableLayout, Vec2 } from '../../../src/core/types';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
 import { buildPlayerGuide, cameraCenter, confidenceLabel, guideFocus, occluded, projectPolyline, scaleFocal, strikeFace, strikeHeadline, strikeWords } from '../../../src/app/snap/guide';
-import { initialSnap, snapReducer, snapStage, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
+import { fitCheck, initialSnap, snapReducer, snapStage, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
 import { describeSpin } from '../../../src/core/shot/power';
-import type { CameraPose, PlayerViewResult } from '../../../src/vision/player-view';
+import { projectBallOutline, type CameraPose, type PlayerViewResult } from '../../../src/vision/player-view';
 import type { VisionResult } from '../../../src/vision/pipeline';
 
 interface Fixture {
@@ -205,6 +205,34 @@ describe('player guide geometry on the fixture pose', () => {
     expect(run.at(-1)!.y).toBeGreaterThan(pose.height);
   });
 
+  it('a ball between the camera and the path: that part is kept as "hidden" (dashed, labelled), not dropped (spec edge case)', () => {
+    const p = plan();
+    const C = cameraCenter(pose);
+    // Put another ball on the camera's line of sight to the middle of the object-ball path, where
+    // that line is at ball-centre height: it hides the cloth behind it from the camera.
+    const pts = p.objectPath.points;
+    const mid = pts[Math.floor(pts.length / 2)]!;
+    const s = (C.z - R) / C.z;
+    const blocker = { x: C.x + (mid.x - C.x) * s, y: C.y + (mid.y - C.y) * s };
+    const g0 = buildPlayerGuide({ pose, table, plan: p, cue: cue.pos, target: target.pos, stroke: p.stroke });
+    expect(g0.hidden.objectPath).toEqual([]);
+    expect(g0.messages.join(' ')).not.toMatch(/hidden/);
+    const g = buildPlayerGuide({ pose, table, plan: p, cue: cue.pos, target: target.pos, stroke: p.stroke, others: [blocker] });
+    expect(g.hidden.objectPath.length, 'the hidden stretch is returned').toBeGreaterThan(0);
+    const len = (runs: Vec2[][]) => runs.reduce((a, r) => a + r.slice(1).reduce((b, q, i) => b + Math.hypot(q.x - r[i]!.x, q.y - r[i]!.y), 0), 0);
+    // Visible + hidden ≈ the whole path as drawn without the blocker (nothing silently dropped).
+    expect(Math.abs(len(g.objectPath) + len(g.hidden.objectPath) - len(g0.objectPath)) / len(g0.objectPath)).toBeLessThan(0.08);
+    expect(len(g.objectPath)).toBeLessThan(len(g0.objectPath) - 1);
+    // The hidden stretch sits behind the blocker on the photo.
+    const bc = centroid(projectBallOutline(pose, { x: blocker.x, y: blocker.y, z: R }, R));
+    const hc = centroid(g.hidden.objectPath.flat());
+    expect(Math.hypot(hc.x - bc.x, hc.y - bc.y)).toBeLessThan(3 * g.cueRadiusPx + 40);
+    expect(g.messages.join(' ')).toMatch(/hidden/);
+    // The cue ball and the target hiding their own stretch of line (under the ball) is not "hidden".
+    expect(g0.hidden.aim).toEqual([]);
+    expect(g0.hidden.cuePath).toEqual([]);
+  });
+
   it('occlusion: cloth behind a ball is hidden, cloth in front of it is not', () => {
     const C = { x: 0, y: -1, z: 0.3 };
     const ball = { x: 0, y: 0, z: R };
@@ -288,6 +316,31 @@ describe('Snap session state machine', () => {
     expect(snapReducer(initialSnap(), { type: 'player-photo', photo }).step).toBe('intro');
     const s = run([{ type: 'overview-photo', photo }, { type: 'overview-result', vision: vision(true), balls }, { type: 'reset' }]);
     expect(s).toEqual(initialSnap());
+  });
+
+  it('the fit remembers the target it was made for; a new target needs a new fit (the chip never goes stale)', () => {
+    const base = run([{ type: 'overview-photo', photo }, { type: 'overview-result', vision: vision(true), balls }, { type: 'player-photo', photo }]);
+    let s = snapReducer(base, { type: 'player-result', result: pv(true), targetId: '1' });
+    expect(s.step).toBe('guide');
+    expect(s.player?.fitTargetId).toBe('1');
+    expect(fitCheck(s, '1')).toBe('current');
+    // The pocket or the stroke do not change the fit (its confidence is about the target ball).
+    expect(fitCheck(s, '1')).toBe('current');
+    // Another target: an automatic fit is redone on the same photo, quietly (the step stays 'guide').
+    expect(fitCheck(s, '8')).toBe('refit');
+    s = snapReducer(s, { type: 'refit' });
+    expect(s.step).toBe('guide');
+    expect(fitCheck(s, '8')).toBe('checking');
+    s = snapReducer(s, { type: 'player-result', result: pv(true), targetId: '8' });
+    expect(fitCheck(s, '8')).toBe('current');
+    expect(s.player?.refitting).toBe(false);
+    // A fit from two taps named its target ball: a new target needs the two taps again.
+    const m = snapReducer(base, { type: 'player-result', result: pv(true), targetId: '1', manual: true });
+    expect(fitCheck(m, '8')).toBe('taps');
+    // No target selected: nothing to vouch for.
+    expect(fitCheck(s, null)).toBe('none');
+    // Not in the guide: no chip.
+    expect(fitCheck(base, '1')).toBe('none');
   });
 
   it('a table with no balls still opens the layout step, with a hint', () => {

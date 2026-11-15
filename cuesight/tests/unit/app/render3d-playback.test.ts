@@ -118,6 +118,68 @@ describe('render3d trajectory timing', () => {
     expect(fin.z).toBeLessThan(0);
   });
 
+  it('pins an event to its point even when the stored position differs by float noise (no exact-equality match)', () => {
+    const pts = [
+      { x: 0, y: 0 },
+      { x: 0.1, y: 0 },
+      { x: 0.2, y: 0 },
+      { x: 0.3, y: 0 },
+    ];
+    // The event position went through arithmetic of its own: 0.4 µm off the recorded point.
+    const t = assignTimes(pts, [ev(0.4, 'cushion', 0.2 + 4e-7, -3e-7), ev(1.2, 'stop', 0.3, 0)]);
+    expect(t[2]).toBeCloseTo(0.4, 12);
+    expect(t[3]).toBeCloseTo(1.2, 12);
+  });
+
+  it('SC-103: a recorded trajectory replays every recorded point (and so every event) at its simulated time, within 1 mm', () => {
+    const table = makeTable('pool9');
+    const balls = DRILLS[0]!.build(table);
+    for (const stroke of [
+      { power: 4, side: 0, vert: 0 },
+      { power: 6, side: 0.2, vert: -0.4 },
+      { power: 3, side: -0.25, vert: 0.4 },
+    ]) {
+      const plan = planShot({ table, balls, source: 'virtual', frozen: false }, { targetId: 'b1', pocketId: 'TR', stroke }, DEFAULT_PHYSICS);
+      const R9 = table.ballRadius;
+      for (const tr of [plan.cuePath, plan.objectPath, ...plan.otherPaths]) {
+        expect(tr.times?.length, `${tr.ballId} recorded times`).toBe(tr.points.length);
+        const track = buildTrack(tr, R9);
+        let worst = 0;
+        tr.points.forEach((p, i) => {
+          const at = sampleTrack(track, tr.times![i]!, R9, pose());
+          // A ball resting at its start until struck holds still; compare where it is at that time.
+          worst = Math.max(worst, Math.hypot(at.x - p.x, at.y - p.y));
+        });
+        expect(worst, `${tr.ballId} ${JSON.stringify(stroke)}`).toBeLessThan(1e-3);
+        for (const e of tr.events) {
+          if (e.kind === 'pocket') continue;
+          const at = sampleTrack(track, e.t, R9, pose());
+          expect(Math.hypot(at.x - e.pos.x, at.y - e.pos.y), `${tr.ballId} ${e.kind} @ ${e.t}`).toBeLessThan(1e-3);
+        }
+      }
+    }
+  });
+
+  it('FR-108: a draw shot slides with backspin before it rolls (not pure rolling from the strike)', () => {
+    const table = makeTable('pool9');
+    const balls = DRILLS[0]!.build(table);
+    const plan = planShot({ table, balls, source: 'virtual', frozen: false }, { targetId: 'b1', pocketId: 'TR', stroke: { power: 6, side: 0, vert: -0.5 } }, DEFAULT_PHYSICS);
+    const R9 = table.ballRadius;
+    const track = buildTrack(plan.cuePath, R9);
+    expect(track.span, 'the recorded spin is used').not.toBeNull();
+    // Shortly after the strike the cue ball is sliding with backspin: its top turns backward
+    // (against the travel), whereas a rolling ball's top moves forward. (4 ms: well under a turn.)
+    const t1 = 0.004;
+    const a = sampleTrack(track, 0, R9, pose());
+    const b = sampleTrack(track, t1, R9, pose());
+    const travel = { x: b.x - a.x, y: b.y - a.y };
+    expect(Math.hypot(travel.x, travel.y)).toBeGreaterThan(0.005);
+    const top0 = quatRotate(a.q, [0, 0, R9]);
+    const top1 = quatRotate(b.q, [0, 0, R9]);
+    const topMove = (top1[0] - top0[0]) * travel.x + (top1[1] - top0[1]) * travel.y;
+    expect(topMove, 'top of the ball moves against the travel (backspin)').toBeLessThan(0);
+  });
+
   it('replays a real plan: the object ball starts at the cue ball contact time', () => {
     const table = makeTable('pool9');
     const balls = DRILLS[0]!.build(table);

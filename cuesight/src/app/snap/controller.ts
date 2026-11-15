@@ -28,7 +28,7 @@ import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
 import { decodePhoto, frameOf, loadSample, photoFromVideo, type Photo } from './photo';
-import { SNAP_MESSAGES, snapStage, type SnapEvent, type SnapSession } from './session';
+import { SNAP_MESSAGES, fitCheck, snapStage, type SnapEvent, type SnapSession } from './session';
 
 export const SAMPLE_PHOTOS = { table: './samples/snap-table.png', player: './samples/snap-player.png' } as const;
 
@@ -199,7 +199,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   let overviewPhoto: Photo | null = null;
   let playerPhoto: Photo | null = null;
   let rgbById = new Map<string, [number, number, number]>();
-  let pending: { id: number; kind: 'still' | 'player-view' } | null = null;
+  /** The request in flight; a player-view fit remembers the target it is for and whether it came from taps. */
+  let pending: { id: number; kind: 'still' | 'player-view'; targetId?: string | null; manual?: boolean } | null = null;
   let nextId = 1_000_000;
   let inspect = false;
   let lastDrawKey = '';
@@ -207,6 +208,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   let guide: PlayerGuide | null = null;
   /** The layout the current player-photo fit was made against. */
   let fittedLayout = '';
+  /** The target a quiet re-fit was last started for (see render, step 'guide'). */
+  let refitFor: string | null = null;
   const S = () => host.state();
   const snap = (): SnapSession => S().snap;
 
@@ -313,7 +316,9 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     const frame = frameOf(overviewPhoto);
     const id = ++nextId;
     pending = { id, kind: 'still' };
-    host.visionWorker().postMessage({ v: PROTOCOL_VERSION, type: 'still', id, frame, opts: { manualCorners: corners, swapAxes: S().swapAxes } }, [frame.data.buffer]);
+    // Snap's own settings, never Live's: the corners tapped on this photo (or none), and no rail swap
+    // (Live's "Rotate" fixes the live camera's view; a still is detected from the photo alone).
+    host.visionWorker().postMessage({ v: PROTOCOL_VERSION, type: 'still', id, frame, opts: { manualCorners: corners, swapAxes: false } }, [frame.data.buffer]);
   }
 
   function knownBalls(): KnownBall[] {
@@ -336,12 +341,16 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     runPlayerView();
   }
 
-  function runPlayerView(taps?: { cue: Vec2; target: Vec2 }): void {
+  /** Posts the player-view fit; false when there is nothing to fit (no photo, layout or cue ball). */
+  function runPlayerView(taps?: { cue: Vec2; target: Vec2 }): boolean {
     const s = S();
     const sn = snap();
-    if (!playerPhoto || !sn.layout) return;
+    if (!playerPhoto || !sn.layout) return false;
     const cue = sn.layout.find((b) => b.kind === 'cue');
-    if (!cue) return host.toast(SNAP_MESSAGES.noCue);
+    if (!cue) {
+      host.toast(SNAP_MESSAGES.noCue);
+      return false;
+    }
     const vis = sn.overview?.vision;
     const frame = frameOf(playerPhoto);
     const input: PlayerViewInput = {
@@ -356,9 +365,10 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       ...(taps ? { manualTaps: taps } : {}),
     };
     const id = ++nextId;
-    pending = { id, kind: 'player-view' };
+    pending = { id, kind: 'player-view', targetId: s.targetId, manual: !!taps };
     fittedLayout = layoutKey(sn.layout);
     host.visionWorker().postMessage({ v: PROTOCOL_VERSION, type: 'player-view', id, input }, [frame.data.buffer]);
+    return true;
   }
 
   /** Vision replies addressed to Snap; returns false when the message is not ours. */
@@ -373,9 +383,10 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       return true;
     }
     if (!pending || m.id !== pending.id) return true; // stale reply for an older photo
+    const req = pending;
     pending = null;
     if (m.type === 'still') onStill(m.result);
-    else onPlayerView(m.result);
+    else onPlayerView(m.result, req.targetId ?? null, !!req.manual);
     return true;
   }
 
@@ -400,8 +411,9 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     }
   }
 
-  function onPlayerView(r: PlayerViewResult): void {
-    host.dispatch({ type: 'player-result', result: r });
+  function onPlayerView(r: PlayerViewResult, targetId: string | null, manual: boolean): void {
+    refitFor = null;
+    host.dispatch({ type: 'player-result', result: r, targetId, manual });
   }
 
   // -------------------------------------------------------------------------------------------
@@ -509,8 +521,25 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     root.dataset.inspect = 'false';
     pending = null;
     rgbById = new Map();
+    releasePixels();
     host.dispatch({ type: 'reset' });
     host.resetSelection();
+  }
+
+  /**
+   * FR-122: drops every copy of the photos' pixels the page still holds, at once (not on the next
+   * render, which never comes after leaving Snap): the photo canvas and its reference, the detection
+   * overlay and the table-photo thumbnail. A zero-size canvas also frees its backing store.
+   */
+  function releasePixels(): void {
+    photoCanvas.photo = null;
+    photoCanvas.focus = null;
+    for (const c of [photoCanvas.canvas, overlayCanvas, thumbCanvas]) {
+      c.width = 0;
+      c.height = 0;
+    }
+    lastDrawKey = '';
+    lastThumbKey = '';
   }
 
   /** Leaving Snap: release every photo (FR-122). */
@@ -593,7 +622,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     });
 
     const warnings: string[] = [];
-    let fit: ReturnType<typeof confidenceLabel> | null = null;
+    let fit: { word: ReturnType<typeof confidenceLabel>['word'] | 'checking'; text: string } | null = null;
     let ctaHtml = '';
     let actions = iconBtn('start-over', 'Start over', 'refresh');
     let busyText = '';
@@ -649,7 +678,14 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       case 'guide': {
         const r = sn.player?.result;
         setChip(null);
-        fit = confidenceLabel(r?.confidence ?? 0);
+        // The fit's confidence is about the target it was made for (FR-116): a new target is fitted
+        // again on the same photo (quietly, the guide stays up), or, after a two-tap fit, tapped again.
+        const fc = fitCheck(sn, s.targetId);
+        if (fc === 'refit' && !pending && refitFor !== s.targetId) {
+          refitFor = s.targetId; // one attempt per target change (never a retry loop from render)
+          if (runPlayerView()) host.dispatch({ type: 'refit' });
+        } else if (fc === 'taps') host.dispatch({ type: 'start-manual' });
+        fit = fc === 'current' ? confidenceLabel(r?.confidence ?? 0) : fc === 'checking' ? { word: 'checking', text: 'Fit: checking…' } : null;
         // The how-to (strike, power, aim) is in the sheet's peek right under the photo: the top card
         // is one row, so the photo gets the screen.
         setInstr(s.plan ? (playable(s.plan) ? `Aim at the ghost ball. Strike ${strikeWords(s.plan.stroke)} (the blue dot on the ball's face).` : 'This shot cannot be played as planned.') : 'Pick a target ball to see the guide.', 'target');
@@ -694,8 +730,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     const pr = fit ? photoCanvas.photoRect() : null;
     fitEl.hidden = !fit || !pr;
     if (fit && pr) {
-      fitEl.dataset.tone = fit.word === 'good' ? 'ok' : fit.word === 'fair' ? 'warn' : 'bad';
-      setHtml(fitEl, `${iconMarkup(fit.word === 'good' ? 'check' : 'alert', 14)}<span>${esc(fit.text)}</span>`);
+      fitEl.dataset.tone = fit.word === 'good' ? 'ok' : fit.word === 'fair' ? 'warn' : fit.word === 'checking' ? 'info' : 'bad';
+      setHtml(fitEl, `${iconMarkup(fit.word === 'good' ? 'check' : fit.word === 'checking' ? 'sparkles' : 'alert', 14)}<span>${esc(fit.text)}</span>`);
       fitEl.style.left = `${Math.round(pr.x + 8)}px`;
       fitEl.style.top = `${Math.round(pr.y + 8)}px`;
     }
@@ -738,7 +774,9 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       const cue = sn.layout.find((b) => b.kind === 'cue');
       const tgt = sn.layout.find((b) => b.id === s.plan!.targetId);
       if (cue) {
-        guide = buildPlayerGuide({ pose: sn.player.result.pose, table: s.table, plan: s.plan, cue: cue.pos, target: tgt?.pos ?? null, stroke: s.plan.stroke, riskPockets: host.riskPockets?.() ?? [] });
+        // Every other ball can hide part of a line from the camera: that part is drawn dashed, marked "hidden".
+        const others = sn.layout.filter((b) => b !== cue && b !== tgt).map((b) => b.pos);
+        guide = buildPlayerGuide({ pose: sn.player.result.pose, table: s.table, plan: s.plan, cue: cue.pos, target: tgt?.pos ?? null, stroke: s.plan.stroke, riskPockets: host.riskPockets?.() ?? [], others });
       }
     }
     const g = guide;

@@ -30,6 +30,11 @@ export interface GuideInput {
   stroke: Pick<Stroke, 'side' | 'vert' | 'power'>;
   /** Pockets the cue ball could drop into with a small error (scratch risk), ringed dashed. */
   riskPockets?: PocketId[];
+  /**
+   * Centres of the other balls on the table (not the cue ball or the target). A stretch of a line
+   * one of them hides from the camera is kept as `hidden` (drawn dashed and labelled), never dropped.
+   */
+  others?: Vec2[];
 }
 
 export interface StrikeMark {
@@ -71,6 +76,12 @@ export interface PlayerGuide {
   aim: Vec2[][];
   objectPath: Vec2[][];
   cuePath: Vec2[][];
+  /**
+   * The stretches of those lines another ball hides from the camera (spec edge case: "the hidden part
+   * of the path is dashed and labelled 'hidden'"). Line under the cue ball or the target itself is
+   * simply not drawn (the ball is there to see).
+   */
+  hidden: { aim: Vec2[][]; objectPath: Vec2[][]; cuePath: Vec2[][] };
   /** Silhouettes (closed polygons, empty when not drawable). */
   ghost: Vec2[];
   target: Vec2[];
@@ -138,10 +149,20 @@ export function inImage(pose: CameraPose, p: Vec2, margin = 0): boolean {
  * ball as seen from the camera) split the run.
  */
 export function projectPolyline(pose: CameraPose, pts: Vec3[], maxSeg = 0.05, hidden?: (p: Vec3) => boolean): Vec2[][] {
-  const runs: Vec2[][] = [];
+  return splitPolyline(pose, pts, maxSeg, hidden).visible;
+}
+
+/**
+ * Like projectPolyline, with two kinds of occlusion: stretches where `drop` is true are left out, and
+ * stretches where `hide` is true come back separately as `hidden` runs (to draw dashed). Consecutive
+ * visible and hidden runs share their end point, so together they draw one continuous line.
+ */
+export function splitPolyline(pose: CameraPose, pts: Vec3[], maxSeg = 0.05, drop?: (p: Vec3) => boolean, hide?: (p: Vec3) => boolean): { visible: Vec2[][]; hidden: Vec2[][] } {
+  const out: { visible: Vec2[][]; hidden: Vec2[][] } = { visible: [], hidden: [] };
   let run: Vec2[] = [];
+  let kind: 'visible' | 'hidden' | null = null;
   const flush = () => {
-    if (run.length >= 2) runs.push(run);
+    if (run.length >= 2 && kind) out[kind].push(run);
     run = [];
   };
   for (let i = 0; i + 1 < pts.length; i++) {
@@ -151,10 +172,12 @@ export function projectPolyline(pose: CameraPose, pts: Vec3[], maxSeg = 0.05, hi
     for (let k = 0; k < n; k++) {
       const p = lerp3(a, b, k / n);
       const q = lerp3(a, b, (k + 1) / n);
-      if (hidden && (hidden(p) || hidden(q))) {
+      const now = drop && (drop(p) || drop(q)) ? null : hide && (hide(p) || hide(q)) ? 'hidden' : 'visible';
+      if (now !== kind) {
         flush();
-        continue;
+        kind = now;
       }
+      if (!now) continue;
       let ca = toCam(pose, p);
       let cb = toCam(pose, q);
       const ina = ca.z >= NEAR;
@@ -175,7 +198,7 @@ export function projectPolyline(pose: CameraPose, pts: Vec3[], maxSeg = 0.05, hi
     }
   }
   flush();
-  return runs;
+  return out;
 }
 
 /** True when the segment camera → p passes through any of the spheres (centre, radius r) before p. */
@@ -286,15 +309,24 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   const cdL = Math.hypot(cd.x, cd.y) || 1;
   const cueDir = { x: cd.x / cdL, y: cd.y / cdL };
 
-  // Lines on the cloth disappear where a real ball (cue, target) hides the cloth from the camera.
+  // Lines on the cloth disappear where the cue ball or the target hides the cloth from the camera
+  // (the ball itself is what the player sees there); where any other ball hides them, the stretch is
+  // kept as "hidden" and drawn dashed.
   const solid = [cue3, ...(i.target ? [on(i.target, R)] : [])];
-  const hidden = (p: Vec3) => occluded(C, p, solid, R);
+  const drop = (p: Vec3) => occluded(C, p, solid, R);
+  const others = (i.others ?? []).map((p) => on(p, R));
+  const hide = others.length ? (p: Vec3) => occluded(C, p, others, R) : undefined;
+  const none = { visible: [] as Vec2[][], hidden: [] as Vec2[][] };
   // Aim line on the cloth: from under the cue ball to under the ghost ball.
-  const aimRuns = projectPolyline(pose, [on(i.cue), on(plan.ghost)], 0.004, hidden);
+  const aimS = splitPolyline(pose, [on(i.cue), on(plan.ghost)], 0.004, drop, hide);
   const obPts = plan.objectPath.points.map((p) => on(p));
   const cbPts = plan.cuePath.points.map((p) => on(p));
-  const objectPath = obPts.length >= 2 ? projectPolyline(pose, obPts, 0.01, hidden) : [];
-  const cuePath = cbPts.length >= 2 ? projectPolyline(pose, cbPts, 0.01, hidden) : [];
+  const obS = obPts.length >= 2 ? splitPolyline(pose, obPts, 0.01, drop, hide) : none;
+  const cbS = cbPts.length >= 2 ? splitPolyline(pose, cbPts, 0.01, drop, hide) : none;
+  const aimRuns = aimS.visible;
+  const objectPath = obS.visible;
+  const cuePath = cbS.visible;
+  const hidden = { aim: aimS.hidden, objectPath: obS.hidden, cuePath: cbS.hidden };
 
   const ghost = projectBallOutline(pose, on(plan.ghost, R), R);
   const target = i.target ? projectBallOutline(pose, on(i.target, R), R) : [];
@@ -365,11 +397,15 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   else if (face && !inImage(pose, face.dot)) messages.push(strikeOffPhoto(pose, face.dot));
   if (!inFrame.ghost && !inFrame.target) messages.push('The target ball is out of the photo. Turn toward the shot and retake.');
   else if (!inFrame.pocket) messages.push('The pocket is out of the photo. Follow the orange line off the edge.');
+  const inPhoto = (runs: Vec2[][]) => runs.some((r) => r.some((p) => inImage(pose, p)));
+  if (inPhoto(hidden.aim) || inPhoto(hidden.objectPath) || inPhoto(hidden.cuePath))
+    messages.push('Another ball hides part of the path in this photo: that part is dashed and marked “hidden”.');
 
   return {
     aim: aimRuns,
     objectPath,
     cuePath,
+    hidden,
     ghost,
     target,
     cueBall,

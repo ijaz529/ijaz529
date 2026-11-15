@@ -23,6 +23,7 @@ import {
   type Orbit,
 } from './camera';
 import { tableGeom, type TableGeom } from './geom';
+import { createGestures } from './gestures';
 import { easeInOutCubic, easeOutCubic, mat4, mat4FromBasis, project, quatMultiply, rayAt, rayPlaneZ, screenRay, v3cross, v3norm, type Quat, type V3 } from './math3d';
 import { pickRay, type Pick3D } from './picking';
 import { buildTrack, playbackTimeline, sampleTrack, type BallPose, type PlaybackTrack, type Timeline } from './playback';
@@ -110,12 +111,10 @@ export interface Table3DOptions {
   maxPixelRatio?: number;
 }
 
-const TAP_MAX_PX = 8;
-const TAP_MAX_MS = 350;
-const DOUBLE_TAP_MS = 320;
 const TRANSITION_MS = 720;
 const ORBIT_RAD_PER_PX = 0.0065;
 const STRIKE_PRE_S = 0.5;
+/** The end position is held this long for watching (coaching); a tap, Skip or Escape ends it at once. */
 const HOLD_S = 3.5;
 /** Idle practice strokes in Player view: this many, this long each, then the cue rests at address. */
 const PRACTICE_STROKES = 3;
@@ -348,6 +347,10 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   // -------------------------------------------------------------------------------------------
   function setData(d: Scene3DData): void {
     if (destroyed) return;
+    // A different plan during a replay (a new pocket, stroke or recommendation): the replay stops
+    // first and the layout returns to its planned state, so old trajectories never run under the new
+    // plan's lines (contract § setData during playback).
+    if (play && d.plan !== play.plan) finishPlayback();
     const tableChanged = !data || data.table !== d.table;
     const prev = data;
     data = d;
@@ -637,7 +640,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       preset,
       pitch: currentOrbit().pitch,
       playing: play !== null,
-      moving: anim !== null || drag !== null || mode === 'orbit' || mode === 'pan' || mode === 'pinch',
+      moving: anim !== null || drag !== null || gestures.steering(),
     };
   }
 
@@ -665,18 +668,6 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       }
       markDirty();
     });
-  }
-
-  function skipPlayback(): void {
-    if (!play) return;
-    if (play.holdUntil !== null) {
-      finishPlayback();
-      return;
-    }
-    // Jump to the final positions and hold briefly.
-    play.t0 = now() - (play.pre + play.tl.duration + 0.001) * 1000;
-    play.holdUntil = now() + 650;
-    markDirty();
   }
 
   function finishPlayback(): void {
@@ -730,22 +721,58 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   }
 
   // -------------------------------------------------------------------------------------------
-  // Gestures
+  // Gestures (the state machine is pure: gestures.ts; here the intents act on the camera and balls)
   // -------------------------------------------------------------------------------------------
-  interface Ptr {
-    x: number;
-    y: number;
-    sx: number;
-    sy: number;
-    t0: number;
-  }
-  const ptrs = new Map<number, Ptr>();
-  type Mode = 'none' | 'pending' | 'orbit' | 'pan' | 'ball' | 'pinch';
-  let mode: Mode = 'none';
-  let pendingBall: string | null = null;
-  let panButton = false;
-  let pinch: { d0: number; dist0: number; mx: number; my: number } | null = null;
-  let lastTap: { t: number; x: number; y: number; empty: boolean } | null = null;
+  const gestures = createGestures<PointerEvent>({
+    now,
+    pick,
+    isPlaying: () => play !== null,
+    canDragBalls: () => !!events.onBallDrag,
+    cameraReady: () => !!g && !!orbit,
+    distance: () => currentOrbit().dist,
+    releasePointer(id) {
+      try {
+        canvas.releasePointerCapture(id);
+      } catch {
+        /* ignore */
+      }
+    },
+    tap: (hit, ev) => events.onTap?.(hit, ev!),
+    doubleTap: () => setCamera(lastPreset, true),
+    // A tap during the replay skips straight to the planned layout (the end hold is for watching,
+    // never something to tap through twice).
+    skipPlayback: () => finishPlayback(),
+    custom: becomeCustom,
+    orbit(dx, dy) {
+      const o = currentOrbit();
+      orbit = clampUserOrbit({ ...o, yaw: o.yaw - dx * ORBIT_RAD_PER_PX, pitch: o.pitch + dy * ORBIT_RAD_PER_PX }, g!);
+      markDirty();
+    },
+    pan: (dx, dy) => panBy(dx, dy),
+    zoomTo(dist) {
+      orbit = clampUserOrbit({ ...currentOrbit(), dist }, g!);
+      markDirty();
+    },
+    zoomBy(factor) {
+      const o = currentOrbit();
+      orbit = clampUserOrbit({ ...o, dist: o.dist * factor }, g!);
+      markDirty();
+    },
+    ballDrag(phase, id, x, y) {
+      const pos = dragPos(x, y);
+      if (phase === 'start') {
+        if (pos) {
+          drag = { id, pos };
+          events.onBallDrag?.(id, pos, 'start');
+        }
+      } else if (drag && pos) {
+        drag.pos = pos;
+        events.onBallDrag?.(drag.id, pos, 'move');
+        markDirty();
+      }
+    },
+    endBallDrag,
+  });
 
   function onDown(e: PointerEvent): void {
     if (!data || !g) return;
@@ -754,66 +781,12 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     } catch {
       /* synthetic events */
     }
-    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t0: now() });
-    if (ptrs.size === 1) {
-      mode = 'pending';
-      panButton = e.button === 2 || e.shiftKey;
-      const p = play ? null : pick(e.clientX, e.clientY);
-      pendingBall = p && p.kind === 'ball' && !panButton ? p.id : null;
-    } else if (ptrs.size === 2) {
-      endBallDrag();
-      mode = 'pinch';
-      const [a, b] = [...ptrs.values()] as [Ptr, Ptr];
-      pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, dist0: currentOrbit().dist, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
-      becomeCustom();
-    }
+    gestures.down({ id: e.pointerId, x: e.clientX, y: e.clientY, button: e.button, shift: e.shiftKey, ev: e });
   }
-
-  function onMove(e: PointerEvent): void {
-    const p = ptrs.get(e.pointerId);
-    if (!p) return;
-    const dx = e.clientX - p.x;
-    const dy = e.clientY - p.y;
-    p.x = e.clientX;
-    p.y = e.clientY;
-    if (mode === 'pending' && Math.hypot(p.x - p.sx, p.y - p.sy) >= TAP_MAX_PX) {
-      if (pendingBall && events.onBallDrag) {
-        mode = 'ball';
-        const pos = dragPos(e.clientX, e.clientY);
-        if (pos) {
-          drag = { id: pendingBall, pos };
-          events.onBallDrag(pendingBall, pos, 'start');
-        }
-      } else {
-        mode = panButton ? 'pan' : 'orbit';
-        becomeCustom();
-      }
-    }
-    if (mode === 'orbit') {
-      const o = currentOrbit();
-      orbit = clampUserOrbit({ ...o, yaw: o.yaw - dx * ORBIT_RAD_PER_PX, pitch: o.pitch + dy * ORBIT_RAD_PER_PX }, g!);
-      markDirty();
-    } else if (mode === 'pan') {
-      panBy(dx, dy);
-    } else if (mode === 'ball' && drag) {
-      const pos = dragPos(e.clientX, e.clientY);
-      if (pos) {
-        drag.pos = pos;
-        events.onBallDrag?.(drag.id, pos, 'move');
-        markDirty();
-      }
-    } else if (mode === 'pinch' && pinch && ptrs.size >= 2) {
-      const [a, b] = [...ptrs.values()] as [Ptr, Ptr];
-      const d = Math.hypot(a.x - b.x, a.y - b.y) || 1;
-      const mx = (a.x + b.x) / 2;
-      const my = (a.y + b.y) / 2;
-      const o = currentOrbit();
-      orbit = clampUserOrbit({ ...o, dist: (pinch.dist0 * pinch.d0) / d }, g!);
-      panBy(mx - pinch.mx, my - pinch.my);
-      pinch.mx = mx;
-      pinch.my = my;
-      markDirty();
-    }
+  const onMove = (e: PointerEvent) => gestures.move({ id: e.pointerId, x: e.clientX, y: e.clientY, ev: e });
+  const onUp = (e: PointerEvent) => gestures.up({ id: e.pointerId, x: e.clientX, y: e.clientY, cancel: e.type === 'pointercancel', ev: e });
+  function onWheel(e: WheelEvent): void {
+    if (gestures.wheel({ deltaY: e.deltaY, deltaMode: e.deltaMode, ctrl: e.ctrlKey })) e.preventDefault();
   }
 
   function dragPos(clientX: number, clientY: number): Vec2 | null {
@@ -838,60 +811,12 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   }
 
   function endBallDrag(): void {
-    if (mode === 'ball' && drag) {
+    if (drag) {
       const d = drag;
       drag = null;
       events.onBallDrag?.(d.id, d.pos, 'end');
       markDirty();
     }
-    drag = null;
-  }
-
-  function onUp(e: PointerEvent): void {
-    const p = ptrs.get(e.pointerId);
-    if (!p) return;
-    ptrs.delete(e.pointerId);
-    try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
-    const wasMode = mode;
-    if (wasMode === 'ball') endBallDrag();
-    if (ptrs.size === 0) {
-      mode = 'none';
-      pinch = null;
-    } else if (wasMode === 'pinch') {
-      mode = 'none';
-    }
-    if (wasMode !== 'pending' || e.type === 'pointercancel') return;
-    const moved = Math.hypot(e.clientX - p.sx, e.clientY - p.sy);
-    if (moved >= TAP_MAX_PX || now() - p.t0 > TAP_MAX_MS) return;
-    if (play) {
-      skipPlayback();
-      return;
-    }
-    const hit = pick(e.clientX, e.clientY);
-    const empty = !hit || hit.kind === 'cloth';
-    const t = now();
-    if (empty && lastTap && lastTap.empty && t - lastTap.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30) {
-      lastTap = null;
-      setCamera(lastPreset, true);
-      return;
-    }
-    lastTap = { t, x: e.clientX, y: e.clientY, empty };
-    events.onTap?.(hit, e);
-  }
-
-  function onWheel(e: WheelEvent): void {
-    if (!g || !orbit) return;
-    e.preventDefault();
-    const k = e.ctrlKey ? 0.01 : 0.0015;
-    const dyPx = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-    becomeCustom();
-    const o = currentOrbit();
-    orbit = clampUserOrbit({ ...o, dist: o.dist * Math.exp(dyPx * k) }, g);
-    markDirty();
   }
 
   const onContext = (e: Event) => e.preventDefault();
