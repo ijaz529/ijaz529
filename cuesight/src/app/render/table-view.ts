@@ -8,7 +8,7 @@
  * static table is cached in an offscreen canvas and only redrawn when the size or table changes.
  */
 import type { Ball, PocketId, ShotPlan, TableSpec, Trajectory, Vec2 } from '../../core/types';
-import { DASH, PALETTE, UI } from './palette';
+import { DASH, HIT_RADIUS_PX, PALETTE, UI } from './palette';
 
 export interface TableViewData {
   table: TableSpec;
@@ -96,11 +96,18 @@ export class TableView {
     this.table = table;
   }
 
+  /**
+   * The ball under a tap (CSS px), or null. A ball inside its natural pick radius (slop × R + 12 px)
+   * always wins; beyond that, up to the 22 px floor, it wins only when no pocket mouth is nearer the
+   * tap, so the caller falls through to pocketAt for a tap on a pocket next to a ball.
+   */
   ballAt(q: Vec2, balls: Ball[], slop = 1.8): Ball | null {
     if (!this.table) return null;
     const p = this.toTable(q);
     let best: Ball | null = null;
-    let bd = this.table.ballRadius * slop + 12 / this.s;
+    const natural = this.table.ballRadius * slop + 12 / this.s;
+    // At least a 44 CSS px target (22 px radius) even on the small mini-map; the nearest ball wins.
+    let bd = Math.max(natural, HIT_RADIUS_PX / this.s);
     for (const b of balls) {
       const d = Math.hypot(b.pos.x - p.x, b.pos.y - p.y);
       if (d < bd) {
@@ -108,12 +115,21 @@ export class TableView {
         best = b;
       }
     }
+    if (best && bd >= natural) {
+      const pk = this.nearestPocket(p);
+      if (pk && pk.d < bd) return null;
+    }
     return best;
   }
 
   pocketAt(q: Vec2): PocketId | null {
     if (!this.table) return null;
-    const p = this.toTable(q);
+    return this.nearestPocket(this.toTable(q))?.id ?? null;
+  }
+
+  /** The nearest pocket mouth within its pick radius (table metres), or null. */
+  private nearestPocket(p: Vec2): { id: PocketId; d: number } | null {
+    if (!this.table) return null;
     let best: PocketId | null = null;
     let bd = Math.max(this.table.cornerMouth, 22 / this.s);
     for (const pk of this.table.pockets) {
@@ -123,7 +139,7 @@ export class TableView {
         best = pk.id;
       }
     }
-    return best;
+    return best ? { id: best, d: bd } : null;
   }
 
   /** Screen-space axis-aligned rect of a table-space rect. */
