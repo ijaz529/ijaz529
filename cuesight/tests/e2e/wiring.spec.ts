@@ -35,11 +35,19 @@ test('Snap photo: a frozen plan is labelled at its anchor on the canvas; HUD met
   await page.addInitScript(() => {
     const w = window as Any;
     w.__texts = [];
+    // Each full redraw of the photo canvas starts with clearRect: number the draws, so a label is
+    // only ever compared with labels from the same picture (an earlier frame's strike label is gone).
+    w.__draw = 0;
+    const origClear = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect = function (this: CanvasRenderingContext2D, x: number, y: number, cw: number, ch: number) {
+      if ((this.canvas as HTMLCanvasElement).id === 'snap-canvas') w.__draw++;
+      return origClear.call(this, x, y, cw, ch);
+    };
     const orig = CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText = function (this: CanvasRenderingContext2D, t: string, x: number, y: number, mw?: number) {
       if ((this.canvas as HTMLCanvasElement).id === 'snap-canvas') {
         const m = this.getTransform();
-        w.__texts.push({ t: String(t), x, y, w: this.measureText(String(t)).width, a: m.a, d: m.d, e: m.e, f: m.f });
+        w.__texts.push({ t: String(t), x, y, w: this.measureText(String(t)).width, a: m.a, d: m.d, e: m.e, f: m.f, draw: w.__draw });
       }
       return mw === undefined ? orig.call(this, t, x, y) : orig.call(this, t, x, y, mw);
     };
@@ -113,7 +121,7 @@ test('Snap photo: a frozen plan is labelled at its anchor on the canvas; HUD met
       const texts = ((window as Any).__texts as Any[]).map((t) => {
         const X = (u: number) => rect.left + (t.a * u + t.e) / dpr;
         const Y = (v: number) => rect.top + (t.d * v + t.f) / dpr;
-        return { t: t.t as string, pill: { left: X(t.x - 9), right: X(t.x - 9 + t.w + 18), top: Y(t.y - 13), bottom: Y(t.y + 12) } };
+        return { t: t.t as string, draw: t.draw as number, pill: { left: X(t.x - 9), right: X(t.x - 9 + t.w + 18), top: Y(t.y - 13), bottom: Y(t.y + 12) } };
       });
       return {
         aimLabel: g.aimLabel as { text: string; r: number },
@@ -132,7 +140,7 @@ test('Snap photo: a frozen plan is labelled at its anchor on the canvas; HUD met
     const pl = lab!.pill;
     const d = Math.hypot(Math.max(pl.left - res.anchor.x, 0, res.anchor.x - pl.right), Math.max(pl.top - res.anchor.y, 0, res.anchor.y - pl.bottom));
     expect(d, `off ${off}°: the label's pill is next to its anchor on the canvas`).toBeLessThanOrEqual(res.anchor.r + 20);
-    const strike = res.texts.filter((t) => t.t.startsWith('Strike here')).pop();
+    const strike = res.texts.filter((t) => t.t.startsWith('Strike here') && t.draw === lab!.draw).pop();
     if (strike) {
       const b = strike.pill;
       const overlap = Math.min(pl.right, b.right) > Math.max(pl.left, b.left) && Math.min(pl.bottom, b.bottom) > Math.max(pl.top, b.top);
