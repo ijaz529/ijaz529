@@ -12,7 +12,8 @@
  * - "Too grainy" only when the noise is what defeats the fit: a photo without the cue ball says so under
  *   moderate noise, and cloth texture on a clean sensor is not sensor noise.
  * - Photos that fail (untinted grey, a moved cue ball, the cue ball out of frame) stay inside the
- *   per-photo budget (< 250 ms CPU at 960 × 720, 95th percentile).
+ *   per-photo budget (< 250 ms CPU at 960 × 720 on a device, 95th percentile): in this process their
+ *   p95 costs at most FAILS_PER_FIT successful fits measured alongside, and < 500 ms CPU on any runner.
  */
 import { beforeAll, describe, expect, it } from 'vitest';
 import { makeTable } from '../../src/core/table';
@@ -562,8 +563,40 @@ describe('"too grainy" names the cause only when the noise is what defeats the f
 
 // --- photos that fail stay inside the budget --------------------------------------------------------------
 
+/**
+ * The device budget is 250 ms CPU per 960 × 720 photo at the 95th percentile, failures included
+ * (contracts/player-view-api.md), as a dev machine measures it. Node on a shared CI runner is no such
+ * scale: the test files running beside this one share the runner's cores, and the same fits read up to
+ * 1.8× a quiet dev machine's, by an amount that moves within a run and differs between workloads (run
+ * 43718867091: these photos p95 353 ms against 206–256 ms locally, the envelope's fits median 112 against
+ * 61 ms, while player-view.test.ts's timed photo read the same 110 ms as locally a minute later). So the
+ * guard is relative, as in pipeline-420.test.ts: each fit of a failing photo alternates, call by call,
+ * with a successful fit from a fixed set (the same code on the same machine at the same moment, so the
+ * runner's speed and load cancel), each failing run counts its fastest of CPU_ROUNDS rounds (the least
+ * interference), and their 95th percentile may be at most FAILS_PER_FIT times the successful fits' median
+ * CPU — on a dev machine ≈ 4 × 65 ms, the device budget. On a 4-core dev machine the ratio read 2.8–3.15
+ * (alone, beside other jobs loading it to 9–11 runnable processes, and in the full suite), 2.9–3.0 with
+ * every fit made 1.5× or 1.84× slower (a slower runner: p95 281 / 362 ms, where the old fixed 250 ms
+ * limit failed), and 4.4–4.5 with the fits of the failing photos made 1.5× slower. A uniform slowdown of
+ * every fit leaves the ratio as it is; the absolute backstop catches a gross one, by the perf.test.ts
+ * convention of the device budget × a CI factor 2.
+ */
+const FAILS_PER_FIT = 4;
+const CPU_ROUNDS = 3;
+const CI_BACKSTOP_MS = 2 * 250;
+
+/** `fn()` and its CPU time in this process, in ms (wall time on a shared machine measures its other jobs). */
+function cpuTimed<T>(fn: () => T): { value: T; ms: number } {
+  const c0 = process.cpuUsage();
+  const value = fn();
+  const c = process.cpuUsage(c0);
+  return { value, ms: (c.user + c.system) / 1000 };
+}
+
 describe('photos that fail stay inside the per-photo budget', () => {
   const photos: { sc: Scene; frame: Frame; layout: SynthBall[]; cat: string }[] = [];
+  /** The reference: successful fits (green cloth, enough balls in view), with and without the app's hints. */
+  const fits: { sc: Scene; frame: Frame; extra: Partial<PlayerViewInput> }[] = [];
   beforeAll(async () => {
     for (let i = 0; i < 10; i++) {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -583,32 +616,54 @@ describe('photos that fail stay inside the per-photo budget', () => {
       const out = randomScene(370_000 + i, preset, ENVELOPE, { cueRow: 1.3 });
       photos.push({ sc: out, frame: render(out).frame, layout: out.balls, cat: 'cueOut' });
     }
+    // The first six random envelope scenes on green cloth with enough balls in view that fit, both ways.
+    for (let i = 0, n = 0; n < 6 && i < 40; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const sc = randomScene(380_000 + i, i % 2 ? 'snooker12' : 'pool9', ENVELOPE);
+      const r = render(sc);
+      if (!(r.cueInView && r.inView >= 3)) continue;
+      const both = [appHints(sc), {}].map((extra) => ({ sc, frame: r.frame, extra }));
+      if (!both.every((f) => run(f.sc, f.frame, f.extra).ok)) continue;
+      fits.push(...both);
+      n++;
+    }
   }, 600_000);
 
-  it('< 250 ms CPU at the 95th percentile over untinted grey, moved-cue-ball and cue-out-of-frame photos (960 × 720)', () => {
-    for (const p of photos.slice(0, 4)) run(p.sc, p.frame, appHints(p.sc), p.layout);
-    const t: number[] = [];
-    const by: Record<string, number[]> = {};
+  it(`within the 250 ms budget at the 95th percentile over untinted grey, moved-cue-ball and cue-out-of-frame photos (960 × 720): ≤ ${FAILS_PER_FIT} successful fits' CPU, < ${CI_BACKSTOP_MS} ms`, async () => {
+    expect(fits).toHaveLength(12);
+    const runs = photos.flatMap((p) => [appHints(p.sc), {}].map((extra) => ({ ...p, extra })));
+    // Warm (a process's first fits run in the interpreter).
+    for (const p of runs.slice(0, 4)) run(p.sc, p.frame, p.extra, p.layout);
+    for (const f of fits.slice(0, 2)) run(f.sc, f.frame, f.extra);
+    const t = runs.map(() => Infinity);
+    const ref: number[] = [];
     let failed = 0;
-    for (const p of photos)
-      for (const extra of [appHints(p.sc), {}]) {
-        const c0 = process.cpuUsage();
-        const res = run(p.sc, p.frame, extra, p.layout);
-        const c = process.cpuUsage(c0);
-        const ms = (c.user + c.system) / 1000;
-        t.push(ms);
-        (by[p.cat] ??= []).push(ms);
-        if (!res.ok) failed++;
+    for (let round = 0; round < CPU_ROUNDS; round++)
+      for (let i = 0; i < runs.length; i++) {
+        // Yield between pairs: a minute of synchronous work (this loop on a busy runner) would starve the
+        // test runner's RPC.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const p = runs[i]!;
+        const f = fits[(i + round) % fits.length]!;
+        ref.push(cpuTimed(() => run(f.sc, f.frame, f.extra)).ms);
+        const { value: res, ms } = cpuTimed(() => run(p.sc, p.frame, p.extra, p.layout));
+        t[i] = Math.min(t[i]!, ms);
+        if (round === 0 && !res.ok) failed++;
       }
     const q = (xs: number[], p: number) => xs.slice().sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(p * xs.length))]!;
+    const by: Record<string, number[]> = {};
+    runs.forEach((p, i) => (by[p.cat] ??= []).push(t[i]!));
+    const p95 = q(t, 0.95);
+    const fit = q(ref, 0.5);
     console.log(
-      `player-view 960×720 CPU on photos that mostly fail (${failed}/${t.length} runs fail): median ${q(t, 0.5).toFixed(0)} ms, p95 ${q(t, 0.95).toFixed(0)} ms, max ${Math.max(...t).toFixed(0)} ms; ${Object.entries(by)
+      `player-view 960×720 CPU on photos that mostly fail (${failed}/${t.length} runs fail, fastest of ${CPU_ROUNDS}): median ${q(t, 0.5).toFixed(0)} ms, p95 ${p95.toFixed(0)} ms, max ${Math.max(...t).toFixed(0)} ms; ${Object.entries(by)
         .map(([k, xs]) => `${k} p95 ${q(xs, 0.95).toFixed(0)}`)
-        .join(', ')}`,
+        .join(', ')}; successful fits median ${fit.toFixed(0)} ms (p95 ${q(ref, 0.95).toFixed(0)}): p95 = ${(p95 / fit).toFixed(2)} fits`,
     );
     expect(failed).toBeGreaterThanOrEqual(0.4 * t.length);
-    expect(q(t, 0.95)).toBeLessThan(250);
-  });
+    expect(p95 / fit).toBeLessThan(FAILS_PER_FIT);
+    expect(p95).toBeLessThan(CI_BACKSTOP_MS);
+  }, 300_000);
 });
 
 /** Three shots from an independent random-layout sweep (seeds 82004, 82019, 82030), as literals. */
