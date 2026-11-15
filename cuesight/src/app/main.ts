@@ -11,7 +11,8 @@ import { dist } from '../core/vec';
 import { PROTOCOL_VERSION, type PlannerPlanOptions, type VisionOut } from '../workers/protocol';
 import { applyH, invert3 } from '../vision/homography';
 import { FrameGrabber, createCameraSession, describeCameraError } from './camera';
-import { DRILLS, cueBall, objectBall } from './drills';
+import { ADD_BALL_TOASTS, addBallTo } from './add-ball';
+import { DRILLS } from './drills';
 import { Overlay, containMapping, type OverlayData } from './render/overlay';
 import { rgbCss } from './render/palette';
 import { TableView } from './render/table-view';
@@ -145,8 +146,12 @@ let labelContent: LabelContent | null = null;
 function labelContentOf(s: AppState, names: Record<PocketId, string>): LabelContent | null {
   return planLabelContent(s.plan, names, { pending: s.strokeMode === 'recommended' && !!s.recommended?.pending, snooker: s.table.id === 'snooker12' });
 }
+/** Floating controls over the 3D table the in-scene label must not slide under (Play, slow motion). */
+function floatingControls(): DOMRect[] {
+  return [...viewControlsEl.querySelectorAll<HTMLElement>('.vc-play, .vc-slow')].map((e) => e.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0);
+}
 function updateLabel(): void {
-  shotLabel.update(lastFrame, labelContent, labelShown(S));
+  shotLabel.update(lastFrame, labelContent, labelShown(S), lastFrame ? floatingControls() : []);
   const balls = editableBalls(S);
   ballTags.update(lastFrame, balls ?? [], !!view3d && !!balls && tableStageOn(S) && sheet.state() !== 'expanded' && document.body.classList.contains('has-3d') && !document.querySelector('#snap[data-inspect="true"]'), S.table.id === 'snooker12');
 }
@@ -1245,23 +1250,17 @@ const actions = {
     replan();
   },
   addBall() {
+    // On the free spot nearest the middle of the table (add-ball.ts); in Snap with the neutral label,
+    // so it never repeats a number or colour vision gave another ball.
+    const balls = editableBalls(S);
+    if (!balls) return;
+    const added = addBallTo(S.table, balls, { neutral: S.mode === 'snap' });
+    if (!added) return toast(ADD_BALL_TOASTS.full);
     store.update((s) => {
-      const balls = editableBalls(s);
-      if (!balls) return;
-      const used = new Set(balls.map((b) => b.id));
-      let n = 1;
-      while (used.has(`b${n}`)) n++;
-      const R = s.table.ballRadius;
-      let p: Vec2 = { x: 0, y: 0 };
-      for (let k = 0; k < 200; k++) {
-        p = { x: (Math.random() - 0.5) * (s.table.length - 4 * R), y: (Math.random() - 0.5) * (s.table.width - 4 * R) };
-        if (balls.every((b) => dist(b.pos, p) > 3 * R)) break;
-      }
-      const hasCue = balls.some((b) => b.kind === 'cue');
-      const cueId = used.has('cue') ? `cue${n}` : 'cue';
-      setEditableBalls(s, hasCue ? [...balls, objectBall(n, p)] : [...balls, { ...cueBall(p), id: cueId }]);
+      const now = editableBalls(s);
+      if (now) setEditableBalls(s, [...now, added.ball]);
     });
-    if (S.mode === 'snap') toast('Ball added in the middle of the table. Drag it to where it is.');
+    if (S.mode === 'snap') toast(added.atCentre ? ADD_BALL_TOASTS.centre : ADD_BALL_TOASTS.near);
     replan();
   },
   removeBall() {

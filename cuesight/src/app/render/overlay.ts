@@ -177,7 +177,8 @@ export class Overlay {
       if (plan.cueRest) {
         this.screenPoly(circlePts(plan.cueRest, R), PALETTE.cue, [2, 3], 2, 0, UI.halo, 4);
         const q = onR(plan.cueRest);
-        this.label('Cue stops', { x: q.x + gr + 8, y: q.y });
+        // Not next to "Not makeable": a shot not to play has no cue-ball finish to name.
+        if (plan.makeable) this.label('Cue stops', { x: q.x + gr + 8, y: q.y });
       }
     }
     // Detected balls.

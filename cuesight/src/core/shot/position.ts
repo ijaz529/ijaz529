@@ -350,7 +350,16 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const pool = landing && reachable ? results.filter((r) => r.restError <= LANDING_RADIUS) : results;
 
   // --- Robustness checks -------------------------------------------------------------------------
-  const aimErr = Math.max(1e-4, (AIM_ERROR_SHARE * base.toleranceDeg * Math.PI) / 180);
+  // The shot's own tolerance: the cue-ball aim's, or for a frozen cue ball the stroke angle's. The
+  // base plan (default stroke) reports none when that stroke misses as played; the aim's geometric
+  // margin stands in for it then, so a miss at the default stroke does not shrink the aim probe.
+  let aimTolDeg = base.toleranceDeg;
+  if (!(aimTolDeg > 0)) {
+    const target = layout.balls.find((b) => b.id === request.targetId)!;
+    const pocket = layout.table.pockets.find((p) => p.id === pocketId)!;
+    aimTolDeg = deg(shotGeometry(layout.table, layout.balls, cueBall, target, pocket, params).toleranceRad);
+  }
+  const aimErr = Math.max(1e-4, (AIM_ERROR_SHARE * aimTolDeg * Math.PI) / 180);
   const squirtOf = (s: Stroke, ratio: number) => (s.side === 0 ? 0 : strikeBall(base.aimDir, 1, s.side, s.vert, R, ratio).squirtRad);
   const note = (risks: StrokeRisk[], scratchIf: StrokeRisk['scratchIf'], p: PocketId) => {
     if (!risks.some((x) => x.scratchIf === scratchIf && x.pocketId === p)) risks.push({ scratchIf, pocketId: p });

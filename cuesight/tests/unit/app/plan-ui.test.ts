@@ -504,13 +504,13 @@ describe('recommendation display (w1-7): speed-sensitive, cut-short search, risk
   it('the fixture is a recommended stroke', () => expect(base.strokeSource).toBe('recommended'));
   it('notes on the card, only for the recommended stroke', () => {
     const f = cardHtml(base, { fragile: true });
-    expect(f).toContain('Speed-sensitive — small changes in pace may change the result.');
+    expect(f).toContain('This stroke may need precise pace: a little harder or softer could miss or scratch.');
     expect(cardHtml(base, { searchCutShort: true })).toContain('Search cut short — the best stroke found in time.');
     expect(cardHtml(base, { risksUnknown: true })).toContain('Scratch risk from small errors not checked.');
     const plain = cardHtml(base, {});
-    expect(plain).not.toMatch(/Speed-sensitive|cut short|not checked/);
+    expect(plain).not.toMatch(/precise pace|cut short|not checked/);
     const mine = { ...base, strokeSource: 'player' as const };
-    expect(cardHtml(mine, { fragile: true, searchCutShort: true, risksUnknown: true })).not.toMatch(/Speed-sensitive|cut short|not checked/);
+    expect(cardHtml(mine, { fragile: true, searchCutShort: true, risksUnknown: true })).not.toMatch(/precise pace|cut short|not checked/);
   });
   it('recommendationContext: absent risks are "not known", never "safe"', () => {
     const rec = (over: Partial<NonNullable<AppState['recommended']>>): AppState['recommended'] => ({ key: 'k', stroke: base.stroke, pending: false, reachable: true, evaluated: 200, ...over });

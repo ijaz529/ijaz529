@@ -20,9 +20,9 @@ const RECOMMEND_TIME_CAP_MS = 1500;
 export type PlannerPost = (m: PlannerOut, transfer?: Transferable[]) => void;
 
 /**
- * Stateful message handler. The evaluation budget is fixed per device and ball count
- * (eval-budget.ts); its figures come back with every recommendation and return with the next
- * request, so a restarted worker keeps them.
+ * Stateful message handler. The evaluation budget is per device and ball count (eval-budget.ts): a
+ * warm calibration, refined once by the first real search, then fixed; its figures come back with
+ * every recommendation and return with the next request, so a restarted worker keeps them.
  */
 export function createPlannerHandler(evalBudget: EvaluationBudget = createEvaluationBudget()): (msg: PlannerIn, post: PlannerPost) => void {
   return (msg, post) => {
@@ -35,11 +35,14 @@ export function createPlannerHandler(evalBudget: EvaluationBudget = createEvalua
         case 'recommend': {
           evalBudget.seed(msg.perEvalMs);
           const maxEvaluations = evalBudget.budget(msg.layout, msg.request, msg.params);
-          const r = recommendStroke(msg.layout, msg.request, msg.params, {
-            ...(msg.request.landing ? { landing: msg.request.landing } : {}),
-            maxEvaluations,
-            timeCapMs: RECOMMEND_TIME_CAP_MS,
-          });
+          // Timed: the first real search refines the budget's figure from its own ms per evaluation.
+          const r = evalBudget.measure(msg.layout, () =>
+            recommendStroke(msg.layout, msg.request, msg.params, {
+              ...(msg.request.landing ? { landing: msg.request.landing } : {}),
+              maxEvaluations,
+              timeCapMs: RECOMMEND_TIME_CAP_MS,
+            }),
+          );
           post({ v: PROTOCOL_VERSION, type: 'recommendation', id: msg.id, ...r, perEvalMs: evalBudget.figures() });
           break;
         }

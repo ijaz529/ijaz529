@@ -3355,6 +3355,55 @@ body[data-mode='snap'] :is(.vc-btn, .vc-play) span {
 .panel[data-sheet='peek'] .hero-main {
   height: 38px;
 }
+/* The spin tile's stroke name, never cut off (final walkthrough: "Follow, right en…" at 375 and 393
+   px). A hair tighter, so "Stun-run-through" fits on one line at 375 px; a name with side takes two
+   lines (.two: the stroke, then "right english") and the ball gives up a line's height for them, so
+   the tile, and the peek, keep their height. At the peek with a headline warning the line is hidden
+   and the ball gets its room back. */
+.hero-stat.spin .s {
+  letter-spacing: -0.01em;
+}
+.hero-stat.spin.two .s {
+  flex-direction: column;
+  gap: 0;
+  font-size: 12px;
+  line-height: 1.15;
+}
+@media (max-height: 700px) and (orientation: portrait) {
+  /* "Stun-run-through," on its line at 375 px */
+  .hero-stat.spin.two .s {
+    font-size: 11.5px;
+  }
+}
+.hero-stat.spin.two .s :is(.t, .t2) {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hero-stat.spin.two .hero-main {
+  height: 31px;
+}
+.hero-stat.spin.two .spin-ball svg {
+  width: 31px;
+  height: 31px;
+}
+.panel[data-sheet='peek'] .hero-stat.spin.two .hero-main {
+  height: 27px;
+}
+.panel[data-sheet='peek'] .hero-stat.spin.two .spin-ball svg {
+  width: 28px;
+  height: 28px;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat.spin.two .hero-main {
+  height: 38px;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat.spin.two .spin-ball svg {
+  width: 42px;
+  height: 42px;
+}
 .strike-line {
   display: flex;
   align-items: center;

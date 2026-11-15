@@ -6,6 +6,7 @@
 import { describeSpin, powerToSpeed, speedWord } from '../../core/shot/power';
 import { squirtOffsetText, throwSentence } from '../../core/shot/coach';
 import type { ShotPlan, WarningCode } from '../../core/types';
+import { FRAGILE_PACE } from '../planner-client';
 import type { AppState } from '../store';
 import { fractionShort, fractionTile, frozenStroke, hasStroke, isFrozenPlan } from '../render/plan-draw';
 import { BALL_NAMED, BALL_NEUTRAL } from '../render/palette';
@@ -71,9 +72,9 @@ export function recommendationContext(rec: AppState['recommended'], plan: Pick<S
   return { fragile: rec.fragile === true, searchCutShort: rec.timedOut === true, risksUnknown: rec.risks === undefined };
 }
 
-/** Honesty notes on a recommended stroke (Principle II), in player words. */
+/** Honesty notes on a recommended stroke (Principle II), in player words (fragile: the toast's own sentence). */
 export const REC_NOTES = {
-  fragile: 'Speed-sensitive — small changes in pace may change the result.',
+  fragile: FRAGILE_PACE,
   searchCutShort: 'Search cut short — the best stroke found in time.',
   risksUnknown: 'Scratch risk from small errors not checked.',
 } as const;
@@ -132,10 +133,33 @@ export function headlineWarning(plan: ShotPlan): ShotPlan['warnings'][number] | 
   return null;
 }
 
-/** Margin of error as the player feels it: millimetres of contact on the object ball. */
-export function marginText(plan: Pick<ShotPlan, 'toleranceMm'>): string {
-  const mm = plan.toleranceMm;
-  return `±${mm >= 10 ? mm.toFixed(0) : mm.toFixed(1)} mm`;
+/**
+ * Margin of error as the player feels it: millimetres of contact on the object ball; for a cue ball
+ * frozen to it (no contact point to aim at) degrees of stroke angle, the margin the core rates it by.
+ * None (the stroke on show misses as played, or no power works) is "±0 mm" / "±0°": short enough
+ * that "very hard · ±0 mm" stays beside the title at 375 px.
+ */
+export function marginText(x: Pick<ShotPlan, 'toleranceMm'> & { toleranceDeg?: number; frozen?: boolean }): string {
+  if (x.frozen) {
+    const d = x.toleranceDeg ?? 0;
+    return d > 0 ? `±${d >= 10 ? d.toFixed(0) : d.toFixed(1)}°` : '±0°';
+  }
+  const mm = x.toleranceMm;
+  return mm > 0 ? `±${mm >= 10 ? mm.toFixed(0) : mm.toFixed(1)} mm` : '±0 mm';
+}
+
+/** The difficulty chip's words and its title (hover/long-press), for a makeable plan. */
+function difficultyChip(plan: ShotPlan, frozen: boolean): { text: string; title: string } {
+  const m = marginText({ ...plan, frozen });
+  const text = `${plan.difficulty} · ${m}`;
+  if (!((frozen ? plan.toleranceDeg : plan.toleranceMm) > 0))
+    return {
+      text,
+      // (A frozen ball the core's probes put just outside the pocket can still drop in the full simulation.)
+      title: plan.obPocketed ? 'No margin: at this speed no stroke sends it clearly inside the pocket, so a small error misses' : 'No margin: the stroke on show does not pot it as played (see the warning)',
+    };
+  if (frozen) return { text, title: `Stroke within ${m} of the angle shown (balls frozen: no contact point to aim at)` };
+  return { text, title: `Hit the contact point within ${m} (aim ±${plan.toleranceDeg.toFixed(2)}°)` };
 }
 
 /** Two letters where colour names share an initial (blue, black, brown), as the ball tags write them. */
@@ -233,8 +257,10 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
   // Makeable: the headline warning is already shown above the hero (.head-warn); the list below has
   // the others, so no warning appears twice.
   const warn = plan.makeable ? chips(shown.filter((w) => !head || w.message !== head.message)) + riskChips : '';
-  // A margin exists only for a shot that can be made (the planner's value goes negative past 90°).
+  // A margin exists only for a shot that can be made (the planner's value goes negative past 90°). A
+  // frozen cue ball has no contact point to aim at: its margin is the stroke angle's (degrees).
   const margin = plan.makeable && plan.toleranceMm > 0;
+  const diffChip = plan.makeable ? difficultyChip(plan, frozen) : null;
   const tipMm = ctx.ballRadius ? tipOffsetMm(p, ctx.ballRadius) : null;
   const src =
     plan.strokeSource === 'player'
@@ -273,6 +299,10 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
   const powerStr = power.toFixed(power % 1 ? 1 : 0);
   const phrase = plan.fractionPhrase ?? `${plan.fractionLabel}-ball`;
   const spinWords = describeSpin(p);
+  // A stroke name with side ("Follow, right english", up to "Stun-run-through, right english") does
+  // not fit the one-line tile at 375–393 px: it takes two lines there, the stroke and the side, and
+  // the ball shrinks by a line (styles.css) so the tile keeps the hero's height.
+  const sideName = plan.strokeName ? /^(.+), ((?:left|right) english)$/.exec(plan.strokeName) : null;
   const hero = plan.makeable
     ? `<div class="hero">
       ${
@@ -296,10 +326,10 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
         </div>
         <div class="s"><span class="t">${esc(speedWord(power))}</span></div>
       </div>
-      <div class="hero-stat spin">
+      <div class="hero-stat spin${sideName ? ' two' : ''}">
         <div class="k">Spin</div>
         <div class="hero-main"><div class="spin-ball" role="img" aria-label="${esc(spinText(p.side, p.vert))}">${spinBallSvg(p.side, p.vert, 42)}</div></div>
-        <div class="s" title="${esc(spinWords)}"><span class="t">${esc(plan.strokeName ?? spinWords)}</span></div>
+        <div class="s" title="${esc(spinWords)}">${sideName ? `<span class="t">${esc(sideName[1]!)},</span> <span class="t2">${esc(sideName[2]!)}</span>` : `<span class="t">${esc(plan.strokeName ?? spinWords)}</span>`}</div>
       </div>
     </div>
     <p class="strike-line">${iconMarkup('target', 14)}<span>${plan.strokeName ? `<b>${esc(plan.strokeName)}</b> · ` : ''}strike <span data-testid="spin">${esc(spinWords)}</span></span></p>`
@@ -312,7 +342,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
   <article class="card shot${plan.makeable ? '' : ' not-makeable'}${head && plan.makeable ? ' has-warn' : ''}" data-testid="shot-card" aria-label="Shot plan">
     <header class="shot-head">
       <h2 class="title">${ballChip(ctx.targetLabel, ctx.targetColor, ctx.targetStripe, ctx.snooker)}<span class="sr-only">${unnamed(ctx.targetLabel) ? 'Unnamed ' : 'Ball '}</span><span class="target-label${/^\d+$/.test(ctx.targetLabel) ? ' sr-only' : ''}">${esc(ctx.targetLabel)}</span>${iconMarkup('arrow-right', 18, 'arrow')}<span class="pocket-name">${esc(ctx.pocketName)}</span></h2>
-      <div class="chip diff diff-${diffClass}" title="${plan.makeable ? `Hit the contact point within ${esc(marginText(plan))} (aim ±${plan.toleranceDeg.toFixed(2)}°)` : 'Not makeable'}" data-testid="difficulty">${plan.makeable ? `${esc(plan.difficulty)} · ${esc(marginText(plan))}` : `${iconMarkup('alert', 14)}not makeable`}</div>
+      <div class="chip diff diff-${diffClass}" title="${diffChip ? esc(diffChip.title) : 'Not makeable'}" data-testid="difficulty">${diffChip ? esc(diffChip.text) : `${iconMarkup('alert', 14)}not makeable`}</div>
     </header>
     ${head && plan.makeable ? `<p class="head-warn warn-${head.code}">${iconMarkup('alert', 16)}<span>${esc(head.message)}</span></p>` : ''}
     ${hero}
@@ -326,8 +356,12 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     ${
       ctx.showDetails
         ? `<dl class="details">
-      <div><dt>Contact tolerance</dt><dd>${margin ? `±${plan.toleranceMm.toFixed(1)} mm` : '—'}</dd></div>
-      <div><dt>Aim tolerance</dt><dd>${margin && plan.toleranceDeg > 0 ? `±${plan.toleranceDeg.toFixed(2)}°` : '—'}</dd></div>
+      <div><dt>Contact tolerance</dt><dd>${margin && !frozen ? `±${plan.toleranceMm.toFixed(1)} mm` : '—'}</dd></div>
+      ${
+        frozen
+          ? `<div><dt>Stroke-angle tolerance</dt><dd>${plan.makeable && plan.toleranceDeg > 0 ? `±${plan.toleranceDeg.toFixed(1)}°` : '—'}</dd></div>`
+          : `<div><dt>Aim tolerance</dt><dd>${margin && plan.toleranceDeg > 0 ? `±${plan.toleranceDeg.toFixed(2)}°` : '—'}</dd></div>`
+      }
       ${tipMm && !noStroke ? `<div><dt>Tip offset</dt><dd>${esc(tipMm)}</dd></div>` : ''}
       <div><dt>Pocket window</dt><dd>±${plan.windowHalfDeg.toFixed(2)}°</dd></div>
       <div><dt>CB speed</dt><dd>${powerToSpeed(power).toFixed(1)} m/s</dd></div>

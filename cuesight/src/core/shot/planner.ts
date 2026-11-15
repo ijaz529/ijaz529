@@ -74,6 +74,17 @@ const FROZEN_SCAN_STEP = rad(2.5);
 /** Frozen CB: refinement probes around the best scan sample. */
 const FROZEN_REFINE = 8;
 /**
+ * Frozen CB, the stroke-angle tolerance (frozenStrokeTolerance): stroke offsets probed outward from
+ * the chosen angle, doubling from FROZEN_TOL_FIRST up to FROZEN_TOL_STEP and then every
+ * FROZEN_TOL_STEP up to FROZEN_TOL_MAX, then FROZEN_TOL_BISECT bisection steps at the first one
+ * outside the window. Resolution choices, not physics: a margin wider than FROZEN_TOL_MAX either way
+ * is reported as FROZEN_TOL_MAX, already 80 times the 'easy' threshold (coach.ts).
+ */
+const FROZEN_TOL_FIRST = rad(0.25);
+const FROZEN_TOL_STEP = rad(2);
+const FROZEN_TOL_MAX = rad(16);
+const FROZEN_TOL_BISECT = 5;
+/**
  * Frozen CB, a stroke too soft at the played power: bisection steps for the lowest power that works
  * below the first half step that does (precision POWER_ADVICE_STEP / 2^3 ≈ 0.06 of a power).
  * A resolution choice for the minimum the app shows, not a physical constant.
@@ -143,7 +154,9 @@ export interface ShotGeometry {
   cbDistance: number;
   /**
    * CB aim tolerance (rad) that keeps the OB in the window; 0 when not makeable. Frozen CB: the
-   * margin of the line of centres (± throw) inside the window instead.
+   * margin of the line of centres (± the most throw at the softest stroke) inside the window instead
+   * — geometry only, for ranking pockets and suggestions; planShot rates a frozen plan by the
+   * stroke-angle tolerance its search has (ShotPlan.toleranceDeg).
    */
   toleranceRad: number;
   /** Ghost-ball tolerance (mm, lateral) for the same margin; 0 when not makeable. */
@@ -559,6 +572,8 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   let strokeOffset = 0; // frozen: stroke angle relative to the line of centres (rad, CCW +)
   let uncompensable = false; // no clean aim cancels the throw inside the window
   let frozenMiss: number | null = null; // frozen: no stroke angle throws it inside the window (rad left)
+  let frozenTolRad = 0; // frozen: stroke-angle tolerance of the stroke found (0 when it misses)
+  let frozenTolMm = 0; // frozen: the object ball's departure margin inside the window, as contact mm
   if (geo.makeable && !geo.frozen) {
     const r = throwSearch(geo, (a) => probe(norm(sub(ghostBall(target.pos, fromAngle(a), R), cue.pos)), geo.window.dir));
     aimAngle = r.aim;
@@ -601,17 +616,29 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     minPower = minFor(r.aim - au, 'pace');
     minPowerCapture = minFor(r.aim - au, 'capture');
     if (r.residual !== null && Math.abs(r.residual) > geo.window.halfRad) frozenMiss = Math.abs(r.residual) - geo.window.halfRad;
+    else if (r.residual !== null) {
+      // The margin the stroke really has, at this speed and tip: the stroke angle either way, and the
+      // object ball's departure inside the window (as contact mm, like a straight shot's).
+      frozenTolRad = frozenStrokeTolerance(r.aim, geo.window.halfRad, (a) => probeWith(fromAngle(a), geo.window.dir, speed, stroke.side, stroke.vert));
+      frozenTolMm = (geo.window.halfRad - Math.abs(r.residual)) * 2 * R * 1000;
+    }
     strokeOffset = r.aim - au;
     // Same meaning as for any shot: OB departure − aim line (here the line of centres), signed CCW.
     throwRad = r.residual === null ? 0 : r.throwRad - angleBetween(geo.window.dir, geo.aimDir);
     aimDir = fromAngle(r.aim);
     const offDeg = Math.abs(deg(strokeOffset));
+    // No stroke angle throws it inside the window at this speed: the angle shown is the closest it
+    // gets (it may still drop, the balls staying in contact a moment), never "to throw it toward the
+    // pocket" next to 'throw-uncompensable'.
+    const closest = frozenMiss !== null ? ' — the closest it gets to the pocket at this speed. Soft centre ball gives the most throw; follow or pace reduces it.' : null;
     warnings.splice(frozenAt, 0, {
       code: 'frozen',
       message:
         offDeg >= 0.5
-          ? `Frozen: the object ball goes along the line of centres; stroke ${offDeg.toFixed(0)}° to the ${strokeOffset > 0 ? 'left' : 'right'} of it to throw it toward the pocket. Soft centre ball gives the most throw; follow or pace reduces it.`
-          : 'Frozen: the object ball goes along the line of centres, which points at the pocket; stroke straight through it.',
+          ? `Frozen: the object ball goes along the line of centres; stroke ${offDeg.toFixed(0)}° to the ${strokeOffset > 0 ? 'left' : 'right'} of it${closest ?? ' to throw it toward the pocket. Soft centre ball gives the most throw; follow or pace reduces it.'}`
+          : closest
+            ? `Frozen: the object ball goes along the line of centres; stroke straight through it${closest}`
+            : 'Frozen: the object ball goes along the line of centres, which points at the pocket; stroke straight through it.',
     });
   } else if (geo.frozen) {
     warnings.splice(frozenAt, 0, { code: 'frozen', message: 'Frozen: the object ball can only go along the line of centres (plus a little throw).' });
@@ -809,8 +836,21 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       });
   }
 
+  // --- Margin and difficulty ---------------------------------------------------------------------
+  // The stroke on show misses (no clean aim or stroke angle cancels the throw, or the simulated ball
+  // misses), or no power works (out of reach even at full power, or a frozen stroke no power pots
+  // with pace): it has no margin, whatever the geometry allows, so it is never rated easy or medium
+  // (Principle II). Otherwise the margin is the aim's: the cue-ball aim tolerance, or for a frozen
+  // cue ball the stroke-angle tolerance its own search has at this speed and tip.
+  const missesAsPlayed =
+    noWorkingPower !== undefined ||
+    warnings.some((w) => w.code === 'ob-missed' || w.code === 'throw-uncompensable') ||
+    (geo.makeable && minPowerCapture > 10);
+  const tolRad = missesAsPlayed ? 0 : geo.frozen ? frozenTolRad : geo.toleranceRad;
+  const tolMm = missesAsPlayed ? 0 : geo.frozen ? frozenTolMm : geo.toleranceMm;
+
   // --- Coaching -----------------------------------------------------------------------------------
-  const tolDeg = deg(geo.toleranceRad);
+  const tolDeg = deg(tolRad);
   const throwShiftMm = dist(ghost, geo.ghost) * 1000;
   // Which way the compensation moved the ghost ball, in the player's terms: left/right of full ball
   // on a hit the label calls "full", thinner/thicker on any cut. No ghost ball when frozen.
@@ -856,7 +896,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     scratch,
     windowHalfDeg: deg(geo.window.halfRad),
     toleranceDeg: tolDeg,
-    toleranceMm: geo.toleranceMm,
+    toleranceMm: tolMm,
     difficulty: difficultyOf(tolDeg),
     warnings,
     tip: '',
@@ -1073,6 +1113,44 @@ function frozenSearch(au: number, errAt: (a: number) => number): SearchResult {
     }
   }
   return { aim: au + s * best.t, throwRad: e0, residual: best.e };
+}
+
+/**
+ * Frozen CB: the stroke-angle tolerance (rad) at `aim`, whose departure is inside the window — how
+ * far the stroke can turn either way with the OB still leaving inside ±halfRad, the nearer of the two
+ * edges (the frozen counterpart of a cue-ball aim tolerance, the stroke being the aim). Each side:
+ * offsets probed outward (FROZEN_TOL_FIRST doubling to FROZEN_TOL_STEP, then every FROZEN_TOL_STEP,
+ * never past FROZEN_TOL_MAX or the other side's edge) until one is outside — a probe that is not a
+ * clean ball-first hit counts as outside — then bisected FROZEN_TOL_BISECT times. The probes step
+ * finely next to the aim and the throw changes over tens of degrees, so a gap in the inside run is
+ * not stepped over. ≤ 2 × (11 + FROZEN_TOL_BISECT) probes, each stopping at the first contact.
+ */
+function frozenStrokeTolerance(aim: number, halfRad: number, errAt: (a: number) => number): number {
+  const inside = (a: number): boolean => {
+    const e = errAt(a);
+    return !Number.isNaN(e) && Math.abs(e) <= halfRad;
+  };
+  let tol = FROZEN_TOL_MAX;
+  for (const s of [1, -1]) {
+    let lo = 0;
+    let hi = NaN;
+    for (let d = Math.min(FROZEN_TOL_FIRST, tol); ; d = Math.min(tol, d < FROZEN_TOL_STEP ? 2 * d : d + FROZEN_TOL_STEP)) {
+      if (!inside(aim + s * d)) {
+        hi = d;
+        break;
+      }
+      lo = d;
+      if (d >= tol) break;
+    }
+    if (Number.isNaN(hi)) continue; // inside out to the current tolerance: this side doesn't lower it
+    for (let i = 0; i < FROZEN_TOL_BISECT; i++) {
+      const m = (lo + hi) / 2;
+      if (inside(aim + s * m)) lo = m;
+      else hi = m;
+    }
+    tol = Math.min(tol, lo);
+  }
+  return tol;
 }
 
 /** A stroke checked at one power (planShot's frozenCheck). */

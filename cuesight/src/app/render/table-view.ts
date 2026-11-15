@@ -715,7 +715,8 @@ export class TableView {
         const sx = this.toCanvas(stick.from);
         this.label('Cue stick', { x: e.x + 6, y: e.y + (e.y >= sx.y ? 10 : -10) }, 'rgba(244,246,251,0.85)', e.x < sx.x ? 'right' : 'left');
       }
-      if (plan.cueRest) {
+      // Not next to "Not makeable": a shot not to play has no cue-ball finish to name.
+      if (plan.cueRest && plan.makeable) {
         const q = this.toCanvas(plan.cueRest);
         this.label('Cue stops', { x: q.x + gr + 8, y: q.y });
       }

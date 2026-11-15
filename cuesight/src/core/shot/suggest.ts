@@ -27,9 +27,16 @@ export function suggestShots(layout: TableLayout, params: PhysicsParams, max = 3
       const g = shotGeometry(layout.table, layout.balls, cue, target, pocket, params);
       if (!g.makeable || g.blockersCue.length || g.blockersObject.length) continue;
       const tol = deg(g.toleranceRad);
-      // Contact margin on the object ball (mm), the figure the shot card shows (ShotPlan.toleranceMm is
-      // this same geometry value, frozen and rail-frozen shots included).
-      cands.push({ targetId: target.id, pocketId: pocket.id, toleranceDeg: tol, toleranceMm: g.toleranceMm, difficulty: difficultyOf(tol), score: Math.log10(Math.max(tol, 1e-4)) });
+      // Ranked by the geometry's margin; the figures shown are the verified plan's (below).
+      cands.push({
+        targetId: target.id,
+        pocketId: pocket.id,
+        toleranceDeg: tol,
+        toleranceMm: g.toleranceMm,
+        difficulty: difficultyOf(tol),
+        score: Math.log10(Math.max(tol, 1e-4)),
+        ...(g.frozen ? { frozen: true } : {}),
+      });
     }
   }
   cands.sort((a, b) => b.score - a.score);
@@ -41,7 +48,15 @@ export function suggestShots(layout: TableLayout, params: PhysicsParams, max = 3
       (w) => w.code === 'kiss' || w.code === 'ob-missed' || w.code === 'throw-uncompensable' || w.code === 'blocked-cue' || w.code === 'blocked-object',
     );
     const q = plan.cueRest ? nextShotQuality(postShotLayout(layout, plan), plan.cueRest, [c.targetId], undefined, params) : 0;
-    verified.push({ ...c, score: c.score + POSITION_WEIGHT * q - (bad ? 2 : 0) - (plan.scratch ? 0.5 : 0) });
+    // The margin and difficulty the card shows when the suggestion is opened (the plan's: the stroke
+    // angle's for a frozen cue ball, none for a stroke that misses as played), in the card's unit.
+    verified.push({
+      ...c,
+      toleranceDeg: plan.toleranceDeg,
+      toleranceMm: plan.toleranceMm,
+      difficulty: plan.difficulty,
+      score: c.score + POSITION_WEIGHT * q - (bad ? 2 : 0) - (plan.scratch ? 0.5 : 0),
+    });
   }
   return verified.sort((a, b) => b.score - a.score).slice(0, max);
 }

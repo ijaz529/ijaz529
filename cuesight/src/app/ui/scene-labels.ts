@@ -15,10 +15,10 @@
 import { advisePower, describeSpin, powerFigure, speedWord } from '../../core/shot/power';
 import type { PocketId, ShotPlan, Stroke } from '../../core/types';
 import { isFrozenPlan } from '../render/plan-draw';
-import type { FrameInfo } from '../render3d';
+import { BALL_AVOID_WEIGHT, type FrameInfo } from '../render3d';
 import { strikeFace } from '../snap/guide';
 import { iconMarkup } from './icons';
-import { placeLabel, type LabelSide } from './label-place';
+import { placeLabel, type Box, type LabelSide, type Pt } from './label-place';
 import { spinBallSvg } from './spin-ball';
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -116,10 +116,18 @@ export function strikeFaceSvg(side: number, vert: number): string {
 }
 
 export interface ShotLabel {
-  /** Called after every 3D frame; `content` null hides the label. */
-  update(info: FrameInfo | null, content: LabelContent | null, show: boolean): void;
+  /**
+   * Called after every 3D frame; `content` null hides the label. `blocked`: screen rects of floating
+   * controls over the table (Play, slow motion) the label must not slide under.
+   */
+  update(info: FrameInfo | null, content: LabelContent | null, show: boolean, blocked?: readonly Box[]): void;
   hide(): void;
   readonly el: HTMLElement;
+}
+
+/** A floating control's rect as one avoid point: its centre, half its diagonal, a ball's weight. */
+export function blockedPoint(b: Box): Pt {
+  return { x: (b.left + b.right) / 2, y: (b.top + b.bottom) / 2, w: BALL_AVOID_WEIGHT, r: Math.hypot(b.right - b.left, b.bottom - b.top) / 2 };
 }
 
 /** Below this on-screen radius (px) the strike disc over the ball is not drawn (the label keeps its mini ball). */
@@ -156,7 +164,7 @@ export function createShotLabel(host: HTMLElement): ShotLabel {
   return {
     el,
     hide,
-    update(info, content, show) {
+    update(info, content, show, blocked = []) {
       if (!show || !info || !content || !info.cue || info.playing) return hide();
       const c = info.cue;
       const player = info.preset === 'player';
@@ -206,7 +214,11 @@ export function createShotLabel(host: HTMLElement): ShotLabel {
       // Hysteresis only while things move: at rest the label goes to the best side for this view, so
       // the same view always shows it in the same place.
       if (info.moving && lastSide && prefer.includes(lastSide)) prefer.splice(prefer.indexOf(lastSide), 1), prefer.unshift(lastSide);
-      const pl = placeLabel({ x: c.x, y: c.y, r: Math.max(6, c.r) }, size, info.avoid, free, { gap: 16, prefer });
+      // Slides a few px where that keeps a ball's disc (or a line) clear.
+      // A floating control counts like a ball (its centre and half its diagonal): the label must not
+      // end up under Play or the slow-motion toggle while keeping clear of the balls.
+      const avoid = blocked.length ? [...info.avoid, ...blocked.map(blockedPoint)] : info.avoid;
+      const pl = placeLabel({ x: c.x, y: c.y, r: Math.max(6, c.r) }, size, avoid, free, { gap: 16, prefer, slide: true });
       lastSide = pl.side;
       el.style.transform = `translate(${Math.round(pl.x - hb.left)}px, ${Math.round(pl.y - hb.top)}px)`;
       // Leader: from the label edge to the cue ball's rim.

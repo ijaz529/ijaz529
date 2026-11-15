@@ -55,9 +55,10 @@ export interface FrameInfo {
   cue: { x: number; y: number; r: number } | null;
   /**
    * Screen points along the plan's lines (aim, object-ball path, cue-ball path), balls and the cue
-   * stick to keep clear; `w` weights a point (the stick counts triple: a label must never hide it).
+   * stick to keep clear; `w` weights a point (the stick counts triple: a label must never hide it),
+   * `r` is a ball's on-screen radius (its whole disc is kept clear).
    */
-  avoid: { x: number; y: number; w?: number }[];
+  avoid: { x: number; y: number; w?: number; r?: number }[];
   /** The free part of the canvas (not under floating controls), client px. */
   free: { left: number; top: number; right: number; bottom: number };
   preset: CameraPreset | 'custom';
@@ -115,6 +116,12 @@ export interface Table3DOptions {
 const TRANSITION_MS = 720;
 const ORBIT_RAD_PER_PX = 0.0065;
 const STRIKE_PRE_S = 0.5;
+/**
+ * Weight of a ball among the 3D label's avoid points (FrameInfo.avoid; a cue-stick point weighs 3, a
+ * line point 1): a ball under the label costs as much as ten line points, or as sitting on the cue
+ * ball itself (label-place.ts), so the label hides a short stretch of line before it hides a ball.
+ */
+export const BALL_AVOID_WEIGHT = 10;
 /** The end position is held this long for watching (coaching); a tap, Skip or Escape ends it at once. */
 const HOLD_S = 3.5;
 /** Idle practice strokes in Player view: this many, this long each, then the cue rests at address. */
@@ -583,7 +590,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       const e = scr(p.x + cam.right[0] * geo.R, p.y + cam.right[1] * geo.R, geo.R + cam.right[2] * geo.R);
       if (c && e) cue = { x: c.x, y: c.y, r: Math.hypot(e.x - c.x, e.y - c.y) };
     }
-    const avoid: { x: number; y: number; w?: number }[] = [];
+    const avoid: FrameInfo['avoid'] = [];
     const push = (x: number, y: number, z = 0) => {
       const q = scr(x, y, z);
       if (q) avoid.push(q);
@@ -601,11 +608,15 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
         if (pts.length) push(pts[pts.length - 1]!.x, pts[pts.length - 1]!.y);
       }
     }
-    // Balls weigh as much as the stick: a label must not hide a ball.
+    // A label must not hide a ball — any of its disc (its on-screen radius), not only its centre. A
+    // ball weighs BALL_AVOID_WEIGHT: more than a short stretch of line or of the stick, and more than
+    // sliding the label back into the free space (at 375–393 px every side covered something in Top
+    // and Orbit, and the cheapest hid the 2 ball).
     for (const b of d.balls)
       if (b !== cueB) {
         const q = scr(b.pos.x, b.pos.y, geo.R);
-        if (q) avoid.push({ x: q.x, y: q.y, w: 3 });
+        const e = scr(b.pos.x + cam.right[0] * geo.R, b.pos.y + cam.right[1] * geo.R, geo.R + cam.right[2] * geo.R);
+        if (q) avoid.push({ x: q.x, y: q.y, w: BALL_AVOID_WEIGHT, ...(e ? { r: Math.hypot(e.x - q.x, e.y - q.y) } : {}) });
       }
     for (const h of geo.holes) push(h.x, h.y, 0);
     // The cue stick (tip at address → 1 m up the butt, including the practice strokes' reach), weighted

@@ -243,8 +243,21 @@ export interface ShotPlan {
   obPocketed: boolean;
   scratch: boolean;
   windowHalfDeg: number;
+  /**
+   * Margin of error of the stroke on show, as cue-ball direction (deg): the aim tolerance that keeps
+   * the object ball in the pocket window; for a frozen cue ball the stroke-angle tolerance its search
+   * has at this speed and tip (how far the stroke can turn either way, the nearer edge, at most 16°).
+   * 0 when the stroke misses as played ('ob-missed', 'throw-uncompensable'), when no power works
+   * (noWorkingPower, or out of reach even at full power) and when the geometry is not makeable.
+   */
   toleranceDeg: number;
+  /**
+   * The same margin as contact on the object ball (mm, lateral): window half-width × 2R × cos(cut);
+   * frozen, how far inside the window the object ball leaves, × 2R (there is no contact point to aim
+   * at: the app shows a frozen plan's margin as the stroke angle). 0 whenever toleranceDeg is.
+   */
   toleranceMm: number;
+  /** difficultyOf(toleranceDeg) (coach.ts): a plan with no margin is 'very hard', never easy or medium. */
   difficulty: Difficulty;
   warnings: Warning[];
   tip: string;
@@ -261,11 +274,17 @@ export interface ShotPlan {
 export interface ShotSuggestion {
   targetId: string;
   pocketId: PocketId;
+  /** The plan's aim tolerance (ShotPlan.toleranceDeg, of the default stroke the suggestion was verified with). */
   toleranceDeg: number;
-  /** Margin of error as contact on the object ball (mm), the unit the shot card uses. */
+  /** Margin of error as contact on the object ball (mm), the unit the shot card uses (ShotPlan.toleranceMm). */
   toleranceMm: number;
   difficulty: Difficulty;
   score: number;
+  /**
+   * The cue ball touches the object ball: no contact point to aim at, so the margin is the stroke
+   * angle's (toleranceDeg), the unit the card shows for it. Absent otherwise.
+   */
+  frozen?: true;
 }
 
 /**

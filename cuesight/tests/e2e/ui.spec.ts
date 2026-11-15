@@ -624,6 +624,78 @@ for (const viewport of [
       expect(t).toMatchObject({ k: 'Cut', t: '⅜+ ball', clipped: 0 });
     });
 
+    // Final walkthrough (fix2c): the one-line spin tile read "Follow, right en…" at 375 and 393 px.
+    test('the spin tile names a stroke with side in full at the peek: nothing cut off, the hero no taller', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice&renderer=2d');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      const stroke = (side: number) =>
+        page.evaluate((side) => {
+          const h = (window as unknown as { __cuesight: PlanHook & { state: { myStroke: unknown; strokeMode: string } } }).__cuesight;
+          h.selectBall('b1');
+          h.state.myStroke = { power: 3, side, vert: 0.3 };
+          h.state.strokeMode = 'mine';
+          h.selectPocket('TR');
+        }, side);
+      const tile = () =>
+        page.evaluate(() => {
+          const card = document.querySelector('#shot-card')!;
+          const s = card.querySelector<HTMLElement>('.hero-stat.spin .s')!;
+          const r = s.getBoundingClientRect();
+          return {
+            text: s.textContent!.replace(/\s+/g, ' ').trim(),
+            clipped: [...s.querySelectorAll<HTMLElement>('span')].map((e) => e.scrollWidth - e.clientWidth),
+            inView: r.width > 4 && r.bottom <= innerHeight && r.top >= 0,
+            hero: card.querySelector('.hero')!.getBoundingClientRect().height,
+            warn: !!card.querySelector('.head-warn'),
+            sheet: document.querySelector<HTMLElement>('.panel')!.dataset.sheet,
+          };
+        });
+      await stroke(0);
+      await expect(page.locator('#shot-card .hero-stat.spin .s')).not.toContainText('english');
+      await sheetSettled(page);
+      const plain = await tile();
+      await stroke(0.25);
+      await expect(page.locator('#shot-card .hero-stat.spin .s')).toContainText('right english');
+      await sheetSettled(page);
+      const side = await tile();
+      expect(side.sheet).toBe('peek');
+      expect(side.warn).toBe(false);
+      expect(side.text).toMatch(/^[A-Z][a-z-]+( shot)?, right english$/);
+      expect(side.clipped.every((c) => c <= 0), JSON.stringify(side)).toBe(true);
+      expect(side.inView).toBe(true);
+      expect(side.hero).toBeLessThanOrEqual(plain.hero + 0.5);
+    });
+
+    // Final walkthrough (fix2c): a frozen ball 4° off at power 6 showed a green "easy · ±0.5 mm" next
+    // to "no stroke angle throws the object ball … the best still misses".
+    test('frozen: the difficulty chip gives the stroke-angle margin, and none (±0°) when no angle throws it in', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice&renderer=2d');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      await practiceShot(page, 'frozen-side');
+      await expect(page.getByTestId('difficulty')).toHaveText(/^(easy|medium|hard|very hard) · ±\d+(\.\d)?°$/);
+      await page.evaluate(() => {
+        const h = (window as unknown as { __cuesight: PlanHook & { state: { myStroke: unknown; strokeMode: string; table: { ballRadius: number; pockets: { id: string; mouthCenter: V2 }[] } } } }).__cuesight;
+        const R = h.state.table.ballRadius;
+        const ob = { x: 0.55, y: 0.18 };
+        const m = h.state.table.pockets.find((p) => p.id === 'BL')!.mouthCenter;
+        const a = Math.atan2(m.y - ob.y, m.x - ob.x) - (4 * Math.PI) / 180;
+        h.state.practice.balls = [
+          { id: 'cue', kind: 'cue', pos: { x: ob.x - Math.cos(a) * (2 * R + 0.0003), y: ob.y - Math.sin(a) * (2 * R + 0.0003) }, label: 'cue' },
+          { id: 'b1', kind: 'object', pos: ob, label: '1', color: '#e8b90f' },
+        ];
+        h.selectBall('b1');
+        h.state.myStroke = { power: 6, side: 0, vert: 0 };
+        h.state.strokeMode = 'mine';
+        h.selectPocket('BL');
+      });
+      await expect(page.locator('#shot-card')).toContainText('no stroke angle throws');
+      await expect(page.getByTestId('difficulty')).toHaveText('very hard · ±0°');
+      await expect(page.locator('#shot-card')).toContainText('the closest it gets');
+      await expect(page.locator('#shot-card')).not.toContainText('to throw it toward the pocket');
+    });
+
     // Verify round 1: at the peek with a headline warning the tiles' captions step aside, and a frozen
     // tile showed a bare "0°" (read as a 0° cut). "Frozen" and the stroke side must be ON SCREEN there:
     // inside the viewport, inside the cut tile and the visible sheet (the top element at their centre),

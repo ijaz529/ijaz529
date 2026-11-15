@@ -240,7 +240,7 @@ test('recommendation notes: a fragile, cut-short reply with no risk data shows t
   await expect(notes).toHaveCount(1, { timeout: 10_000 });
   await expect(notes).toBeVisible();
   const text = (await notes.allTextContents()).map((t) => t.trim()).join(' | ');
-  expect(text).toContain('Speed-sensitive — small changes in pace may change the result.');
+  expect(text).toContain('This stroke may need precise pace: a little harder or softer could miss or scratch.');
   expect(text).toContain('Search cut short — the best stroke found in time.');
   expect(text).toContain('Scratch risk from small errors not checked.');
 });

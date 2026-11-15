@@ -229,6 +229,38 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
   });
 
+  /**
+   * Final walkthrough (fix2c): "Add ball" toasted "Ball added in the middle of the table." but put the
+   * ball anywhere at random, labelled with the free id number (a second "8" next to the detected black).
+   */
+  test('Add ball: on the free spot nearest the middle, as the toast says, with no borrowed number', async ({ page }) => {
+    type B = { id: string; kind: string; pos: V2; label?: string };
+    const layout = async () => (await H(page)).layout as B[];
+    await tablePhoto(page);
+    const R = await page.evaluate(() => (window as unknown as { __cuesight: { state: { table: { ballRadius: number } } } }).__cuesight.state.table.ballRadius);
+    const before = await layout();
+    // On this photo the middle of the table is clear (the 15 sits 9 cm from it).
+    expect(Math.min(...before.map((b) => Math.hypot(b.pos.x, b.pos.y)))).toBeGreaterThan(3 * R);
+    const add = page.getByRole('button', { name: 'Add a ball' });
+    await add.click();
+    await expect(page.locator('#toast')).toHaveText('Ball added in the middle of the table. Drag it to where it is.');
+    const one = (await layout()).filter((b) => !before.some((x) => x.id === b.id));
+    expect(one).toHaveLength(1);
+    expect(one[0]!.pos).toEqual({ x: 0, y: 0 });
+    expect(one[0]!).toMatchObject({ kind: 'object', label: 'ball' });
+    // A second one: the middle is taken, so the free spot nearest it — clear of every ball, on the cloth.
+    await add.click();
+    await expect(page.locator('#toast')).toHaveText('Ball added near the middle of the table. Drag it to where it is.');
+    const all = await layout();
+    const two = all.filter((b) => !before.some((x) => x.id === b.id) && b.id !== one[0]!.id);
+    expect(two).toHaveLength(1);
+    const p = two[0]!.pos;
+    expect(Math.hypot(p.x, p.y)).toBeLessThan(3.5 * R);
+    for (const b of all) if (b !== two[0]) expect(Math.hypot(b.pos.x - p.x, b.pos.y - p.y), b.id).toBeGreaterThanOrEqual(3 * R - 1e-9);
+    // The neutral label: no number or colour another ball carries (no tag, a grey chip).
+    expect(two[0]!).toMatchObject({ kind: 'object', label: 'ball' });
+  });
+
   test('Start over discards both photos, including the thumbnail and the drawn photo (FR-122)', async ({ page }) => {
     await tablePhoto(page);
     await pick(page, gt.balls.find((b) => b.id === '1')!.pos, 'TR');

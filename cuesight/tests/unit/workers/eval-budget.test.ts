@@ -6,7 +6,7 @@
  *  - figures measured by an earlier worker are adopted (the app restarts the worker to abandon a
  *    superseded recommendation), so the budget, and with it the stroke, stays the same.
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../src/core/shot/planner', async (importOriginal) => {
   const m = await importOriginal<typeof import('../../../src/core/shot/planner')>();
@@ -25,7 +25,19 @@ import { planShot } from '../../../src/core/shot/planner';
 import { FULL_EVALUATIONS, recommendStroke } from '../../../src/core/shot/position';
 import { makeTable } from '../../../src/core/table';
 import type { Ball, TableLayout } from '../../../src/core/types';
-import { createEvaluationBudget, MIN_EVALUATIONS, RECOMMEND_BUDGET_MS, SEARCH_PLAN_OPTIONS } from '../../../src/workers/eval-budget';
+import {
+  createEvaluationBudget,
+  MIN_EVALUATIONS,
+  RECOMMEND_BUDGET_MS,
+  REFINE_MIN_EVALUATIONS,
+  REFINE_RANGE,
+  SEARCH_PLAN_OPTIONS,
+  TIMED_PLANS,
+  WARMUP_MS,
+  WARMUP_PLANS,
+} from '../../../src/workers/eval-budget';
+import { createPlannerHandler } from '../../../src/workers/planner.worker';
+import { PROTOCOL_VERSION, type PlannerOut } from '../../../src/workers/protocol';
 
 const P = DEFAULT_PHYSICS;
 const T = makeTable('pool9');
@@ -69,7 +81,8 @@ describe('evaluation budget: the calibration times what the search evaluates', (
     expect(searchOpts).toEqual(new Set([JSON.stringify(SEARCH_PLAN_OPTIONS)]));
     spy.mockClear();
     createEvaluationBudget(clock(1)).budget(lay, req, P);
-    expect(spy).toHaveBeenCalledTimes(4); // one warm-up, best of three
+    // The JIT warm-up (WARMUP_PLANS at 1 ms each here, under WARMUP_MS), then the best of TIMED_PLANS.
+    expect(spy).toHaveBeenCalledTimes(WARMUP_PLANS + TIMED_PLANS);
     for (const c of spy.mock.calls) expect(c[3]).toEqual(SEARCH_PLAN_OPTIONS);
   });
 
@@ -87,10 +100,10 @@ describe('evaluation budget: the calibration times what the search evaluates', (
     planShot(lay, req, P, SEARCH_PLAN_OPTIONS);
     const searched = sims.mock.calls.length;
     expect(withAdvice).toBeGreaterThan(3 * searched);
-    // The calibration's four timed plans cost exactly four search evaluations.
+    // Each of the calibration's plans (warm-up and timed) costs exactly one search evaluation.
     sims.mockClear();
     createEvaluationBudget(clock(1)).budget(lay, req, P);
-    expect(sims.mock.calls.length).toBe(4 * searched);
+    expect(sims.mock.calls.length).toBe((WARMUP_PLANS + TIMED_PLANS) * searched);
     // And a caller that only says record: false (a search) no longer pays for the advice either: the
     // core's default is advice = record !== false.
     sims.mockClear();
@@ -144,5 +157,114 @@ describe('evaluation budget: figures survive a worker restart', () => {
     const b = recommendStroke(lay, req, P, { maxEvaluations: next.budget(lay, req, P) });
     expect(b.stroke).toEqual(a.stroke);
     expect(b.evaluated).toBe(a.evaluated);
+  });
+});
+
+/**
+ * Final-walkthrough polish (fix2c): the figure was measured with a cold JIT on the first request (in
+ * Node 1.6–4.7 ms against 0.52 ms warm; in a fresh browser worker under load a budget of 60–120 and a
+ * fragile pick on the first shot) and kept for the page's life. Now the calibration warms the JIT
+ * first, and the first real search refines the figure once from its own ms per evaluation (bounded by
+ * REFINE_RANGE either way; final afterwards, and final in a worker seeded with it).
+ */
+describe('evaluation budget: a warm calibration, refined once by the first real search', () => {
+  const lay = drill('cut30');
+  const req = { targetId: 'b1', pocketId: 'TR' as const };
+  const n = String(lay.balls.length);
+  const realPlan = spy.getMockImplementation()!;
+  afterEach(() => spy.mockImplementation(realPlan));
+
+  /** A clock the planShot calls advance: `cost(k)` ms for the k-th plan (0-based); searches advance it by hand. */
+  function jitClock(cost: (k: number) => number) {
+    let t = 0;
+    let k = 0;
+    spy.mockImplementation((...a: Parameters<typeof planShot>) => {
+      t += cost(k++);
+      return realPlan(...a);
+    });
+    return { now: () => t, advance: (ms: number) => (t += ms), plans: () => k };
+  }
+
+  it('warms the JIT before timing: cold plans (20 ms) do not set the figure when warm ones (1 ms) follow', () => {
+    // The old calibration (one untimed plan, then the best of three) timed three 20 ms plans here: 60.
+    const c = jitClock((k) => (k < 4 ? 20 : 1));
+    const b = createEvaluationBudget(c.now);
+    expect(b.budget(lay, req, P)).toBe(FULL_EVALUATIONS);
+    expect(b.figures()).toEqual({ [n]: 1 });
+    expect(c.plans()).toBe(WARMUP_PLANS + TIMED_PLANS);
+  });
+
+  it('the warm-up is bounded: at most WARMUP_PLANS plans, and it stops once WARMUP_MS have passed', () => {
+    const slow = jitClock(() => 50);
+    createEvaluationBudget(slow.now).budget(lay, req, P);
+    expect(slow.plans()).toBe(Math.ceil(WARMUP_MS / 50) + TIMED_PLANS);
+    const fast = jitClock(() => 0.1);
+    createEvaluationBudget(fast.now).budget(lay, req, P);
+    expect(fast.plans()).toBe(WARMUP_PLANS + TIMED_PLANS);
+  });
+
+  it('the first real search refines the figure from its own ms per evaluation, once, within REFINE_RANGE', () => {
+    const c = jitClock(() => 10);
+    const b = createEvaluationBudget(c.now);
+    expect(b.budget(lay, req, P)).toBe(Math.floor(RECOMMEND_BUDGET_MS / 10));
+    // A search that ran 120 evaluations in 480 ms: 4 ms each. measure() returns the search's result.
+    const r = b.measure(lay, () => (c.advance(480), { evaluated: 120 }));
+    expect(r).toEqual({ evaluated: 120 });
+    expect(b.figures()).toEqual({ [n]: 4 });
+    expect(b.budget(lay, req, P)).toBe(Math.floor(RECOMMEND_BUDGET_MS / 4));
+    // Final: a later search (7 ms each) leaves the figure, and with it the budget, as it is.
+    b.measure(lay, () => (c.advance(700), { evaluated: 100 }));
+    expect(b.figures()).toEqual({ [n]: 4 });
+    expect(b.budget(lay, req, P)).toBe(Math.floor(RECOMMEND_BUDGET_MS / 4));
+    // Bounded: a figure moves by at most REFINE_RANGE either way.
+    const lo = createEvaluationBudget(jitClock(() => 10).now);
+    lo.budget(lay, req, P);
+    lo.measure(lay, () => ({ evaluated: 200 })); // no time at all: clamped, never 0
+    expect(lo.figures()).toEqual({ [n]: 10 / REFINE_RANGE });
+    const hiClock = jitClock(() => 10);
+    const hi = createEvaluationBudget(hiClock.now);
+    hi.budget(lay, req, P);
+    hi.measure(lay, () => (hiClock.advance(200 * 100), { evaluated: 200 }));
+    expect(hi.figures()).toEqual({ [n]: 10 * REFINE_RANGE });
+  });
+
+  it('a search with too few evaluations (none: not makeable) does not refine; the next real one does', () => {
+    const c = jitClock(() => 10);
+    const b = createEvaluationBudget(c.now);
+    b.budget(lay, req, P);
+    b.measure(lay, () => (c.advance(50), { evaluated: 0 }));
+    b.measure(lay, () => (c.advance(50), { evaluated: REFINE_MIN_EVALUATIONS - 1 }));
+    expect(b.figures()).toEqual({ [n]: 10 });
+    b.measure(lay, () => (c.advance(400), { evaluated: 100 }));
+    expect(b.figures()).toEqual({ [n]: 4 });
+    // A ball count without a figure is not given one by a search.
+    b.measure({ ...lay, balls: lay.balls.slice(0, 2) }, () => (c.advance(200), { evaluated: 100 }));
+    expect(Object.keys(b.figures())).toEqual([n]);
+  });
+
+  it('a restarted worker seeded with the figures keeps them (seeded figures are final): the same budget', () => {
+    const c = jitClock(() => 10);
+    const first = createEvaluationBudget(c.now);
+    first.budget(lay, req, P);
+    first.measure(lay, () => (c.advance(300), { evaluated: 100 }));
+    expect(first.figures()).toEqual({ [n]: 3 });
+    const next = createEvaluationBudget(jitClock(() => 1).now);
+    next.seed(first.figures());
+    const budget = next.budget(lay, req, P);
+    next.measure(lay, () => ({ evaluated: 300 }));
+    expect(next.figures()).toEqual({ [n]: 3 });
+    expect(next.budget(lay, req, P)).toBe(budget);
+  });
+
+  it("the worker's recommendation reply carries the refined figure (the perEvalMs plumbing)", () => {
+    // clock(8): every reading is 8 ms on, so the calibration's figure is 8 and the search (one reading
+    // before it, one after) took 8 ms for all its evaluations: refined to the bound, 8 / REFINE_RANGE.
+    const handle = createPlannerHandler(createEvaluationBudget(clock(8)));
+    const out: PlannerOut[] = [];
+    handle({ v: PROTOCOL_VERSION, type: 'recommend', id: 1, layout: lay, request: req, params: P }, (m) => out.push(m));
+    const reply = out[0] as Extract<PlannerOut, { type: 'recommendation' }>;
+    expect(reply.type).toBe('recommendation');
+    expect(reply.evaluated).toBeGreaterThanOrEqual(REFINE_MIN_EVALUATIONS);
+    expect(reply.perEvalMs).toEqual({ [n]: 8 / REFINE_RANGE });
   });
 });

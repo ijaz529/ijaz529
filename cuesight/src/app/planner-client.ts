@@ -233,6 +233,13 @@ export function createPlannerClient(o: PlannerClientOptions) {
 export type PlannerClient = ReturnType<typeof createPlannerClient>;
 
 /** What the app shows for a recommendation reply: the stroke to use (null = the basic stroke) and a toast. */
+/**
+ * A speed-sensitive recommendation (core `fragile`: no candidate was verified against ±6/±12 % speed
+ * errors — one scratched OR missed at some speed, or the budget ran out first), in one player-language
+ * sentence: "may", and both ways it can go wrong. The toast and the shot card's note say exactly this.
+ */
+export const FRAGILE_PACE = 'This stroke may need precise pace: a little harder or softer could miss or scratch.';
+
 export function recommendationOutcome(m: RecommendationReply, hasLanding: boolean): { stroke: Stroke | null; toast: string | null } {
   const found = m.evaluated > 0 && Number.isFinite(m.score);
   // Nothing evaluated: the shot itself is not makeable, which the shot card already says. Strokes
@@ -249,7 +256,7 @@ export function recommendationOutcome(m: RecommendationReply, hasLanding: boolea
   // or missed at some speed, or the budget ran out first. So: "may", and both ways it can go wrong.
   const fragile = m.fragile === true;
   if (hasLanding && !m.reachable) return { stroke: m.stroke, toast: 'That spot can’t be reached safely — showing the best stroke found.' };
-  if (fragile) return { stroke: m.stroke, toast: 'This stroke may need precise pace: a little harder or softer could miss or scratch.' };
+  if (fragile) return { stroke: m.stroke, toast: FRAGILE_PACE };
   return { stroke: m.stroke, toast: null };
 }
 

@@ -9,6 +9,8 @@ export interface Pt {
   y: number;
   /** Weight of an avoid point (default 1): e.g. 3 for the cue stick, which a label must not hide. */
   w?: number;
+  /** Radius (px) of what the point stands for, e.g. a ball's disc: covered when the disc reaches the label (+ pad). */
+  r?: number;
 }
 
 export interface Box {
@@ -58,15 +60,28 @@ export function candidate(side: LabelSide, c: Pt, r: number, w: number, h: numbe
 }
 
 /**
- * Best placement: fewest covered avoid points (within `pad` px of the label), then least overflow
- * of the free box, then the order of `prefer`. The result is clamped into the free box.
+ * Slides tried around each side's spot with `slide` (px, along one axis at a time): a label that
+ * would cover the edge of a ball (or a few line points) usually clears it a few pixels along. Each
+ * pixel slid costs SLIDE_COST, so a slide wins only when it covers less; among equals the side's own
+ * spot wins. (The 3D table's label uses it; the Snap photo's labels keep to their spots.)
+ */
+const SLIDES = [-8, 8, -16, 16, -24, 24];
+const SLIDE_COST = 0.25;
+const NO_SHIFT: readonly [number, number][] = [[0, 0]];
+const SHIFTS: readonly [number, number][] = [[0, 0], ...SLIDES.flatMap((d): [number, number][] => [[d, 0], [0, d]])];
+
+/**
+ * Best placement: fewest covered avoid points (within `pad` px of the label, plus the point's own
+ * radius: a ball counts as covered when its disc reaches the label, not only its centre), then least
+ * overflow of the free box, then the order of `prefer`; with `slide`, each side's spot may slide a
+ * little (SLIDES) to clear what it would cover. The result is clamped into the free box.
  */
 export function placeLabel(
   anchor: Pt & { r: number },
   size: { w: number; h: number },
   avoid: readonly Pt[],
   free: Box,
-  opts: { gap?: number; pad?: number; prefer?: readonly LabelSide[] } = {},
+  opts: { gap?: number; pad?: number; prefer?: readonly LabelSide[]; slide?: boolean } = {},
 ): Placement {
   const gap = opts.gap ?? 14;
   const pad = opts.pad ?? 6;
@@ -74,21 +89,27 @@ export function placeLabel(
   let best: Placement | null = null;
   let bestScore = Infinity;
   order.forEach((side, rank) => {
-    const p = candidate(side, anchor, anchor.r, size.w, size.h, gap);
-    const over =
-      Math.max(0, free.left - p.x) + Math.max(0, p.x + size.w - free.right) + Math.max(0, free.top - p.y) + Math.max(0, p.y + size.h - free.bottom);
-    // Clamp, then count what the clamped label would cover.
-    const x = Math.max(free.left, Math.min(free.right - size.w, p.x));
-    const y = Math.max(free.top, Math.min(free.bottom - size.h, p.y));
-    let covered = 0;
-    for (const q of avoid) if (q.x >= x - pad && q.x <= x + size.w + pad && q.y >= y - pad && q.y <= y + size.h + pad) covered += q.w ?? 1;
-    // The clamped label must not sit on the anchor itself.
-    const onAnchor = anchor.x + anchor.r > x && anchor.x - anchor.r < x + size.w && anchor.y + anchor.r > y && anchor.y - anchor.r < y + size.h;
-    const score = covered * 40 + over * 2 + rank * 3 + (onAnchor ? 400 : 0);
-    if (score < bestScore) {
-      bestScore = score;
-      const lead = { x: Math.max(x, Math.min(x + size.w, anchor.x)), y: Math.max(y, Math.min(y + size.h, anchor.y)) };
-      best = { x, y, side, lead, covered };
+    const p0 = candidate(side, anchor, anchor.r, size.w, size.h, gap);
+    for (const [sx, sy] of opts.slide ? SHIFTS : NO_SHIFT) {
+      const p = { x: p0.x + sx, y: p0.y + sy };
+      const over =
+        Math.max(0, free.left - p.x) + Math.max(0, p.x + size.w - free.right) + Math.max(0, free.top - p.y) + Math.max(0, p.y + size.h - free.bottom);
+      // Clamp, then count what the clamped label would cover.
+      const x = Math.max(free.left, Math.min(free.right - size.w, p.x));
+      const y = Math.max(free.top, Math.min(free.bottom - size.h, p.y));
+      let covered = 0;
+      for (const q of avoid) {
+        const m = pad + (q.r ?? 0);
+        if (q.x >= x - m && q.x <= x + size.w + m && q.y >= y - m && q.y <= y + size.h + m) covered += q.w ?? 1;
+      }
+      // The clamped label must not sit on the anchor itself.
+      const onAnchor = anchor.x + anchor.r > x && anchor.x - anchor.r < x + size.w && anchor.y + anchor.r > y && anchor.y - anchor.r < y + size.h;
+      const score = covered * 40 + over * 2 + rank * 3 + (onAnchor ? 400 : 0) + (Math.abs(sx) + Math.abs(sy)) * SLIDE_COST;
+      if (score < bestScore) {
+        bestScore = score;
+        const lead = { x: Math.max(x, Math.min(x + size.w, anchor.x)), y: Math.max(y, Math.min(y + size.h, anchor.y)) };
+        best = { x, y, side, lead, covered };
+      }
     }
   });
   return best!;
