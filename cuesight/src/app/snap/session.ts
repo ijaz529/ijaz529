@@ -106,7 +106,7 @@ export const SNAP_MESSAGES = {
  * - 'retake-table': the balls moved since the table photo, so a guide from the old layout would be
  *   wrong (FR-121); two taps cannot help.
  * - 'retake-light': too dark, too grainy, or no cloth in view: a better photo is the fix; the two taps
- *   are still offered.
+ *   are offered once for a dark or grainy photo, never without cloth in view (tapsOffered).
  * - 'taps': no cue ball, too few balls or no fit: the two taps fit the photo.
  */
 export type PlayerFailAction = 'retake-table' | 'retake-light' | 'taps';
@@ -115,6 +115,27 @@ export function playerFailAction(reason: string | null | undefined): PlayerFailA
   if (/^The balls seem to have moved/.test(reason)) return 'retake-table';
   if (/too dark|too grainy|find the table cloth/.test(reason)) return 'retake-light';
   return 'taps';
+}
+
+/**
+ * Whether the two-tap fallback is offered for the failed fit in session `s` (FR-118):
+ * - never after 'moved' (FR-121: a guide from the old layout would be wrong);
+ * - never with no cloth in the photo ('noCloth': it shows no table, so there is no cue ball to tap);
+ * - for a dark or grainy photo, once: the taps fit a dim photo that still shows the balls, but when a
+ *   two-tap fit failed for the same reason they did not help, and only a better photo will.
+ */
+export function tapsOffered(s: Pick<SnapSession, 'error' | 'player'>): boolean {
+  const next = playerFailAction(s.error);
+  if (next === 'retake-table') return false;
+  if (next === 'taps') return true;
+  return !/find the table cloth/.test(s.error ?? '') && !s.player?.manual;
+}
+
+/** The top instruction for a photo to retake ('retake-light'): what the better photo needs. */
+export function retakeInstruction(reason: string | null | undefined): string {
+  if (/find the table cloth/.test(reason ?? '')) return 'Retake your photo with the table’s cloth in view, aimed along your shot.';
+  if (/too grainy/.test(reason ?? '')) return 'Retake your photo with more light on the table, holding the phone steady.';
+  return 'Retake your photo with more light on the table.';
 }
 
 export function visionFailedEvent(kind: 'still' | 'player-view', loaded: boolean): SnapEvent {
@@ -191,7 +212,7 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
     case 'start-manual':
       return s.player ? { ...s, step: 'manual-taps', taps: {} } : s;
     case 'manual-tap': {
-      if (s.step !== 'manual-taps' || playerFailAction(s.error) === 'retake-table') return s;
+      if (s.step !== 'manual-taps' || !tapsOffered(s)) return s;
       if (!s.taps.cue) return { ...s, taps: { cue: e.p } };
       return { ...s, step: 'player-processing', taps: { cue: s.taps.cue, target: e.p } };
     }

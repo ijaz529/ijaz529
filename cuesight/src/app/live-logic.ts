@@ -354,6 +354,16 @@ export function pickNextAllowed(ball: Pick<Ball, 'id' | 'kind'>, targetId: strin
   return ball.kind !== 'cue' && ball.id !== targetId;
 }
 
+/**
+ * What Suggest says instead of searching when the layout has no cue ball (Live: none found, or two
+ * whites too close to call): every shot needs one, so the search would come back empty and the list
+ * would say "No clean pot on this layout", which is not the reason. Null when there is a cue ball.
+ */
+export function suggestNeedsCue(balls: readonly Pick<Ball, 'kind' | 'label'>[]): string | null {
+  if (balls.some((b) => b.kind === 'cue')) return null;
+  return balls.filter((b) => b.label === 'white?').length >= 2 ? 'Two white balls — tap the one you play with, then Suggest again.' : 'I can’t find the cue ball — tap it, then Suggest again.';
+}
+
 // --- Start mode (spec 002 T166) ------------------------------------------------------------------
 
 /** A `?mode=` override, if valid. */

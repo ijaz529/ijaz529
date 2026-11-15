@@ -758,6 +758,16 @@ const LAYOUT_SIGMA = 0.005;
 const LAYOUT_STEP = 0.0002;
 /** Inlier cracks a cushion line needs to count as seen (Evaluation.edgeCrossed). */
 const EDGE_LINE_SUPPORT = 15;
+/**
+ * Smallest angle (degrees) between a side and an end cushion line in the photo for them to count as
+ * crossing (Evaluation.edgeCrossed). From a few cm above the cushion top, every cushion line far from the
+ * camera lies near the cushion plane's horizon: a side and an end cushion then show as one nearly straight
+ * line and pin no more than one line does. ASSUMPTION (synthetic renders): in the s101053 neighbourhood
+ * (5–9 cm up, 92–100° lens, looking up at the far corner) the two lines met at 0–5° in every photo, and
+ * crossing-line fits there passed with a camera 25–50 cm off (ghost 3–9 %); over 470 random envelope and
+ * low wide-lens photos, 353 of 354 crossing fits met at ≥ 20°.
+ */
+const EDGE_CROSS_MIN_DEG = 10;
 /** Fewest associated crack points an LM stage needs (the 7 parameters plus redundancy). */
 const MIN_REFINE_POINTS = 12;
 const SIG_BALL = 1.0; // px, silhouette crack points
@@ -1240,8 +1250,10 @@ interface Evaluation {
   edgeInliers: number;
   /**
    * Cushion lines of both directions carry ≥ EDGE_LINE_SUPPORT inlier cracks (a side and an end
-   * cushion): two non-parallel table lines pin the pose; parallel ones (the near and far end, seen at a
-   * grazing angle) leave it free to slide.
+   * cushion) and meet at ≥ EDGE_CROSS_MIN_DEG in the photo: two non-parallel table lines pin the pose;
+   * parallel ones (the near and far end, seen at a grazing angle), or a side and an end line that show as
+   * one straight line (both on the cushion plane's horizon, seen from a few cm above it), leave it free
+   * to slide.
    */
   edgeCrossed: boolean;
   /** Fraction of the cloth-boundary cracks the model explains (within 2.5 px). */
@@ -1345,48 +1357,118 @@ function evaluate(pr: Problem, r: Refined, cands: Candidate[]): Evaluation {
   }
   const explainedFrac = explainedPts / Math.max(1, pr.nPts - neutralPts);
   const quality = matched.length - 0.6 * missing - 0.4 * unexplained - 0.1 * Math.min(10, residualPx) + 4 * explainedFrac;
-  // edgeSegments order: four side-cushion segments (y = ±Y), then the two end cushions (x = ±X).
-  let side = false;
-  let end = false;
-  for (let q = 0; q < pr.segs.length; q++) {
-    if (segIn[q]! < EDGE_LINE_SUPPORT) continue;
-    if (q < 4) side = true;
-    else end = true;
+  // edgeSegments order: four side-cushion segments (y = ±Y), then the two end cushions (x = ±X). A side
+  // and an end line cross only where their images meet at EDGE_CROSS_MIN_DEG or more: the image line of a
+  // segment's plane (camera frame normal n) has the image normal (n.x, n.y).
+  const cosCross = Math.cos((EDGE_CROSS_MIN_DEG * Math.PI) / 180);
+  let crossed = false;
+  for (let q = 0; q < 4 && !crossed; q++) {
+    const a = allPlanes[q];
+    if (segIn[q]! < EDGE_LINE_SUPPORT || !a) continue;
+    const la = hyp2(a.nx, a.ny);
+    for (let q2 = 4; q2 < pr.segs.length; q2++) {
+      const b = allPlanes[q2];
+      if (segIn[q2]! < EDGE_LINE_SUPPORT || !b) continue;
+      const lb = hyp2(b.nx, b.ny);
+      if (la > 1e-9 && lb > 1e-9 && Math.abs(a.nx * b.nx + a.ny * b.ny) / (la * lb) <= cosCross) crossed = true;
+    }
   }
-  return { matched, visible, missing, residualPx, edgeInliers, edgeCrossed: side && end, explainedFrac, unexplained, missingIdx, unexplainedIdx, quality };
+  return { matched, visible, missing, residualPx, edgeInliers, edgeCrossed: crossed, explainedFrac, unexplained, missingIdx, unexplainedIdx, quality };
 }
 
 /**
  * The moved-ball signature of ball k under this pose: k is predicted on plain cloth (missing), and these
- * circles nothing explains have its colour and lie where a ball can rest — each one's ray meets the
- * plane of the ball centres on the bed, at least DISPLACED_MIN ball radii from where the layout put k,
- * and a ball there would have the circle's image size. Returns their indices (empty: no signature).
+ * circles nothing explains have its colour and lie where a ball can rest (restsElsewhere). Returns their
+ * indices (empty: no signature).
  */
 function displacedCircles(pr: Problem, fit: Fit, cands: Candidate[], ev: Evaluation, k: number): number[] {
   const out: number[] = [];
   if (!ev.missingIdx.includes(k)) return out;
-  const R = fit.R;
-  const b = pr.balls[k]!;
   for (const j of ev.unexplainedIdx) {
     const c = cands[j]!;
     if (pr.cc[k * pr.nCands + j]! >= 3 || c.r < 3) continue;
-    // Ray through the circle centre, in world coordinates (Rᵀ · camera ray).
-    const mx = (c.u - pr.cx) / fit.f;
-    const my = (c.v - pr.cy) / fit.f;
-    const dx = R[0]! * mx + R[3]! * my + R[6]!;
-    const dy = R[1]! * mx + R[4]! * my + R[7]!;
-    const dz = R[2]! * mx + R[5]! * my + R[8]!;
-    if (!(dz < -1e-6)) continue;
-    const t = (pr.Rb - fit.C.z) / dz;
-    if (!(t > 0)) continue;
-    const px = fit.C.x + t * dx;
-    const py = fit.C.y + t * dy;
-    if (Math.abs(px) > pr.halfL || Math.abs(py) > pr.halfW) continue;
-    if (hyp2(px - b.x, py - b.y) < DISPLACED_MIN * pr.Rb) continue;
-    const [X, Y, Z] = cameraToWorldC(R, fit.C, { x: px, y: py, z: pr.Rb });
-    if (!sphereImageTo(X, Y, Z, pr.Rb, fit.f, pr.cx, pr.cy, projTmp)) continue;
-    const ratio = c.r / projTmp[2]!;
-    if (ratio > 1 / DISPLACED_SIZE && ratio < DISPLACED_SIZE) out.push(j);
+    if (restsElsewhere(pr, fit, c, k)) out.push(j);
+  }
+  return out;
+}
+
+/**
+ * Does circle c put ball k elsewhere on the bed? Its ray meets the plane of the ball centres on the bed,
+ * at least DISPLACED_MIN ball radii from where the layout put k, and a ball there has the circle's image
+ * size (within DISPLACED_SIZE).
+ */
+function restsElsewhere(pr: Problem, fit: Fit, c: Candidate, k: number): boolean {
+  const R = fit.R;
+  const b = pr.balls[k]!;
+  // Ray through the circle centre, in world coordinates (Rᵀ · camera ray).
+  const mx = (c.u - pr.cx) / fit.f;
+  const my = (c.v - pr.cy) / fit.f;
+  const dx = R[0]! * mx + R[3]! * my + R[6]!;
+  const dy = R[1]! * mx + R[4]! * my + R[7]!;
+  const dz = R[2]! * mx + R[5]! * my + R[8]!;
+  if (!(dz < -1e-6)) return false;
+  const t = (pr.Rb - fit.C.z) / dz;
+  if (!(t > 0)) return false;
+  const px = fit.C.x + t * dx;
+  const py = fit.C.y + t * dy;
+  if (Math.abs(px) > pr.halfL || Math.abs(py) > pr.halfW) return false;
+  if (hyp2(px - b.x, py - b.y) < DISPLACED_MIN * pr.Rb) return false;
+  const [X, Y, Z] = cameraToWorldC(R, fit.C, { x: px, y: py, z: pr.Rb });
+  if (!sphereImageTo(X, Y, Z, pr.Rb, fit.f, pr.cx, pr.cy, projTmp)) return false;
+  const ratio = c.r / projTmp[2]!;
+  return ratio > 1 / DISPLACED_SIZE && ratio < DISPLACED_SIZE;
+}
+
+/** Shift (ball radii, along the line of sight in the photo) of a key ball's circle that can be a move (overlappedCircles). */
+const LOS_SHIFT_MIN = 0.4;
+/**
+ * The moved-ball signature of a key ball (target or cue ball) moved along the line of sight: predicted
+ * in full view, but neither matched (its outline is off) nor on bare cloth (its circle still overlaps the
+ * prediction), with a circle of its colour that only its own prediction explains, off the prediction by
+ * LOS_SHIFT_MIN radii or more along the ball's line of sight, and that puts it elsewhere on the bed
+ * (restsElsewhere). From behind the cue ball, 12 cm along the aim moves a ball by ≈ 1.2 radii in the
+ * photo: within the guide's image tolerance, yet the cut changes by 5° (release verification: "Fit:
+ * good · 99 %" with the ghost ball 12 cm off). A move under about 0.4 radii (a low camera far from the
+ * ball: 12.5 cm is 5 px there) is within the circle fit's own error and is not told. Returns those
+ * circles' indices.
+ */
+function overlappedCircles(pr: Problem, fit: Fit, cands: Candidate[], ev: Evaluation, k: number): number[] {
+  const out: number[] = [];
+  if (pr.camo[k] || ev.missingIdx.includes(k) || ev.matched.some((m) => m.k === k)) return out;
+  const nb = pr.balls.length;
+  const proj: Projected = { u: new Float64Array(nb), v: new Float64Array(nb), r: new Float64Array(nb), d: new Float64Array(nb), vis: new Uint8Array(nb) };
+  projectAll(pr, fit, proj);
+  if (proj.vis[k] !== 1) return out;
+  // The image direction in which k moves when it moves away along its line of sight on the bed.
+  const b = pr.balls[k]!;
+  const lx = b.x - fit.C.x;
+  const ly = b.y - fit.C.y;
+  const ll = hyp2(lx, ly);
+  if (ll < 1e-6) return out;
+  const [X1, Y1, Z1] = cameraToWorldC(fit.R, fit.C, { x: b.x + (0.02 * lx) / ll, y: b.y + (0.02 * ly) / ll, z: pr.Rb });
+  if (!sphereImageTo(X1, Y1, Z1, pr.Rb, fit.f, pr.cx, pr.cy, projTmp)) return out;
+  const ex = projTmp[0]! - proj.u[k]!;
+  const ey = projTmp[1]! - proj.v[k]!;
+  const el = hyp2(ex, ey);
+  if (el < 1e-9) return out;
+  for (let j = 0; j < cands.length; j++) {
+    const c = cands[j]!;
+    if (pr.cc[k * pr.nCands + j]! >= 3 || c.r < 3) continue;
+    // Explained by k's prediction (explained()'s reach) and by no other ball in view.
+    let mine = false;
+    let other = false;
+    for (let o = 0; o < nb && !other; o++) {
+      if (!proj.vis[o]) continue;
+      const reach = proj.r[o]! + 0.5 * c.r + 2;
+      if (hyp2(c.u - proj.u[o]!, c.v - proj.v[o]!) >= reach) continue;
+      if (o === k) mine = true;
+      else other = true;
+    }
+    // Off along the line of sight (nearer or farther), not sideways: a pose a little off shifts a far
+    // ball sideways by a radius (from 7 cm up, 8.8 px against r 7.8 px at 0.1 r along it), which is no
+    // move; a ball moved 10–17 cm along the aim shows 0.55–1.1 radii along it.
+    const along = Math.abs(((c.u - proj.u[k]!) * ex + (c.v - proj.v[k]!) * ey) / el) / proj.r[k]!;
+    if (mine && !other && along >= LOS_SHIFT_MIN && restsElsewhere(pr, fit, c, k)) out.push(j);
   }
   return out;
 }
@@ -1430,7 +1512,7 @@ function severalDisplaced(pr: Problem, fit: Fit, cands: Candidate[], ev: Evaluat
  * 92° grey-cloth photo, mispredicted by its own width, costs × 1.3–1.8; a cue ball moved 8–20 cm costs
  * × 4.7–23 (+170 … +1000).
  */
-function stillFits(pr: Problem, rf: Refined, k: number, c: Candidate): boolean {
+function stillFits(pr: Problem, rf: Refined, k: number, c: Candidate, reach = false): boolean {
   const sel = selectPoints(pr, rf.assign, 90, 160);
   if (sel.length < MIN_REFINE_POINTS) return false;
   const keep = pr.taps;
@@ -1438,8 +1520,16 @@ function stillFits(pr: Problem, rf: Refined, k: number, c: Candidate): boolean {
   pr.taps = [{ ball: k, x: c.u, y: c.v, sigma: Math.max(1, 0.15 * c.r) }];
   const forced = levenberg(pr, rf.fit, sel, rf.assign.elem, 8);
   pr.taps = keep;
-  return forced.cost <= Math.max(STILL_FITS_RATIO * base, base + STILL_FITS_ABS);
+  if (forced.cost > Math.max(STILL_FITS_RATIO * base, base + STILL_FITS_ABS)) return false;
+  if (!reach) return true;
+  // The refit must also put k on the circle: the pinned centre costs only (offset / σ)² / 2, so a pose
+  // held by the other balls can leave k where it was within the cost allowance.
+  const [X, Y, Z] = cameraToWorldC(forced.fit.R, forced.fit.C, pr.balls[k]!);
+  if (!sphereImageTo(X, Y, Z, pr.Rb, forced.fit.f, pr.cx, pr.cy, projTmp)) return false;
+  return hyp2(projTmp[0]! - c.u, projTmp[1]! - c.v) <= Math.max(2, STILL_FITS_REACH * c.r);
 }
+/** How close (circle radii) a refit with ball k pinned must bring k to the circle for k not to have moved (stillFits `reach`). */
+const STILL_FITS_REACH = 0.25;
 const STILL_FITS_RATIO = 2.5;
 /** Neutral cloth tint below which no chroma separates it from neutral ball surfaces (table-detect's rule). */
 const UNTINTED_SAT = 0.08;
@@ -2202,13 +2292,21 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx, maxSeeds =
   const keyMoved =
     ok &&
     ([targetIdx, cueIdx].some((k) => {
-      if (k < 0 || !fe.missingIdx.includes(k)) return false;
+      if (k < 0) return false;
+      // Moved along the line of sight: still overlapping its prediction, but off it (overlappedCircles).
+      if (!fe.missingIdx.includes(k)) return overlappedCircles(pr, fit, cands, fe, k).some((j) => !stillFits(pr, fitR, k, cands[j]!, true));
       const near = displacedCircles(pr, fit, cands, fe, k);
       if (!near.length) return !pr.untinted;
       return near.some((j) => !stillFits(pr, fitR, k, cands[j]!));
     }) ||
       fe.missingIdx.some((k) => k !== targetIdx && k !== cueIdx && displaced(pr, fitR, cands, fe, k)));
   if (keyMoved) ok = false;
+  // On an untinted grey cloth the same evidence cannot say "moved" (above), but it still says the guide is
+  // unverified: the ghost ball is drawn next to a target the pose puts on plain cloth. Either the target
+  // moved or the pose is off (from 7 cm up, three balls fitted a camera 5 cm off and 8° turned, the
+  // target predicted beside its own circle: ghost 2.3 %, confidence 0.68), so the fit is not used and the
+  // player is offered the two taps instead (they name the target, so they still draw: FR-118).
+  else if (ok && !manualTaps && pr.untinted && targetIdx >= 0 && fe.missingIdx.includes(targetIdx)) ok = false;
   // A fit that is not good enough to use never reports a usable confidence.
   if (!ok) confidence = Math.min(confidence, 0.49);
   const matched = fe.matched.map((m) => ({ id: known[m.k]!.id, image: { x: m.u, y: m.v }, radiusPx: m.r }));

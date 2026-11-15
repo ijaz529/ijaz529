@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
+import { inflateSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
 import { regionStats, visibleBox } from './pixels';
 import { jpegWithOrientation } from '../../src/app/snap/exif';
+import { encodePng } from '../../scripts/png';
 
 /** Feature 002 US2: Snap, the two-photo guide, on the committed synthetic photos. */
 const dir = fileURLToPath(new URL('../fixtures/', import.meta.url));
@@ -519,7 +521,56 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await expect(page.locator('#hud-strike')).toContainText('Strike');
     await expect(page.locator('#snap-hud')).toContainText('/10');
   });
+
+  test('a photo too dark to read asks for a better photo first (taps second); one with no cloth refuses the taps and says so', async ({ page }) => {
+    // Release verification: these photos kept asking for two taps that could not work, so the player looped.
+    await tablePhoto(page);
+    await pick(page, gt.balls.find((b) => b.id === '8')!.pos, 'BR');
+    await page.setInputFiles('#snap-file-player', { name: 'dark.png', mimeType: 'image/png', buffer: scaledPng(`${dir}snap-player.png`, 0.15) });
+    await stepIs(page, ['guide', 'manual-taps']);
+    expect((await H(page)).step).toBe('manual-taps');
+    await expect(page.locator('#snap-top')).toContainText('Retake your photo with more light on the table.');
+    await expect(page.locator('#snap-top')).toContainText('Or tap the cue ball, then your target.');
+    // A photo of a plain surface: no cloth, so no cue ball to tap.
+    const flat = new Uint8ClampedArray(960 * 720 * 4);
+    for (let i = 0; i < flat.length; i += 4) flat.set([132, 128, 120, 255], i);
+    await page.setInputFiles('#snap-file-player', { name: 'wall.png', mimeType: 'image/png', buffer: encodePng({ width: 960, height: 720, data: flat }) });
+    await expect.poll(async () => (await H(page)).player?.result?.reason ?? '', { timeout: 15_000 }).toMatch(/table cloth/);
+    expect((await H(page)).step).toBe('manual-taps');
+    await expect(page.locator('#snap-top')).toContainText('Retake your photo with the table’s cloth in view');
+    await expect(page.locator('#snap-top')).not.toContainText('Or tap the cue ball');
+    const p = await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photoToScreen({ x: 300, y: 300 }));
+    await page.mouse.click(p.x, p.y);
+    await expect(page.locator('#toast')).toContainText('Taps can’t help on this photo');
+    expect((await H(page)).step).toBe('manual-taps');
+  });
 });
+
+/** An RGBA PNG written by scripts/png.ts (filter 0 on every row), every channel scaled by `k`. */
+function scaledPng(file: string, k: number): Buffer {
+  const buf = readFileSync(file);
+  let p = 8;
+  let w = 0;
+  let h = 0;
+  const idat: Buffer[] = [];
+  while (p < buf.length) {
+    const len = buf.readUInt32BE(p);
+    const type = buf.toString('ascii', p + 4, p + 8);
+    const body = buf.subarray(p + 8, p + 8 + len);
+    if (type === 'IHDR') {
+      w = body.readUInt32BE(0);
+      h = body.readUInt32BE(4);
+    } else if (type === 'IDAT') idat.push(body);
+    p += 12 + len;
+  }
+  const raw = inflateSync(Buffer.concat(idat));
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    expect(raw[y * (w * 4 + 1)], 'unfiltered rows').toBe(0);
+    for (let x = 0; x < w * 4; x++) data[y * w * 4 + x] = (x & 3) === 3 ? 255 : raw[y * (w * 4 + 1) + 1 + x]! * k;
+  }
+  return encodePng({ width: w, height: h, data });
+}
 
 test.describe('Snap when table detection itself fails', () => {
   test('the vision worker crashing on the table photo ends the wait with a message; the next photo starts a new worker', async ({ page }) => {

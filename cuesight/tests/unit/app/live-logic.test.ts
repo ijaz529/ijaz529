@@ -32,6 +32,7 @@ import {
   liveGate,
   nextSinceLocked,
   pickNextAllowed,
+  suggestNeedsCue,
   pillMeta,
   pillText,
   probeCamera,
@@ -379,6 +380,19 @@ describe('Zones: the next ball', () => {
     expect(pickNextAllowed({ id: 'b1', kind: 'object' }, 'b1')).toBe(false);
     expect(pickNextAllowed({ id: 'b2', kind: 'object' }, 'b1')).toBe(true);
     expect(pickNextAllowed({ id: 'b2', kind: 'object' }, null)).toBe(true);
+  });
+});
+
+describe('Suggest without a cue ball (Live: none found, or two whites too close to call)', () => {
+  it('asks for the cue ball instead of searching (the search would say "No clean pot", which is not the reason)', () => {
+    // Release verification: a cue ball frozen between two balls, read "white?" next to a white-ish green
+    // stripe — Suggest said "No clean pot on this layout. Consider a safety or a bank."
+    const twoWhites = [ball('t1', -0.5, 0.05, 'object', 'white?'), ball('t2', 0.55, -0.3, 'object', 'white?'), ball('t3', 0.3, 0.2, 'object', 'red')];
+    expect(suggestNeedsCue(twoWhites)).toBe('Two white balls — tap the one you play with, then Suggest again.');
+    expect(suggestNeedsCue([ball('t3', 0.3, 0.2, 'object', 'red'), ball('t4', 0.1, 0.2, 'object', 'white?')])).toBe('I can’t find the cue ball — tap it, then Suggest again.');
+    expect(suggestNeedsCue([])).toBe('I can’t find the cue ball — tap it, then Suggest again.');
+    // With a cue ball (found, or marked by the player) Suggest searches as before.
+    expect(suggestNeedsCue([...twoWhites, ball('cue', 0, 0, 'cue', 'cue')])).toBeNull();
   });
 });
 

@@ -308,3 +308,69 @@ describe('cue ball partly behind an object ball, stripes on the table', () => {
     expect(real.YUV).toBeGreaterThanOrEqual(FLOOR[`${pose} YUV`]!);
   }, 180_000);
 });
+
+describe('cue ball frozen between two touching object balls, a green stripe on the green cloth elsewhere', () => {
+  // The cue ball touching a red and a blue on a line at 0°, 45° and 90° to the view, at two spots, with
+  // five more balls elsewhere, among them a green stripe whose band vanishes into the cloth (in every
+  // 8-ball game): it reads white-ish. Each neighbour hides a rim arc of the cue ball, the two arcs
+  // opposite, but its rim against the cloth between them on both sides leaves any band in view, so its
+  // whiteness counts. The release candidate called it ambiguous and, with the green stripe white-ish,
+  // flagged no cue in 127 of 324 runs (lines at 45° and 90°: 24 of 36 per encoding); Live then asked for
+  // taps. Floor per view, encoding and angle: the wave-1 detector's count under the same calibrations
+  // (auto, exact, 4 jittered at ±0.3 px). Along the view (0°) the cue ball hides behind the nearer ball
+  // and what decides is the cluster count and its visible whiteness (wave-1 there: RGB 10–12 of 12,
+  // video 0–10).
+  const R = R9;
+  const OTHERS = [
+    { pos: { x: 0.55, y: -0.3 }, color: C.green!, stripe: true },
+    { pos: { x: -0.2, y: 0.42 }, color: C.yellow! },
+    { pos: { x: 0.9, y: 0.25 }, color: C.purple! },
+    { pos: { x: 1.0, y: -0.35 }, color: C.black! },
+    { pos: { x: -0.85, y: -0.4 }, color: C.orange!, stripe: true },
+  ];
+  const FLOOR: Record<string, Record<string, number>> = {
+    end: { 'RGB 0': 10, 'YUV 0': 1, 'bilinear 0': 0, 'RGB 45': 12, 'YUV 45': 12, 'bilinear 45': 10, 'RGB 90': 12, 'YUV 90': 12, 'bilinear 90': 12 },
+    side: { 'RGB 0': 12, 'YUV 0': 10, 'bilinear 0': 9, 'RGB 45': 12, 'YUV 45': 12, 'bilinear 45': 12, 'RGB 90': 12, 'YUV 90': 12, 'bilinear 90': 12 },
+    corner: { 'RGB 0': 10, 'YUV 0': 4, 'bilinear 0': 1, 'RGB 45': 12, 'YUV 45': 12, 'bilinear 45': 12, 'RGB 90': 12, 'YUV 90': 12, 'bilinear 90': 12 },
+  };
+  it.each(['end', 'side', 'corner'] as Pose[])('%s view: the real cue ball is flagged at least as often as by wave-1, never an object ball (RGB, YUV 4:2:0 and bilinear 4:2:0; auto, exact and 4 jittered calibrations)', (pose) => {
+    const cam = POSES[pose]!;
+    const wrong: string[] = [];
+    const real: Record<string, number> = {};
+    const none: string[] = [];
+    for (const ang of [0, 45, 90])
+      for (const cx of [-0.5, 0.2]) {
+        const cue = { x: cx, y: 0.05 };
+        const a = Math.atan2(cue.y - cam.pos.y, cue.x - cam.pos.x) + (ang * Math.PI) / 180;
+        const g = 2 * R + 0.0002;
+        const sc = mk('pool9', cam, [
+          { pos: cue, color: C.cue! },
+          { pos: { x: cue.x - g * Math.cos(a), y: cue.y - g * Math.sin(a) }, color: C.red! },
+          { pos: { x: cue.x + g * Math.cos(a), y: cue.y + g * Math.sin(a) }, color: C.blue! },
+          ...OTHERS,
+        ]);
+        const f = render(sc);
+        for (const [nm, frame] of [
+          ['RGB', f],
+          ['YUV', yuv420(f)],
+          ['bilinear', bilinear420(f)],
+        ] as const)
+          for (const c of calibrationSet(sc, [[0.3, 4, 99000]])) {
+            const r = detectWith(sc, frame, c);
+            const ci = cueIndex(r);
+            const key = `${nm} ${ang}`;
+            real[key] ??= 0;
+            const tag = `${ang}° at x ${cx} ${nm} ${c.name}`;
+            if (ci === 0) real[key]!++;
+            else if (ci === -1) none.push(tag);
+            else wrong.push(`${tag}: ${ci} (${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')})`);
+          }
+      }
+    console.log(`${pose}: real cue flagged ${Object.entries(real).map(([k, v]) => `${k}° ${v}/12 (wave-1 ${FLOOR[pose]![k]})`).join(', ')}; none in ${none.join(', ') || '-'}`);
+    expect(wrong, wrong.join('\n')).toEqual([]);
+    const short = Object.entries(FLOOR[pose]!)
+      .filter(([k, v]) => real[k]! < v)
+      .map(([k, v]) => `${k}°: ${real[k]} < ${v}`);
+    expect(short, short.join('\n')).toEqual([]);
+  }, 180_000);
+});

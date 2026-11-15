@@ -29,7 +29,7 @@ import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
 import { decodePhoto, frameOf, loadSample, photoFromVideo, releasePhoto, type Photo } from './photo';
-import { SNAP_MESSAGES, fitCheck, playerFailAction, snapAimText, snapGuideInstruction, snapStage, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
+import { SNAP_MESSAGES, fitCheck, playerFailAction, retakeInstruction, snapAimText, snapGuideInstruction, snapStage, tapsOffered, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
 
 export const SAMPLE_PHOTOS = { table: './samples/snap-table.png', player: './samples/snap-player.png' } as const;
 
@@ -528,6 +528,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     if (sn.step === 'manual-taps') {
       const p = photoCanvas.toPhoto(e.clientX, e.clientY);
       if (!p) return;
+      // Taps refused (the balls moved, or a better photo is the only fix): say so rather than ignore them.
+      if (!tapsOffered(sn)) return host.toast(playerFailAction(sn.error) === 'retake-table' ? 'Retake the table photo first.' : 'Taps can’t help on this photo — retake it first.');
       host.dispatch({ type: 'manual-tap', p });
       const after = snap();
       if (after.step === 'player-processing' && after.taps.cue && after.taps.target) runPlayerView({ cue: after.taps.cue, target: after.taps.target });
@@ -738,16 +740,30 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
         const tname = !tl ? 'target ball' : /^\d+$/.test(tl) ? `${tl}-ball (your target)` : `${tl} ball (your target)`;
         const next = playerFailAction(sn.error);
         if (next === 'retake-table') {
-          // The layout changed since the table photo: a guide from it would be wrong, and taps cannot fix that.
-          setInstr('Retake the table photo: the balls have moved since it was taken.', 'camera', 'warn');
-          if (sn.error) warnings.push(sn.error);
-          actions = iconBtn('retake-table', 'Retake the table photo', 'camera') + iconBtn('start-over', 'Start over', 'refresh');
+          // The layout changed since the table photo: a guide from it would be wrong, and taps cannot fix
+          // that. The fit's own sentence is the instruction (it says "seem": a rare static photo reads as
+          // moved), so it is not repeated as a chip.
+          setInstr(sn.error ?? 'The balls seem to have moved. Retake the table photo.', 'camera', 'warn');
+          // A new player photo stays possible against the same layout (FR-120): the verdict can be wrong.
+          actions = iconBtn('retake-table', 'Retake the table photo', 'camera') + iconBtn('take-player', 'New player photo', 'image') + iconBtn('start-over', 'Start over', 'refresh');
           break;
         }
         const tapText = !sn.taps.cue ? 'Tap the centre of the cue ball in your photo.' : `Now tap the centre of the ${tname}.`;
+        const actionsTaps = iconBtn('take-player', 'Retake the player-view photo', 'camera') + iconBtn('pick-player', 'Choose another player-view photo', 'image') + iconBtn('edit-layout', 'Edit the layout', 'layers') + iconBtn('start-over', 'Start over', 'refresh');
+        if (next === 'retake-light') {
+          // Too dark, too grainy or no cloth in view: a better photo is the fix, so it is the instruction.
+          // The taps come second, offered once for a dark or grainy photo (not without cloth in view, nor
+          // after a two-tap fit failed for the same reason: then they did not help).
+          const offer = tapsOffered(sn);
+          if (offer && sn.taps.cue) setInstr(tapText, 'hand');
+          else setInstr(retakeInstruction(sn.error), 'camera', 'warn');
+          if (sn.error) warnings.push(offer ? `${sn.error} Or tap the cue ball, then your target.` : sn.player?.manual ? `${sn.error} The two taps didn’t help on this photo.` : sn.error);
+          actions = actionsTaps;
+          break;
+        }
         setInstr(tapText, 'hand');
-        if (sn.error) warnings.push(next === 'retake-light' ? `${sn.error} Or tap the cue ball, then your target.` : `${sn.error} Next time, include a rail or a pocket and the target ball in the photo.`);
-        actions = iconBtn('take-player', 'Retake the player-view photo', 'camera') + iconBtn('pick-player', 'Choose another player-view photo', 'image') + iconBtn('edit-layout', 'Edit the layout', 'layers') + iconBtn('start-over', 'Start over', 'refresh');
+        if (sn.error) warnings.push(`${sn.error} Next time, include a rail or a pocket and the target ball in the photo.`);
+        actions = actionsTaps;
         break;
       }
     }

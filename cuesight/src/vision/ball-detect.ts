@@ -161,6 +161,13 @@ const CUE_FILL_MIN = 0.75;
 const CUE_MIN_WHITE = 0.05;
 const CUE_SPREAD = 0.15;
 const CUE_MARGIN = 0.15;
+/**
+ * A white ball whose completeness is within this of the cue-ball threshold may still be the cue ball (a
+ * white ball's mask erodes on video: a real cue ball beside a rack read 0.82 against 0.83), so it keeps a
+ * cue ball walled in a pack ambiguous; a stripe whose band reads as cloth is further off (a green stripe
+ * on green cloth, 0.67–0.79 against 0.85 in the frozen-cue scenes).
+ */
+const CUE_FILL_SLACK = 0.03;
 /** Any ball: luminance spread p90 − p10 at least this × p90 (shading); flat bright blobs are glare. */
 const FLAT_SPREAD = 0.25;
 /** Tint: saturation above this but ≤ 0.4, hue away from the cloth; weighted into the cue score. */
@@ -1029,7 +1036,10 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
   // and touching neighbours, as in a pack's back row). Such a ball is ambiguous: its whiteness is no
   // evidence for or against any other ball, so the cue is chosen among the unambiguous candidates (a
   // cue ball partly behind one object ball is one) with the margin over them; an ambiguous one is the
-  // cue only when no other ball is white at all.
+  // cue only when no other ball that could be the cue ball is white: whole and shaded (within
+  // CUE_FILL_SLACK of the threshold). A stripe whose band reads as cloth is not one: a cue ball frozen
+  // between two touching balls (an opposite pair hidden by the contacts) next to a green stripe on green
+  // cloth reading white-ish went unflagged in 127 of 324 runs, and Live asked for taps.
   let best = -1;
   let second = -1;
   let amb = -1;
@@ -1037,7 +1047,7 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
   const cueFill = Math.max(CUE_FILL_MIN, CUE_FILL - 0.5 / ctx.rp);
   for (let i = 0; i < found.length; i++) {
     const f = found[i]!;
-    if (f.ball.white >= CUE_MIN_WHITE) nWhite++;
+    if (f.ball.white >= CUE_MIN_WHITE && f.complete >= cueFill - CUE_FILL_SLACK && f.spread >= CUE_SPREAD) nWhite++;
     if (f.complete < cueFill || f.ball.white < CUE_MIN_WHITE || f.spread < CUE_SPREAD) continue;
     if (f.enclosed) {
       if (amb < 0 || f.ball.white > found[amb]!.ball.white) amb = i;

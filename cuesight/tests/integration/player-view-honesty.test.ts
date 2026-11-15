@@ -356,6 +356,71 @@ describe('SC-107 on grey cloth: never an ok fit off tolerance', () => {
     }
   }, 120_000);
 
+  // The s101053 neighbourhood (release verification): the cue ball and 2–3 other balls in view, 5–9 cm
+  // up, a 92–100° lens against the app's 65° hint, looking up at the far corner. From that low, the side
+  // and end cushion lines lie on the cushion plane's horizon and show as one nearly straight line (2–5°
+  // apart in the photo), so they pin nothing. Before the fix, 12 of 81 green neighbours and 9 of 81 grey
+  // ones gave an ok fit with the ghost 3–9 % of the diagonal off at confidence 0.85–0.93, two of them
+  // inside the SC-106 envelope (#55 and #62, 8 cm up).
+  const s101053 = {
+    balls: [
+      { pos: { x: -1.209581, y: 0.46613 }, color: [245, 245, 238] },
+      { pos: { x: -1.67488, y: 0.805607 }, color: [200, 25, 30] },
+      { pos: { x: -0.683599, y: 0.322482 }, color: [200, 25, 30] },
+      { pos: { x: -0.360855, y: 0.252146 }, color: [200, 25, 30] },
+      { pos: { x: -0.630159, y: -0.452907 }, color: [200, 25, 30] },
+      { pos: { x: 1.481049, y: 0.13861 }, color: [200, 25, 30] },
+      { pos: { x: -1.635213, y: 0.091197 }, color: [236, 190, 20] },
+      { pos: { x: 0.548802, y: -0.062332 }, color: [120, 70, 30] },
+      { pos: { x: -1.6807, y: 0.275315 }, color: [20, 60, 170] },
+      { pos: { x: 1.709595, y: -0.497982 }, color: [20, 110, 50] },
+    ] as SynthBall[],
+    cam: { pos: { x: -0.866981, y: 0.184963, z: 0.066162 }, target: { x: -1.619421, y: 0.722539, z: 0.446746 }, fovDeg: 96.014586, rollDeg: -8.869027 },
+  };
+  /** Neighbour i of s101053 (i = 0 is the literal): camera ±3 cm (height ±1.5 cm, ≥ 5 cm), aim ±4 cm, FOV ±4°, roll ±2°, cloth ±8 levels (±3 per channel). */
+  function s101053Neighbours(n: number, base: RGB, extra: number[]): Scene[] {
+    const g = rng(4371);
+    const out: Scene[] = [];
+    for (let i = 0; i <= Math.max(n, ...extra); i++) {
+      const j = i === 0 ? 0 : 1;
+      const c = s101053.cam;
+      const cam: SynthCamera = {
+        pos: { x: c.pos.x + j * U(g, -0.03, 0.03), y: c.pos.y + j * U(g, -0.03, 0.03), z: Math.max(0.05, c.pos.z + j * U(g, -0.015, 0.015)) },
+        target: { x: c.target.x + j * U(g, -0.04, 0.04), y: c.target.y + j * U(g, -0.04, 0.04), z: c.target.z + j * U(g, -0.03, 0.03) },
+        fovDeg: c.fovDeg + j * U(g, -4, 4),
+        rollDeg: c.rollDeg + j * U(g, -2, 2),
+      };
+      const dc = j * Math.round(U(g, -8, 8));
+      const cloth = base.map((v) => v + dc + j * Math.round(U(g, -3, 3))) as RGB;
+      if (i > n && !extra.includes(i)) continue;
+      const name = `s101053#${i} HFOV ${cam.fovDeg.toFixed(0)}° h ${cam.pos.z.toFixed(3)} cloth ${cloth.join(',')}`;
+      out.push({ name, table: tables.snooker12, balls: s101053.balls, targetIdx: 1, cam, W: 960, H: 720, cloth });
+    }
+    return out;
+  }
+  for (const [label, base] of [
+    ['green 40,130,70', [40, 130, 70]],
+    ['its grey 100,104,108', [100, 104, 108]],
+  ] as [string, RGB][])
+    it(`the s101053 neighbourhood on ${label}, with the app's hints: no ok fit with the ghost off tolerance (low wide-lens 2–3-ball fits)`, async () => {
+      const rows: string[] = [];
+      const off: string[] = [];
+      let good = 0;
+      for (const sc of s101053Neighbours(40, base, [46, 55, 62])) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const { frame } = render(sc);
+        const res = run(sc, frame, appHints(sc));
+        const e = res.pose ? errorsOf(sc, res.pose) : null;
+        rows.push(`  ${sc.name}: ${fmt(res, e)}`);
+        if (res.ok && e!.ghost <= 0.015) good++;
+        // SC-107: an ok fit is drawn as right, so its ghost must be within tolerance (an ok fit never has
+        // a confidence under 0.5: one off by more than 1.5 % must not be ok at all).
+        if (res.ok && e!.ghost > 0.015) off.push(rows[rows.length - 1]!);
+      }
+      console.log(`s101053 neighbourhood on ${label}: ${good}/${rows.length} ok within tolerance\n${rows.join('\n')}`);
+      expect(off, `${off.length} ok fits with the ghost off tolerance:\n${off.join('\n')}`).toEqual([]);
+    }, 600_000);
+
   it('random layouts on 27 greys from 8–14 cm up: no ok fit off tolerance, never "moved" or "too dark"', async () => {
     const rows: string[] = [];
     let good = 0;
