@@ -9,6 +9,7 @@ import { makeTable } from '../../../src/core/table';
 import type { TablePresetId } from '../../../src/core/types';
 import { detectBalls, type DetectedBall } from '../../../src/vision/ball-detect';
 import { calibrationFromCorners, type Calibration } from '../../../src/vision/calibration';
+import { applyH, invert3 } from '../../../src/vision/homography';
 import { frameToHsv, type Frame } from '../../../src/vision/image';
 import { BALL_COLORS, cameraModel, fixtureBalls, renderSyntheticTable, type RGB, type SynthBall, type SynthCamera, type SynthScene } from '../../../src/vision/synth/render';
 import { createTableScratch, detectTable, learnClothInQuad, type ClothModel } from '../../../src/vision/table-detect';
@@ -85,19 +86,116 @@ function render(sc: SynthScene, key?: string): Frame {
   return f;
 }
 
-/** Calibration straight from the synthetic camera (tests detection alone, not table detection). */
-function exactCalibration(sc: SynthScene): Calibration {
+/** Image corners of the outer cloth edge, projected by the synthetic camera. */
+function exactCorners(sc: SynthScene): Vec2[] {
   const cam = cameraModel(sc.camera, sc.width, sc.height);
   const t = sc.table;
   const X = t.length / 2 + t.cushionWidth;
   const Y = t.width / 2 + t.cushionWidth;
-  const corners = [
+  return [
     [-X, -Y],
     [X, -Y],
     [X, Y],
     [-X, Y],
   ].map(([x, y]) => cam.project({ x: x!, y: y!, z: t.cushionHeight }));
-  return { corners, H0: cam.planeH(0), HR: cam.planeH(t.ballRadius), focal: cam.f, focalSource: 'estimated', source: 'manual', camera: { ...cam.C }, width: sc.width, height: sc.height };
+}
+
+/** Calibration straight from the synthetic camera (tests detection alone, not table detection). */
+function exactCalibration(sc: SynthScene): Calibration {
+  const cam = cameraModel(sc.camera, sc.width, sc.height);
+  const t = sc.table;
+  return { corners: exactCorners(sc), H0: cam.planeH(0), HR: cam.planeH(t.ballRadius), focal: cam.f, focalSource: 'estimated', source: 'manual', camera: { ...cam.C }, width: sc.width, height: sc.height };
+}
+
+/** Deterministic uniform numbers in [−1, 1) (LCG). */
+function lcg(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return (s / 4294967296) * 2 - 1;
+  };
+}
+
+/**
+ * A calibration to run the detector with. `refs` (jittered corners): where a perfect detector puts each
+ * truth ball under THIS calibration (its centre projected by the true camera, back through this
+ * calibration's ball-centre plane), so the detector is not charged for the calibration's own error
+ * (±1 px corners alone move the fixture's balls by a median of 10–16 mm). Null: the truth itself.
+ */
+interface CalCase {
+  name: string;
+  cal: Calibration | null;
+  refs: Vec2[] | null;
+}
+
+/**
+ * The calibrations a cluster must hold under: the table detector's (auto), the camera's exact one, and
+ * the exact corners jittered uniformly by ±0.3 px (12 seeds) and ±1 px (6 seeds), as calibration error.
+ */
+function calibrationSet(sc: SynthScene): CalCase[] {
+  const ex = exactCorners(sc);
+  const cam = cameraModel(sc.camera, sc.width, sc.height);
+  const out: CalCase[] = [
+    { name: 'auto', cal: null, refs: null },
+    { name: 'exact', cal: exactCalibration(sc), refs: null },
+  ];
+  for (const [amp, n, seed0] of [
+    [0.3, 12, 1000],
+    [1, 6, 2000],
+  ] as const)
+    for (let s = 0; s < n; s++) {
+      const rn = lcg(seed0 + s);
+      const cal = calibrationFromCorners(
+        ex.map((p) => ({ x: p.x + amp * rn(), y: p.y + amp * rn() })),
+        sc.table,
+        sc.width,
+        sc.height,
+      );
+      expect(cal, `±${amp} px #${s} calibrates`).not.toBeNull();
+      const Hi = invert3(cal!.HR);
+      const refs = sc.balls.map((b) => {
+        const q = cam.project({ x: b.pos.x, y: b.pos.y, z: sc.table.ballRadius });
+        return applyH(Hi, q.x, q.y);
+      });
+      out.push({ name: `±${amp} px #${s}`, cal, refs });
+    }
+  return out;
+}
+
+/**
+ * Share of each ball's silhouette that no other ball covers (ray cast, 2×2 rays per pixel): what
+ * rendering the ball in and out adds to the outline.
+ */
+function exclusiveShare(sc: SynthScene): number[] {
+  const cam = cameraModel(sc.camera, sc.width, sc.height);
+  const [rt, dn, fw] = cam.R;
+  const R = sc.table.ballRadius;
+  const n = sc.balls.length;
+  const own = new Float64Array(n);
+  const tot = new Float64Array(n);
+  for (let y = 0; y < sc.height * 2; y++)
+    for (let x = 0; x < sc.width * 2; x++) {
+      const u = ((x + 0.5) / 2 - sc.width / 2) / cam.f;
+      const v = ((y + 0.5) / 2 - sc.height / 2) / cam.f;
+      const dx = rt.x * u + dn.x * v + fw.x;
+      const dy = rt.y * u + dn.y * v + fw.y;
+      const dz = rt.z * u + dn.z * v + fw.z;
+      const dl = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      let hits = 0;
+      let who = -1;
+      for (let i = 0; i < n; i++) {
+        const ox = cam.C.x - sc.balls[i]!.pos.x;
+        const oy = cam.C.y - sc.balls[i]!.pos.y;
+        const oz = cam.C.z - R;
+        const b = (ox * dx + oy * dy + oz * dz) / dl;
+        if (b > 0 || b * b - (ox * ox + oy * oy + oz * oz - R * R) < 0) continue;
+        hits++;
+        who = i;
+        tot[i]! += 1;
+      }
+      if (hits === 1) own[who]! += 1;
+    }
+  return [...own].map((o, i) => o / Math.max(1, tot[i]!));
 }
 
 /** The cloth model learned inside a known outline (the pipeline's manual-corners path). */
@@ -120,10 +218,11 @@ interface Run {
  * Detect, then match one-to-one (greedy, within 6 cm) to the truth. With auto calibration the
  * table's 180° symmetry is resolved by whichever orientation fits better.
  */
-function detect(sc: SynthScene, frame: Frame, o: { exact?: boolean } = {}): Run {
+function detect(sc: SynthScene, frame: Frame, o: { exact?: boolean; cal?: Calibration | null; refs?: Vec2[] | null } = {}): Run {
   const det = detectTable(frame);
-  if (!o.exact) expect(det, 'table detected').not.toBeNull();
-  const cal = o.exact ? exactCalibration(sc) : calibrationFromCorners(det!.corners, sc.table, frame.width, frame.height);
+  const given = o.cal ?? null;
+  if (!o.exact && !given) expect(det, 'table detected').not.toBeNull();
+  const cal = given ?? (o.exact ? exactCalibration(sc) : calibrationFromCorners(det!.corners, sc.table, frame.width, frame.height));
   expect(cal, 'calibrated').not.toBeNull();
   // With the camera's own calibration (the detector alone), a framing the table detector declines
   // (near corners below the frame) gets its cloth model from the known outline, as manual corners do
@@ -131,10 +230,11 @@ function detect(sc: SynthScene, frame: Frame, o: { exact?: boolean } = {}): Run 
   const cloth = det?.cloth ?? clothInQuad(frame, cal!.corners);
   expect(cloth, 'cloth model').not.toBeNull();
   const balls = detectBalls(frame, cal!, sc.table, cloth!);
+  const truth = o.refs ?? sc.balls.map((b) => b.pos);
   let best: (Run & { cost: number }) | null = null;
-  for (const sign of o.exact ? [1] : [1, -1]) {
+  for (const sign of o.exact || o.refs ? [1] : [1, -1]) {
     const pairs: { t: number; d: number; dist: number }[] = [];
-    sc.balls.forEach((tb, ti) => balls.forEach((db, di) => pairs.push({ t: ti, d: di, dist: Math.hypot(db.pos.x - sign * tb.pos.x, db.pos.y - sign * tb.pos.y) })));
+    truth.forEach((tb, ti) => balls.forEach((db, di) => pairs.push({ t: ti, d: di, dist: Math.hypot(db.pos.x - sign * tb.x, db.pos.y - sign * tb.y) })));
     pairs.sort((a, b) => a.dist - b.dist);
     const match = sc.balls.map(() => ({ det: -1, err: Infinity }));
     const used = new Set<number>();
@@ -554,33 +654,61 @@ describe('cue-ball identification', () => {
 describe('touching clusters', () => {
   // Seen from low down, a pack's interior balls can sit (almost) wholly inside their neighbours'
   // silhouettes: rendering each such ball in and out adds 0–13 % of its own silhouette to the outline,
-  // too little to say it is there, so the detector does not invent it (Constitution II). Not every
-  // allowed miss is that: with the automatic table fit (~10 mm off at the far end in the end view) the
-  // 15-ball end view loses #2 and #6, which the camera's exact calibration finds (it misses #5 and #8,
-  // both hidden). The 15-ball side view now finds every ball (0.3.0 missed #14, 28–47 % in view).
-  // (The 0.2.x detector missed 3–7 per pack and placed the rest 25–35 mm off.) Never a phantom ball.
-  const cases: [string, (p: Pose) => SynthScene, Partial<Record<Pose, number>>][] = [
-    ['3-ball row', (p) => rack(3, p), {}],
-    ['9-ball diamond', (p) => rack(9, p), { end: 1, corner: 1 }],
-    ['15-ball triangle', (p) => rack(15, p), { end: 3, corner: 2 }],
-    ['snooker 15-red pack', snookerPack, { end: 2, corner: 3 }],
+  // too little to say it is there, so the detector does not invent it (Constitution II). The allowed
+  // misses per view are those balls: the test ray-casts every ball's share of the outline and checks
+  // that the allowance never exceeds the number of balls under 15 % (every other ball is at ≥ 27 %).
+  // Two allowances were below that count and only ever held at one set of table corners (the
+  // wave-1 table fit moved them by 0.1–0.3 px and both broke; the camera's exact calibration broke
+  // them in the 0.3.0 detector too): the 15-ball corner view (2 → 3; six balls at 6–13 %, the exact
+  // calibration misses #6, #8, #9 at 12 %, 7 %, 6 %) and the snooker end view (2 → 3; #5, #8, #9 at
+  // 9 %, i.e. 2 image px each). Never a phantom ball.
+  //
+  // Every scene holds under 20 calibrations: the table detector's, the camera's exact one, and the
+  // exact corners jittered by ±0.3 px (12 seeds) and ±1 px (6 seeds); the count of a cluster must not
+  // hinge on sub-pixel calibration error (the 0.3.0-and-wave-1 detector: 0–5 balls lost and phantoms
+  // in 4 of 20 at ±0.3 px). Known limits, measured: in a few jittered calibrations of the snooker
+  // end/side/corner views and the pool end views one ball still goes (a disc settles on a corner
+  // ball's rim and an interior ball is not counted, or the cloth-coloured green and the black of a
+  // pool pack read as too little of themselves); those views hold strictly under the auto and exact
+  // calibrations, and at most `jitterMisses` of their 18 jittered calibrations may fail.
+  const cases: [string, (p: Pose) => SynthScene, Partial<Record<Pose, number>>, Partial<Record<Pose, number>>][] = [
+    ['3-ball row', (p) => rack(3, p), {}, {}],
+    ['9-ball diamond', (p) => rack(9, p), { end: 1, corner: 1 }, { end: 3 }],
+    ['15-ball triangle', (p) => rack(15, p), { end: 3, corner: 3 }, { end: 2 }],
+    ['snooker 15-red pack', snookerPack, { end: 3, corner: 3 }, { end: 2, side: 1, corner: 4 }],
   ];
-  for (const [name, build, hidden] of cases)
-    it.each(ALL_POSES)(`${name}, %s view: every visible ball, median ≤ 10 mm, p95 ≤ 25 mm`, (pose) => {
+  for (const [name, build, hidden, jitterMisses] of cases)
+    it.each(ALL_POSES)(`${name}, %s view: every visible ball, no phantom, median ≤ 10 mm, p95 ≤ 25 mm, under auto, exact and jittered calibrations`, (pose) => {
       const sc = build(pose);
-      const r = detect(sc, render(sc));
-      const found = r.match.map((_, i) => i).filter((i) => r.match[i]!.det >= 0);
-      const s = errStats(r, found);
-      const missed = sc.balls.length - found.length;
-      console.log(`${name} ${pose}: ${r.balls.length}/${sc.balls.length}, errors mm ${fmt(errStats(r).mm)}`);
-      expect(r.fp, 'phantom balls').toHaveLength(0);
-      expect(missed).toBeLessThanOrEqual(hidden[pose] ?? 0);
-      expect(s.median).toBeLessThanOrEqual(10);
+      const frame = render(sc);
+      const share = exclusiveShare(sc);
+      const allow = hidden[pose] ?? 0;
+      expect(share.filter((v) => v < 0.15).length, `allowance ${allow} vs balls under 15 % of their outline: ${share.map((v) => v.toFixed(2)).join(' ')}`).toBeGreaterThanOrEqual(allow);
+      // Where misses are allowed, hidden and visible balls are far apart (no ball near the 15 % line).
+      if (allow > 0) expect(share.every((v) => v < 0.15 || v >= 0.25), `no ball between hidden and visible: ${share.map((v) => v.toFixed(2)).join(' ')}`).toBe(true);
+      const bad: string[] = [];
+      const log: string[] = [];
+      for (const c of calibrationSet(sc)) {
+        const r = detect(sc, frame, { cal: c.cal, refs: c.refs });
+        const found = r.match.map((_, i) => i).filter((i) => r.match[i]!.det >= 0);
+        const s = errStats(r, found);
+        const missed = sc.balls.length - found.length;
+        const fail: string[] = [];
+        if (r.fp.length) fail.push(`${r.fp.length} phantom`);
+        if (missed > allow) fail.push(`${missed} missed > ${allow}`);
+        if (s.median > 10) fail.push(`median ${s.median.toFixed(1)} mm`);
+        if (s.p95 > (missed ? 30 : 25)) fail.push(`p95 ${s.p95.toFixed(1)} mm`);
+        const line = `${c.name}: ${r.balls.length}/${sc.balls.length}, errors mm ${fmt(errStats(r).mm)}`;
+        log.push(line);
+        if (fail.length) bad.push(`${c.name}: ${fail.join(', ')} (${line})`);
+      }
+      console.log(`${name} ${pose}:\n  ${log.join('\n  ')}`);
       // Next to an uncounted ball the neighbours' fits absorb a little of its silhouette, so the tail is
-      // allowed to 30 mm there (measured 25–30 mm in the 15-ball end/corner and snooker end/corner views);
-      // SC-003's 25 mm holds wherever every ball is counted.
-      expect(s.p95).toBeLessThanOrEqual(missed ? 30 : 25);
-    });
+      // allowed to 30 mm there; SC-003's 25 mm holds wherever every ball is counted.
+      const strict = bad.filter((b) => b.startsWith('auto') || b.startsWith('exact'));
+      expect(strict, strict.join('\n')).toEqual([]);
+      expect(bad.length, bad.join('\n')).toBeLessThanOrEqual(jitterMisses[pose] ?? 0);
+    }, 120_000);
 });
 
 describe('touching pairs side by side across the view', () => {
@@ -600,15 +728,22 @@ describe('touching pairs side by side across the view', () => {
     // Chroma bleed dilates the pairs' masks by about a pixel and the white cue's not at all, so with no
     // coloured single ball in view the frame cannot tell the pairs' dilation; the ring must still not
     // be fitted as extra balls (0.3.0 detector: 6–8 balls for these 5 in the corner view).
+    // Under auto, exact and jittered (±0.3 / ±1 px) calibrations: the chroma ring must not become a ball
+    // whichever side of a threshold the calibration's sub-pixel error puts it (the wave-1 detector put a
+    // phantom on it at 30° with the automatic corners only: its refit trigger sat at a visible-cloth
+    // share of 0.056 against a threshold of 0.08).
     const bad: string[] = [];
     for (const deg of [0, 30, 45, 60, 75, 90]) {
       const sc = pairs(pose, deg);
-      const r = detect(sc, chroma420(render(sc)));
-      const msg = `${deg}°: ${r.balls.length} balls, errors mm ${fmt(r.match.map((m) => m.err * 1000))}, labels ${r.balls.map((b) => b.label).join(',')}`;
-      if (r.balls.length !== 5 || r.fp.length > 0 || r.match.some((m) => m.err > 0.015)) bad.push(msg);
+      const frame = chroma420(render(sc));
+      for (const c of calibrationSet(sc)) {
+        const r = detect(sc, frame, { cal: c.cal, refs: c.refs });
+        const msg = `${deg}° ${c.name}: ${r.balls.length} balls, errors mm ${fmt(r.match.map((m) => m.err * 1000))}, labels ${r.balls.map((b) => b.label).join(',')}`;
+        if (r.balls.length !== 5 || r.fp.length > 0 || r.match.some((m) => m.err > 0.015)) bad.push(msg);
+      }
     }
     expect(bad, bad.join('\n')).toEqual([]);
-  });
+  }, 120_000);
 
   it('640×360 end view, pairs square to the view (exact calibration)', () => {
     // At 640×360 the near cushion is below the frame: the table detector declines the truncated
@@ -864,7 +999,9 @@ describe('per-frame scratch (Constitution IV)', () => {
     // with double arguments (boxed) each cost MBs per frame here (0.3.0: 0.5 MB, with a boxed per-pixel
     // call 7 MB). What remains is per-blob bookkeeping (a few KB).
     const { det, cal } = setup();
-    for (let i = 0; i < 5; i++) detectBalls(frame(), cal, sc.table, det.cloth);
+    // Warm enough for the JIT to settle even when this test runs alone (5 calls: +450–500 KB per call
+    // alone with the wave-1 detector and this one alike, +44 KB after the rest of the file).
+    for (let i = 0; i < 40; i++) detectBalls(frame(), cal, sc.table, det.cloth);
     let maxBuf = -Infinity;
     let maxHeap = -Infinity;
     for (let i = 0; i < 20; i++) {
@@ -879,4 +1016,27 @@ describe('per-frame scratch (Constitution IV)', () => {
     expect(maxBuf).toBeLessThan(64 * 1024);
     expect(maxHeap).toBeLessThan(256 * 1024);
   });
+
+  it('a snooker pack resampled on its own finer window: no typed arrays and < 256 KB of JS heap per call once warm', () => {
+    // The window pass has its own scratch set (grown once, then reused). Measured: +168–172 KB per call
+    // once the JIT has settled (40 warm calls; the first few allocate MBs of boxed doubles while the
+    // code is still unoptimised), as the whole-table pass alone (+143 KB on this frame).
+    const psc = snookerPack('end');
+    const f = render(psc);
+    const det = detectTable(f)!;
+    const cal = calibrationFromCorners(det.corners, psc.table, psc.width, psc.height)!;
+    for (let i = 0; i < 40; i++) detectBalls(f, cal, psc.table, det.cloth);
+    let maxBuf = -Infinity;
+    let maxHeap = -Infinity;
+    for (let i = 0; i < 20; i++) {
+      const m0 = process.memoryUsage();
+      detectBalls(f, cal, psc.table, det.cloth);
+      const m1 = process.memoryUsage();
+      maxBuf = Math.max(maxBuf, m1.arrayBuffers - m0.arrayBuffers);
+      maxHeap = Math.max(maxHeap, m1.heapUsed - m0.heapUsed);
+    }
+    console.log(`detectBalls per call, snooker pack (window pass): ArrayBuffers +${(maxBuf / 1024).toFixed(0)} KB, heap +${(maxHeap / 1024).toFixed(0)} KB (max of 20)`);
+    expect(maxBuf).toBeLessThan(64 * 1024);
+    expect(maxHeap).toBeLessThan(256 * 1024);
+  }, 60_000);
 });

@@ -8,11 +8,16 @@
  *     saturation spread so cloth-hued balls (snooker green, pool 6) still stand out, plus the
  *     white/green blend seams inside a cloth-coloured stripe. Pixels a near cushion hides, and hole-like
  *     (dark) pixels in the pocket throats, are "unknown" (neither ball nor cloth).
- *  3. Connected blobs (small holes filled) → strip long thin attachments (a cue stick) → count and
- *     place balls with a disc model in the de-stretched frame (multi-start, local search; a ball whose
- *     silhouette adds nothing to the blob is not counted; the silhouettes' dilation is measured on
- *     coloured single balls, in image pixels) → fit a circle to each ball's visible silhouette boundary
- *     (occluded and unknown edges excluded).
+ *  3. Connected blobs (small holes filled) → strip long thin attachments (a cue stick; judged on the
+ *     closed silhouette) → count and place balls with a disc model in the de-stretched frame → fit a
+ *     circle to each ball's visible silhouette boundary (occluded and unknown edges excluded). The count
+ *     is a model selection over k: the least whole-cluster residual (uncovered blob + covered cloth,
+ *     the mask sampled once per rectified px along the view) plus a toll per ball, over every count a
+ *     grow-past-the-toll search and a backward elimination visit; insertions start where the residual's
+ *     matched filter peaks; a ball the cluster can do without once its neighbours re-settle is not
+ *     counted. Clusters of ≤ 4 balls with no measured frame dilation are fitted at the sharp-frame and
+ *     the video silhouette size and the size is chosen by that same penalised cost; a pack seen at
+ *     less than RP_FIT px of ball radius is resampled finer in its own window first.
  *  4. Shape gate (fill, aspect, size, shading, width across the view) rejects lamp glare and sticks.
  *  5. Colour: robust hue and brightness (relative to the frame's white through the cloth beside each
  *     ball) named from the table's palette; the cue ball is the whitest COMPLETE ball with a clear
@@ -29,6 +34,10 @@
  *  - a black ball 1R inside a far pocket (its dark pixels merge with the hole) is missed in about a
  *    third of the views, as by the 0.2.x detector;
  *  - on 4:2:0 video a snooker pack in the end and corner views loses 3–5 reds (median error 14–20 mm);
+ *  - in a few of 18 jittered calibrations (±0.3 / ±1 px corners) of the snooker end, side and corner
+ *    views one disc settles on a corner ball's rim while an interior ball goes uncounted, and in the pool
+ *    end views the cloth-coloured green and the black of a pack read as too little of themselves (one
+ *    ball more missed); the auto and exact calibrations are not affected;
  *  - a cue stick crossing the near cushion diagonally (butt raised ≥ 8°) can leave one piece that
  *    passes as a ball.
  *
@@ -148,9 +157,20 @@ const TINT_W = 1.5;
 const CHROMA_DIL = 0.5;
 /** A single blob with more than this share of low-S pixels is a white (or black) ball: luma-bound rim. */
 const WHITE_BLOB = 0.7;
-/** Self-consistency refit: clusters of at most this many balls whose plain-view part is > VIS_CLOTH cloth. */
+/** Clusters of at most this many balls are fitted at both the sharp-frame and the video silhouette size. */
 const SMALL_CLUSTER = 4;
-const VIS_CLOTH = 0.08;
+/**
+ * A cluster is fitted at no less than this ball radius (rectified px). The scale matched to the image
+ * leaves a far snooker pack at 4–5 px, where the outline's scallops between touching balls are ≲ 1 px
+ * deep and the disc fit cannot tell which ball a slice of the outline belongs to (jittered ±0.3 px
+ * corners changed the count by up to 3). Resampled finer, the colour is interpolated before the cloth
+ * test, so the silhouette's edge falls between image pixels and the scallops resolve. Measured on the
+ * ray-traced packs (20 calibrations each): snooker end view at 5.2 px 16 of 20 lose a visible ball, at
+ * 7 px none; corner views of pool racks at 5 px vs 7 px: 13 vs 1 of 20 over today's allowance.
+ */
+const RP_FIT = 7;
+/** Margin (× R) around a deferred cluster's bbox in its window: the ring localClothV reads, plus blur. */
+const WIN_MARGIN = 3;
 /** Most balls one blob may hold (a full snooker pack is 15 reds; a pool rack 15). */
 const K_MAX = 22;
 
@@ -241,6 +261,8 @@ interface Scratch {
   /** Per blob pixel: de-stretched (u, v); owning ball. */
   bcap: number;
   dq: Float64Array;
+  /** Every st-th blob pixel's (u, v): the k-means restarts' sample (KM_PIX at most). */
+  dqs: Float64Array;
   assign: Int32Array;
   dmin: Float64Array;
   /** k-means lower bounds (Hamerly); seeding distances of the two k-means variants. */
@@ -250,6 +272,8 @@ interface Scratch {
   /** Local grids (bbox / de-stretched). */
   gcap: number;
   grid: Uint8Array;
+  /** Fit grid: cost change when a cell becomes covered (cloth − blob samples). */
+  gE: Int8Array;
   dist: Uint16Array;
   dist2: Uint16Array;
   /** Silhouette edge points (u, v). */
@@ -259,12 +283,24 @@ interface Scratch {
 }
 
 let SCRATCH: Scratch | null = null;
+/** A second set for the cluster window pass (the whole-table pass's buffers stay intact). */
+let SCRATCH_W: Scratch | null = null;
 
 function scratchFor(n: number): Scratch {
   if (SCRATCH && SCRATCH.cap >= n) return SCRATCH;
+  SCRATCH = makeScratch(n, SCRATCH);
+  return SCRATCH;
+}
+
+function windowScratchFor(n: number): Scratch {
+  if (SCRATCH_W && SCRATCH_W.cap >= n) return SCRATCH_W;
+  SCRATCH_W = makeScratch(n, SCRATCH_W);
+  return SCRATCH_W;
+}
+
+function makeScratch(n: number, prev: Scratch | null): Scratch {
   const cap = Math.ceil(n * 1.1);
-  const prev = SCRATCH;
-  SCRATCH = {
+  return {
     cap,
     rgb: new Float32Array(cap * 3),
     hue: new Float32Array(cap),
@@ -278,6 +314,7 @@ function scratchFor(n: number): Scratch {
     queue: new Int32Array(cap),
     bcap: prev?.bcap ?? 0,
     dq: prev?.dq ?? new Float64Array(0),
+    dqs: prev?.dqs ?? new Float64Array(0),
     assign: prev?.assign ?? new Int32Array(0),
     dmin: prev?.dmin ?? new Float64Array(0),
     dlo: prev?.dlo ?? new Float64Array(0),
@@ -285,19 +322,20 @@ function scratchFor(n: number): Scratch {
     km1: prev?.km1 ?? new Float64Array(0),
     gcap: prev?.gcap ?? 0,
     grid: prev?.grid ?? new Uint8Array(0),
+    gE: prev?.gE ?? new Int8Array(0),
     dist: prev?.dist ?? new Uint16Array(0),
     dist2: prev?.dist2 ?? new Uint16Array(0),
     ecap: prev?.ecap ?? 0,
     edge: prev?.edge ?? new Float64Array(0),
     eown: prev?.eown ?? new Int32Array(0),
   };
-  return SCRATCH;
 }
 
 function growBlob(S: Scratch, n: number): void {
   if (S.bcap >= n) return;
   S.bcap = Math.ceil(n * 1.5);
   S.dq = new Float64Array(S.bcap * 2);
+  S.dqs = new Float64Array(S.bcap * 2);
   S.assign = new Int32Array(S.bcap);
   S.dmin = new Float64Array(S.bcap);
   S.dlo = new Float64Array(S.bcap);
@@ -309,6 +347,7 @@ function growGrid(S: Scratch, n: number): void {
   if (S.gcap >= n) return;
   S.gcap = Math.ceil(n * 1.5);
   S.grid = new Uint8Array(S.gcap);
+  S.gE = new Int8Array(S.gcap);
   S.dist = new Uint16Array(S.gcap);
   S.dist2 = new Uint16Array(S.gcap);
 }
@@ -334,8 +373,8 @@ const TRIAL = new Float64Array(K_MAX * 2);
 const BEST = new Float64Array(K_MAX * 2);
 const PRE = new Float64Array(K_MAX * 2);
 const SAVE = new Float64Array(K_MAX * 2);
-/** Quality of the last fitDiscs: largest visible-cloth share of a disc (small clusters only). */
-const FITQ = { visCloth: 0 };
+/** The last fitDiscs' penalised whole-cluster cost (cells: residual + toll per ball). */
+const FITQ = { J: 0 };
 const SUMX = new Float64Array(K_MAX);
 const SUMY = new Float64Array(K_MAX);
 const CNT = new Float64Array(K_MAX);
@@ -350,8 +389,9 @@ interface RectGeo {
   w: number;
   h: number;
   scale: number;
-  hx: number;
-  hy: number;
+  /** Table coordinates (m) of the rectified image's top-left corner (row 0 = largest y). */
+  x0: number;
+  y0: number;
 }
 
 function rectGeometry(calib: Calibration, table: TableSpec, opts: BallDetectOptions): RectGeo {
@@ -369,7 +409,7 @@ function rectGeometry(calib: Calibration, table: TableSpec, opts: BallDetectOpti
     const px = Math.max(dd(a, b) / (2 * hx), dd(d, c) / (2 * hx), dd(b, c) / (2 * hy), dd(a, d) / (2 * hy));
     scale = Math.max(150, Math.min(320, px));
   }
-  return { w: Math.round(2 * hx * scale), h: Math.round(2 * hy * scale), scale, hx, hy };
+  return { w: Math.round(2 * hx * scale), h: Math.round(2 * hy * scale), scale, x0: -hx, y0: hy };
 }
 
 /**
@@ -480,17 +520,20 @@ interface RectBuffers {
   unknown: Uint8Array;
 }
 
-function rectifyInto(frame: Frame, calib: Calibration, table: TableSpec, cloth: ClothModel, g: RectGeo, b: RectBuffers): void {
-  const { w, h, scale, hx, hy } = g;
+/** The whole-table pass's cloth saturation statistics, reused by window passes (too little cloth in view). */
+const RSTATS = { sHi: Infinity, sLo: 0 };
+
+function rectifyInto(frame: Frame, calib: Calibration, table: TableSpec, cloth: ClothModel, g: RectGeo, b: RectBuffers, window = false): void {
+  const { w, h, scale, x0, y0 } = g;
   const H = calib.HR;
   const { rgb, hue, sat, val, nonCloth, unknown } = b;
   CLOTH_HIST.fill(0);
   let nCloth = 0;
   // Pass 1: sample, HSV, the loose cloth test; histogram the cloth's S.
   for (let j = 0; j < h; j++) {
-    const Y = hy - (j + 0.5) / scale; // row 0 = +y (far side when viewed from the −y rail)
+    const Y = y0 - (j + 0.5) / scale; // row 0 = +y (far side when viewed from the −y rail)
     for (let i = 0; i < w; i++) {
-      const X = -hx + (i + 0.5) / scale;
+      const X = x0 + (i + 0.5) / scale;
       const ww = H[6]! * X + H[7]! * Y + H[8]!;
       const u = (H[0]! * X + H[1]! * Y + H[2]!) / ww;
       const v = (H[3]! * X + H[4]! * Y + H[5]!) / ww;
@@ -531,8 +574,12 @@ function rectifyInto(frame: Frame, calib: Calibration, table: TableSpec, cloth: 
   // A ball that shares the cloth hue (snooker green on green cloth) is still more saturated than the
   // cloth itself. Shadows keep the cloth's S, so deliberately no darker-than-cloth test; and no
   // brighter-than-cloth test either: it grows lamp glare and the lit rim of white balls.
-  const s95 = histQuantile(CLOTH_HIST, 0, 64, nCloth, 0.95);
-  const sHi = nCloth >= CLOTH_STATS_MIN ? s95 + Math.max(CLOTH_S_MARGIN, 2 * (s95 - histQuantile(CLOTH_HIST, 0, 64, nCloth, 0.5))) : Infinity;
+  if (!window) {
+    const s95 = histQuantile(CLOTH_HIST, 0, 64, nCloth, 0.95);
+    RSTATS.sHi = nCloth >= CLOTH_STATS_MIN ? s95 + Math.max(CLOTH_S_MARGIN, 2 * (s95 - histQuantile(CLOTH_HIST, 0, 64, nCloth, 0.5))) : Infinity;
+    RSTATS.sLo = histQuantile(CLOTH_HIST, 0, 64, nCloth, SEAM_S_Q) - SEAM_S_MARGIN;
+  }
+  const sHi = RSTATS.sHi;
   const nT = fillThroats(calib, table);
   const nC = fillCushions(calib, table, CUSH_MARGIN / scale);
   const camX = calib.camera.x;
@@ -542,14 +589,14 @@ function rectifyInto(frame: Frame, calib: Calibration, table: TableSpec, cloth: 
   // Pass 2: tightened cloth test; pixels hidden by a near cushion, and hole-like pixels in the
   // throats, become unknown.
   for (let j = 0; j < h; j++) {
-    const Y = hy - (j + 0.5) / scale;
+    const Y = y0 - (j + 0.5) / scale;
     for (let i = 0; i < w; i++) {
       const k = j * w + i;
       if (unknown[k]) continue;
       // Hidden by a near cushion? (Inlined: a per-pixel call with double arguments would box them.)
       let hid = false;
       if (nC > 0) {
-        const X = -hx + (i + 0.5) / scale;
+        const X = x0 + (i + 0.5) / scale;
         for (let c = 0; c < nC && !hid; c++) {
           const o = c * 9;
           const d = (X - CUSH[o]!) * CUSH[o + 5]! + (Y - CUSH[o + 1]!) * CUSH[o + 6]!;
@@ -576,7 +623,7 @@ function rectifyInto(frame: Frame, calib: Calibration, table: TableSpec, cloth: 
       // Any saturation: video chroma bleed makes the hole's rim dark but coloured, and a dark ball pixel
       // here is only "unknown", which the fit treats as possibly ball.
       if (nc && vv < darkV) {
-        TXY[0] = -hx + (i + 0.5) / scale;
+        TXY[0] = x0 + (i + 0.5) / scale;
         TXY[1] = Y;
       }
       if (nc && vv < darkV && inThroat(nT)) {
@@ -586,7 +633,7 @@ function rectifyInto(frame: Frame, calib: Calibration, table: TableSpec, cloth: 
       nonCloth[k] = nc;
     }
   }
-  if (Number.isFinite(sHi)) markSeams(w, h, b, cloth, histQuantile(CLOTH_HIST, 0, 64, nCloth, SEAM_S_Q) - SEAM_S_MARGIN, sHi);
+  if (Number.isFinite(sHi)) markSeams(w, h, b, cloth, RSTATS.sLo, sHi);
 }
 
 /**
@@ -665,7 +712,7 @@ export function rectify(frame: Frame, calib: Calibration, table: TableSpec, clot
     unknown: new Uint8Array(n),
   };
   rectifyInto(frame, calib, table, cloth, g, b);
-  return { w: g.w, h: g.h, scale: g.scale, x0: -g.hx, y0: g.hy, rgb: b.rgb, nonCloth: b.nonCloth };
+  return { w: g.w, h: g.h, scale: g.scale, x0: g.x0, y0: g.y0, rgb: b.rgb, nonCloth: b.nonCloth };
 }
 
 // --- per-frame context -----------------------------------------------------------------------------
@@ -695,6 +742,8 @@ interface Ctx {
    */
   dil: number;
   found: Found[];
+  /** Whole-table pass at less than RP_FIT px of ball radius: set clusters aside for the window pass. */
+  defer: boolean;
 }
 
 /** A detection plus internal evidence used for dedupe, cue selection and naming. */
@@ -804,32 +853,18 @@ function chamferDT(D: Uint16Array, gw: number, gh: number): void {
 export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, cloth: ClothModel, opts: BallDetectOptions = {}): DetectedBall[] {
   const R = table.ballRadius;
   const g = rectGeometry(calib, table, opts);
-  const { w, h } = g;
-  const N = w * h;
-  const S = scratchFor(N);
+  const S = scratchFor(g.w * g.h);
   rectifyInto(frame, calib, table, cloth, g, S);
-  const { nonCloth, er, mask, label, queue } = S;
-
-  // Light morphological opening (3×3 cross erosion then dilation) to drop specks. Borders stay 0.
-  for (let j = 0; j < h; j++)
-    for (let i = 0; i < w; i++) {
-      const k = j * w + i;
-      er[k] = j === 0 || i === 0 || j === h - 1 || i === w - 1 ? 0 : nonCloth[k]! & nonCloth[k - 1]! & nonCloth[k + 1]! & nonCloth[k - w]! & nonCloth[k + w]!;
-    }
-  for (let j = 0; j < h; j++)
-    for (let i = 0; i < w; i++) {
-      const k = j * w + i;
-      mask[k] = j === 0 || i === 0 || j === h - 1 || i === w - 1 ? 0 : er[k]! | er[k - 1]! | er[k + 1]! | er[k - w]! | er[k + w]!;
-    }
+  openMask(S, g.w, g.h);
 
   const palette = opts.palette ?? (table.id === 'snooker12' || /snooker/i.test(table.name) ? 'snooker' : 'pool');
   const ctx: Ctx = {
     S,
-    w,
-    h,
+    w: g.w,
+    h: g.h,
     scale: g.scale,
-    x0: -g.hx,
-    y0: g.hy,
+    x0: g.x0,
+    y0: g.y0,
     rp: R * g.scale,
     R,
     cam: calib.camera,
@@ -842,68 +877,11 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
     focal: calib.focal,
     dil: NaN,
     found: [],
+    defer: R * g.scale < RP_FIT,
   };
 
   // Pass 1: connected components (4-connected) with their area and second moments.
-  label.fill(0, 0, N);
-  let nComp = 0;
-  for (let s = 0; s < N; s++) {
-    if (!mask[s] || label[s]) continue;
-    const lab = ctx.next++;
-    let head = 0;
-    let tail = 0;
-    queue[tail++] = s;
-    label[s] = lab;
-    let si = 0;
-    let sj = 0;
-    let sii = 0;
-    let sjj = 0;
-    let sij = 0;
-    let clothLike = 0;
-    let whiteLike = 0;
-    while (head < tail) {
-      const k = queue[head++]!;
-      const i = k % w;
-      const j = (k - i) / w;
-      si += i;
-      sj += j;
-      sii += i * i;
-      sjj += j * j;
-      sij += i * j;
-      const sk = S.sat[k]!;
-      if (sk > 0.4 && hueDiff(S.hue[k]!, cloth.hue) < 30) clothLike++;
-      else if (sk < 0.25) whiteLike++;
-      if (i > 0 && mask[k - 1] && !label[k - 1]) {
-        label[k - 1] = lab;
-        queue[tail++] = k - 1;
-      }
-      if (i < w - 1 && mask[k + 1] && !label[k + 1]) {
-        label[k + 1] = lab;
-        queue[tail++] = k + 1;
-      }
-      if (k >= w && mask[k - w] && !label[k - w]) {
-        label[k - w] = lab;
-        queue[tail++] = k - w;
-      }
-      if (k + w < N && mask[k + w] && !label[k + w]) {
-        label[k + w] = lab;
-        queue[tail++] = k + w;
-      }
-    }
-    growComps(nComp + 1);
-    const o = nComp * COMP_STRIDE;
-    COMPS[o] = s;
-    COMPS[o + 1] = lab;
-    COMPS[o + 2] = tail;
-    COMPS[o + 3] = si;
-    COMPS[o + 4] = sj;
-    COMPS[o + 5] = sii;
-    COMPS[o + 6] = sjj;
-    COMPS[o + 7] = sij;
-    COMPS[o + 8] = clothLike / tail;
-    COMPS[o + 9] = whiteLike / tail;
-    nComp++;
-  }
+  const nComp = labelComponents(ctx);
   // The frame's silhouette dilation: median over coloured single-ball-like blobs of (effective
   // de-stretched radius − R), in image px (it is image blur and chroma bleed: a far blob's rectified
   // silhouette is dilated by more rectified px). Video chroma bleed dilates coloured silhouettes by
@@ -922,40 +900,12 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
     DILS.subarray(0, nd).sort();
     ctx.dil = Math.max(-1, Math.min(2, nd & 1 ? DILS[nd >> 1]! : (DILS[(nd >> 1) - 1]! + DILS[nd >> 1]!) / 2));
   }
-  // Pass 2: process each component.
-  for (let c = 0; c < nComp; c++) {
-    const o = c * COMP_STRIDE;
-    const n = COMPS[o + 2]!;
-    if (n < MIN_BLOB * Math.PI * ctx.rp * ctx.rp) continue;
-    const lab = COMPS[o + 1]!;
-    let head = 0;
-    let tail = 0;
-    queue[tail++] = COMPS[o]!;
-    const seen = -lab - 2; // temporary mark while collecting (restored below)
-    label[COMPS[o]!] = seen;
-    while (head < tail) {
-      const k = queue[head++]!;
-      const i = k % w;
-      if (i > 0 && label[k - 1] === lab) {
-        label[k - 1] = seen;
-        queue[tail++] = k - 1;
-      }
-      if (i < w - 1 && label[k + 1] === lab) {
-        label[k + 1] = seen;
-        queue[tail++] = k + 1;
-      }
-      if (k >= w && label[k - w] === lab) {
-        label[k - w] = seen;
-        queue[tail++] = k - w;
-      }
-      if (k + w < N && label[k + w] === lab) {
-        label[k + w] = seen;
-        queue[tail++] = k + w;
-      }
-    }
-    for (let q = 0; q < tail; q++) label[queue[q]!] = lab;
-    processComponent(ctx, tail, lab);
-  }
+  // Pass 2: process each component. A cluster seen at less than RP_FIT px of ball radius is set aside
+  // (DEFER) and fitted on a finer resampling of its own window (Pass 3).
+  NDEFER = 0;
+  processComponents(ctx, nComp, null, 0);
+  const nDefer = NDEFER;
+  for (let d = 0; d < nDefer; d++) windowPass(ctx, frame, calib, table, cloth, d);
 
   // De-duplicate across blobs only (a blob cut in two by the opening, or chroma bleed): two real balls
   // can't be closer than ~2R. Centres split from one blob are never merged here (the split already
@@ -1017,6 +967,193 @@ function growComps(n: number): void {
   next.set(COMPS);
   COMPS = next;
   DILS = new Float64Array(n * 2);
+}
+
+/** Light morphological opening of nonCloth into mask (3×3 cross erosion then dilation): drops specks. Borders stay 0. */
+function openMask(S: Scratch, w: number, h: number): void {
+  const { nonCloth, er, mask } = S;
+  for (let j = 0; j < h; j++)
+    for (let i = 0; i < w; i++) {
+      const k = j * w + i;
+      er[k] = j === 0 || i === 0 || j === h - 1 || i === w - 1 ? 0 : nonCloth[k]! & nonCloth[k - 1]! & nonCloth[k + 1]! & nonCloth[k - w]! & nonCloth[k + w]!;
+    }
+  for (let j = 0; j < h; j++)
+    for (let i = 0; i < w; i++) {
+      const k = j * w + i;
+      mask[k] = j === 0 || i === 0 || j === h - 1 || i === w - 1 ? 0 : er[k]! | er[k - 1]! | er[k + 1]! | er[k - w]! | er[k + w]!;
+    }
+}
+
+/** Label the 4-connected components of ctx's mask; records each one's start, label, area and moments in COMPS. */
+function labelComponents(ctx: Ctx): number {
+  const { S, w, h } = ctx;
+  const N = w * h;
+  const { mask, label, queue } = S;
+  label.fill(0, 0, N);
+  let nComp = 0;
+  for (let s = 0; s < N; s++) {
+    if (!mask[s] || label[s]) continue;
+    const lab = ctx.next++;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = s;
+    label[s] = lab;
+    let si = 0;
+    let sj = 0;
+    let sii = 0;
+    let sjj = 0;
+    let sij = 0;
+    let clothLike = 0;
+    let whiteLike = 0;
+    while (head < tail) {
+      const k = queue[head++]!;
+      const i = k % w;
+      const j = (k - i) / w;
+      si += i;
+      sj += j;
+      sii += i * i;
+      sjj += j * j;
+      sij += i * j;
+      const sk = S.sat[k]!;
+      if (sk > 0.4 && hueDiff(S.hue[k]!, ctx.clothHue) < 30) clothLike++;
+      else if (sk < 0.25) whiteLike++;
+      if (i > 0 && mask[k - 1] && !label[k - 1]) {
+        label[k - 1] = lab;
+        queue[tail++] = k - 1;
+      }
+      if (i < w - 1 && mask[k + 1] && !label[k + 1]) {
+        label[k + 1] = lab;
+        queue[tail++] = k + 1;
+      }
+      if (k >= w && mask[k - w] && !label[k - w]) {
+        label[k - w] = lab;
+        queue[tail++] = k - w;
+      }
+      if (k + w < N && mask[k + w] && !label[k + w]) {
+        label[k + w] = lab;
+        queue[tail++] = k + w;
+      }
+    }
+    growComps(nComp + 1);
+    const o = nComp * COMP_STRIDE;
+    COMPS[o] = s;
+    COMPS[o + 1] = lab;
+    COMPS[o + 2] = tail;
+    COMPS[o + 3] = si;
+    COMPS[o + 4] = sj;
+    COMPS[o + 5] = sii;
+    COMPS[o + 6] = sjj;
+    COMPS[o + 7] = sij;
+    COMPS[o + 8] = clothLike / tail;
+    COMPS[o + 9] = whiteLike / tail;
+    nComp++;
+  }
+  return nComp;
+}
+
+/**
+ * Collect each component's pixels into queue[0..n) and process it. With `owner` (a window pass), only a
+ * component whose pixels mostly lie on the deferred blob `ownLab` of the whole-table pass is processed.
+ */
+function processComponents(ctx: Ctx, nComp: number, owner: Ctx | null, ownLab: number): void {
+  const { S, w, h } = ctx;
+  const N = w * h;
+  const { label, queue } = S;
+  for (let c = 0; c < nComp; c++) {
+    const o = c * COMP_STRIDE;
+    const n = COMPS[o + 2]!;
+    if (n < MIN_BLOB * Math.PI * ctx.rp * ctx.rp) continue;
+    const lab = COMPS[o + 1]!;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = COMPS[o]!;
+    const seen = -lab - 2; // temporary mark while collecting (restored below)
+    label[COMPS[o]!] = seen;
+    while (head < tail) {
+      const k = queue[head++]!;
+      const i = k % w;
+      if (i > 0 && label[k - 1] === lab) {
+        label[k - 1] = seen;
+        queue[tail++] = k - 1;
+      }
+      if (i < w - 1 && label[k + 1] === lab) {
+        label[k + 1] = seen;
+        queue[tail++] = k + 1;
+      }
+      if (k >= w && label[k - w] === lab) {
+        label[k - w] = seen;
+        queue[tail++] = k - w;
+      }
+      if (k + w < N && label[k + w] === lab) {
+        label[k + w] = seen;
+        queue[tail++] = k + w;
+      }
+    }
+    for (let q = 0; q < tail; q++) label[queue[q]!] = lab;
+    if (owner) {
+      let on = 0;
+      for (let q = 0; q < tail; q++) {
+        const k = queue[q]!;
+        const i = k % w;
+        const j = (k - i) / w;
+        const i1 = Math.floor((ctx.x0 + (i + 0.5) / ctx.scale - owner.x0) * owner.scale);
+        const j1 = Math.floor((owner.y0 - (ctx.y0 - (j + 0.5) / ctx.scale)) * owner.scale);
+        if (i1 >= 0 && j1 >= 0 && i1 < owner.w && j1 < owner.h && owner.S.label[j1 * owner.w + i1] === ownLab) on++;
+      }
+      if (2 * on < tail) continue;
+    }
+    processComponent(ctx, tail, lab);
+  }
+}
+
+/** Clusters set aside by the whole-table pass: label and pixel bbox (minI, maxI, minJ, maxJ). */
+const DEFER = new Float64Array(64 * 5);
+let NDEFER = 0;
+
+/**
+ * Pass 3 for deferred cluster d: resample its window (bbox plus 3R, clipped to the table) at the scale
+ * that gives RP_FIT px of ball radius, and detect its balls there with the whole-table pass's cloth
+ * statistics and frame dilation. Results join ctx.found.
+ */
+function windowPass(ctx: Ctx, frame: Frame, calib: Calibration, table: TableSpec, cloth: ClothModel, d: number): void {
+  const o = d * 5;
+  const lab = DEFER[o]!;
+  const sc = ctx.scale;
+  const scale2 = sc * (RP_FIT / ctx.rp);
+  const m = WIN_MARGIN * ctx.R;
+  const X0 = Math.max(ctx.x0, ctx.x0 + DEFER[o + 1]! / sc - m);
+  const X1 = Math.min(ctx.x0 + ctx.w / sc, ctx.x0 + (DEFER[o + 2]! + 1) / sc + m);
+  const Y1 = Math.min(ctx.y0, ctx.y0 - DEFER[o + 3]! / sc + m);
+  const Y0 = Math.max(ctx.y0 - ctx.h / sc, ctx.y0 - (DEFER[o + 4]! + 1) / sc - m);
+  const g2: RectGeo = { w: Math.max(3, Math.ceil((X1 - X0) * scale2)), h: Math.max(3, Math.ceil((Y1 - Y0) * scale2)), scale: scale2, x0: X0, y0: Y1 };
+  const S2 = windowScratchFor(g2.w * g2.h);
+  rectifyInto(frame, calib, table, cloth, g2, S2, true);
+  openMask(S2, g2.w, g2.h);
+  // Same field order as detectBalls' context (one object shape for every Ctx).
+  const c2: Ctx = {
+    S: S2,
+    w: g2.w,
+    h: g2.h,
+    scale: scale2,
+    x0: X0,
+    y0: Y1,
+    rp: ctx.R * scale2,
+    R: ctx.R,
+    cam: ctx.cam,
+    table: ctx.table,
+    clothHue: ctx.clothHue,
+    clothVal: ctx.clothVal,
+    HR: ctx.HR,
+    swatches: ctx.swatches,
+    next: ctx.next,
+    focal: ctx.focal,
+    dil: ctx.dil,
+    found: ctx.found,
+    defer: false,
+  };
+  const n2 = labelComponents(c2);
+  processComponents(c2, n2, ctx, lab);
+  ctx.next = c2.next;
 }
 
 /**
@@ -1189,12 +1326,45 @@ function stripThin(ctx: Ctx, n: number, lab: number, minI: number, maxI: number,
   growGrid(S, gn);
   const D = S.dist;
   const E = S.dist2;
-  D.fill(0, 0, gn);
+  const G = S.grid;
+  G.fill(0, 0, gn);
   for (let q = 0; q < n; q++) {
     const k = queue[q]!;
     const i = k % w;
-    D[((k - i) / w - minJ + 1) * gw + (i - minI + 1)] = BIG;
+    G[((k - i) / w - minJ + 1) * gw + (i - minI + 1)] = 1;
   }
+  // Thinness is judged on the closed silhouette (3×3 closing): the saturation test leaves 1–2 px
+  // cloth-classified cracks across a cloth-hued ball (its lit and shaded parts desaturate toward the
+  // cloth's S), which would cut it into strips that read as a stick and get stripped. A stick stays
+  // thin when closed; only original blob pixels are ever stripped.
+  for (let y = 0; y < gh; y++)
+    for (let x = 0; x < gw; x++) {
+      let any = 0;
+      for (let dy = -1; dy <= 1 && !any; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx >= 0 && yy >= 0 && xx < gw && yy < gh && G[yy * gw + xx]) {
+            any = 1;
+            break;
+          }
+        }
+      E[y * gw + x] = any;
+    }
+  for (let y = 0; y < gh; y++)
+    for (let x = 0; x < gw; x++) {
+      let all = 1;
+      for (let dy = -1; dy <= 1 && all; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= gw || yy >= gh || !E[yy * gw + xx]) {
+            all = 0;
+            break;
+          }
+        }
+      D[y * gw + x] = all || G[y * gw + x] ? BIG : 0;
+    }
   chamferDT(D, gw, gh);
   // Core: farther than r px from the border; regrow by r (a disc opening, chamfer-approximated).
   for (let c = 0; c < gn; c++) E[c] = D[c]! > 3 * r ? 0 : BIG;
@@ -1354,24 +1524,49 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
   const aspect = Math.sqrt(saa / Math.max(1e-9, spp));
   const ratio = (cnt * sinEl) / (Math.PI * rp * rp);
   const single = !truncated && ratio >= 0.6 && ratio <= 1.6 && Math.abs(aspect * sinEl - 1) <= 0.2;
+  if (ctx.defer && kArea >= 3 && NDEFER < 64) {
+    // A pack at too few px per ball: fitted on its own finer window (windowPass).
+    let minI = w;
+    let maxI = 0;
+    let minJ = h;
+    let maxJ = 0;
+    for (let q = 0; q < cnt; q++) {
+      const k = queue[start + q]!;
+      const i = k % w;
+      const j = (k - i) / w;
+      if (i < minI) minI = i;
+      if (i > maxI) maxI = i;
+      if (j < minJ) minJ = j;
+      if (j > maxJ) maxJ = j;
+    }
+    const o = NDEFER * 5;
+    DEFER[o] = lab;
+    DEFER[o + 1] = minI;
+    DEFER[o + 2] = maxI;
+    DEFER[o + 3] = minJ;
+    DEFER[o + 4] = maxJ;
+    NDEFER++;
+    return;
+  }
   const rho = pxPerImagePx(ctx, cx, cy);
   const known = Number.isFinite(ctx.dil);
   const dil = single ? Math.max(-1, Math.min(2, Math.sqrt((cnt * sinEl) / Math.PI) - rp)) : known ? Math.max(-1, Math.min(2.5, ctx.dil * rho)) : 0;
   let rad = rp + dil;
   let k = fitDiscs(ctx, cnt, lab, cx, cy, ax, ay, sinEl, uMin, uMax, vMin, vMax, rad);
-  if (!single && !known && !truncated && k > 1 && k <= SMALL_CLUSTER && FITQ.visCloth > VIS_CLOTH) {
+  if (!single && !known && !truncated && k > 1 && k <= SMALL_CLUSTER) {
     // The frame has no coloured single ball to measure its dilation by (a lone cue ball and touching
-    // pairs), and the fit at the sharp-frame size is not self-consistent: some ball's part in plain
-    // view lies on cloth. That is what too-small discs on a dilated (video chroma) silhouette do: they
-    // put extra balls on the ring and push the real ones off centre. Refit at the 4:2:0-video size and
-    // keep it if it needs fewer balls or is more consistent (larger discs show a little more cloth at
-    // their rims, so that is compared only at equal counts). Packs are left alone: their half-hidden
-    // balls show only as slivers, and the shared outline fits tightly.
-    const c0 = FITQ.visCloth;
+    // pairs). Sharp frames dilate coloured silhouettes by ≈ 0.3–0.4 image px, video (4:2:0 chroma) by
+    // ≈ 0.45–0.65: too-small discs on a video silhouette put extra balls on its ring and push the real
+    // ones off centre, too-large ones on a sharp silhouette merge a row seen end-on. Fit at both sizes
+    // and choose by the penalised whole-cluster cost; the frame's dilation is then one more fitted
+    // parameter, so the video size must win by one more toll (measured on the fixtures under ±0.3/±1 px
+    // corner jitter: sharp 3-ball row end-on, the video size is ahead by 2–15 cells, toll 16.5; video
+    // pairs, by 17–57, toll 7.9–16.5). No knife-edge trigger: both fits always run.
+    const J0 = FITQ.J;
     SAVE.set(BEST.subarray(0, k * 2));
     const rad1 = rp + Math.min(1.5, CHROMA_DIL * rho);
     const k1 = fitDiscs(ctx, cnt, lab, cx, cy, ax, ay, sinEl, uMin, uMax, vMin, vMax, rad1);
-    if (k1 < k || (k1 === k && FITQ.visCloth < c0)) {
+    if (FITQ.J + discToll(ctx) < J0) {
       k = k1;
       rad = rad1;
     } else BEST.set(SAVE.subarray(0, k * 2));
@@ -1472,10 +1667,12 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
  * (its half-chord there is ≥ 0.95R; a white ball's mask erodes by ≲ 0.1R); a cue butt (≤ 15 mm radius,
  * ≲ 1.2× magnified when raised above the ball-centre plane, plus ~1 px of chroma) reaches ≲ 0.76R.
  * Each side, and the centre line, needs 2 of its 3 samples. The flank samples sit half a pixel
- * further in: a white ball's mask erodes by about that on video (chroma pulled toward the cloth).
+ * further in: a white ball's mask erodes by about that on video (chroma pulled toward the cloth). A
+ * sample counts when it is in the silhouette's 3×3 closing (inClosed): a 1–2 px cloth-classified crack
+ * across a cloth-hued ball is not its edge, while closing leaves a straight stick's width unchanged.
  */
 function wideAcross(ctx: Ctx, xr: number, yr: number, ax: number, ay: number, sinEl: number): boolean {
-  const { S, w, h, rp } = ctx;
+  const { w, h, rp } = ctx;
   const bx = -ay;
   const by = ax;
   // side −1 / +1: the two flanks; side 0: the centre line itself (a ball's centre is inside it).
@@ -1490,11 +1687,30 @@ function wideAcross(ctx: Ctx, xr: number, yr: number, ax: number, ay: number, si
         ok++;
         continue;
       }
-      const k = j * w + i;
-      if (S.mask[k] || S.unknown[k] || S.label[k] === -1) ok++;
+      if (inClosed(ctx, i, j)) ok++;
     }
     if (ok < 2) return false;
   }
+  return true;
+}
+
+/** Silhouette (any ball, unknown, or a stripped part) at rectified pixel (i, j)? Outside the frame: yes. */
+function silAt(ctx: Ctx, i: number, j: number): boolean {
+  if (i < 0 || j < 0 || i >= ctx.w || j >= ctx.h) return true;
+  const S = ctx.S;
+  const k = j * ctx.w + i;
+  return S.mask[k] !== 0 || S.unknown[k] !== 0 || S.label[k] === -1;
+}
+
+/** Is (i, j) in the 3×3 closing of the silhouette: every 3×3 neighbour has silhouette within its own 3×3? */
+function inClosed(ctx: Ctx, i: number, j: number): boolean {
+  if (silAt(ctx, i, j)) return true;
+  for (let dy = -1; dy <= 1; dy++)
+    for (let dx = -1; dx <= 1; dx++) {
+      let near = false;
+      for (let ey = -1; ey <= 1 && !near; ey++) for (let ex = -1; ex <= 1 && !near; ex++) near = silAt(ctx, i + dx + ex, j + dy + ey);
+      if (!near) return false;
+    }
   return true;
 }
 
@@ -1550,6 +1766,20 @@ const GTRY = new Int32Array(K_MAX * 2);
 const DISC_MIN_BLOB = 0.4;
 /** Penalty (cells) per px that two centres are closer than the 1.7R minimum. */
 const SEP_W = 40;
+/** Most mask samples per fit cell along the view (one per rectified px up to a 1/4 de-stretch). */
+const NS_MAX = 4;
+/** Most pixels the k-means restarts of the disc fit look at (a regular subsample of a larger blob). */
+const KM_PIX = 700;
+/**
+ * Search over the count (fitDiscs): grow while one more disc saves at least GROW_FRAC of the toll, and
+ * at most GROW_PAST discs beyond the first count where it no longer paid the whole toll; then prune
+ * back down to PRUNE_BELOW below that count. Every count on the way is kept for the model selection.
+ * Each insertion tries the deepest uncovered cell and the N_PEAKS − 1 best residual peaks.
+ */
+const GROW_FRAC = 0.25;
+const GROW_PAST = 3;
+const PRUNE_BELOW = 2;
+const N_PEAKS = 4;
 
 interface DiscGrid {
   gw: number;
@@ -1560,11 +1790,15 @@ interface DiscGrid {
   r2: number;
   sinEl: number;
   minSep: number;
+  /** The hard floor MIN_SEP_SPLIT·R (table-metric px). */
+  hardSep: number;
+  /** Mask samples per cell (along the view): costs are in samples. */
+  ns: number;
 }
-const DG: DiscGrid = { gw: 0, gh: 0, u0: 0, v0: 0, ri: 0, r2: 0, sinEl: 1, minSep: 0 };
+const DG: DiscGrid = { gw: 0, gh: 0, u0: 0, v0: 0, ri: 0, r2: 0, sinEl: 1, minSep: 0, hardSep: 0, ns: 1 };
 
 /** Cost change of moving a disc from cell (au, av) to (bu, bv); applies the coverage change if asked. */
-function moveDelta(G: Uint8Array, COV: Uint16Array, au: number, av: number, bu: number, bv: number, apply: boolean): number {
+function moveDelta(E: Int8Array, COV: Uint16Array, au: number, av: number, bu: number, bv: number, apply: boolean): number {
   const { gw, ri, r2 } = DG;
   let d = 0;
   const x0 = Math.min(au, bu) - ri;
@@ -1577,13 +1811,12 @@ function moveDelta(G: Uint8Array, COV: Uint16Array, au: number, av: number, bu: 
       const inB = (x - bu) * (x - bu) + (y - bv) * (y - bv) <= r2;
       if (inA === inB) continue;
       const c = y * gw + x;
-      const t = G[c]!;
       const n = COV[c]!;
       if (inA) {
-        if (n === 1) d += t & 1 ? 1 : t & 2 ? 0 : -1;
+        if (n === 1) d -= E[c]!;
         if (apply) COV[c] = n - 1;
       } else {
-        if (n === 0) d += t & 1 ? -1 : t & 2 ? 0 : 1;
+        if (n === 0) d += E[c]!;
         if (apply) COV[c] = n + 1;
       }
     }
@@ -1640,26 +1873,25 @@ function buildMoves(): boolean {
 }
 
 /** moveDelta through the move table (same cells, same result). */
-function moveDeltaT(G: Uint8Array, COV: Uint16Array, au: number, av: number, type: number, apply: boolean): number {
+function moveDeltaT(E: Int8Array, COV: Uint16Array, au: number, av: number, type: number, apply: boolean): number {
   const gw = DG.gw;
   let d = 0;
   const e1 = MSTART[type + 1]!;
   for (let e = MSTART[type]!; e < e1; e++) {
     const c = (av + MOFF[e * 3 + 1]!) * gw + au + MOFF[e * 3]!;
-    const t = G[c]!;
     const n = COV[c]!;
     if (MOFF[e * 3 + 2]! < 0) {
-      if (n === 1) d += t & 1 ? 1 : t & 2 ? 0 : -1;
+      if (n === 1) d -= E[c]!;
       if (apply) COV[c] = n - 1;
     } else {
-      if (n === 0) d += t & 1 ? -1 : t & 2 ? 0 : 1;
+      if (n === 0) d += E[c]!;
       if (apply) COV[c] = n + 1;
     }
   }
   return d;
 }
 
-/** Separation penalty of centre m at cell (gi, gj) against the other k−1 centres in GC. */
+/** Separation penalty (samples) of centre m at cell (gi, gj) against the other k−1 centres in GC. */
 function sepPenalty(k: number, m: number, gi: number, gj: number): number {
   let p = 0;
   for (let j = 0; j < k; j++) {
@@ -1667,9 +1899,21 @@ function sepPenalty(k: number, m: number, gi: number, gj: number): number {
     const du = (gi - GC[j * 2]!) / DG.sinEl;
     const dv = gj - GC[j * 2 + 1]!;
     const d = Math.sqrt(du * du + dv * dv);
-    if (d < DG.minSep) p += SEP_W * (DG.minSep - d);
+    if (d < DG.minSep) p += SEP_W * DG.ns * (DG.minSep - d);
   }
   return p;
+}
+
+/** Are any two of the k centres in GC closer than MIN_SEP_SPLIT·R on the table (the hard floor)? */
+function tooClose(k: number): boolean {
+  const lim2 = DG.hardSep * DG.hardSep;
+  for (let a = 0; a < k; a++)
+    for (let b = a + 1; b < k; b++) {
+      const du = (GC[a * 2]! - GC[b * 2]!) / DG.sinEl;
+      const dv = GC[a * 2 + 1]! - GC[b * 2 + 1]!;
+      if (du * du + dv * dv < lim2) return true;
+    }
+  return false;
 }
 
 /** Rebuild coverage for the k centres in GC; returns the full cost (uncovered + phantom + penalty). */
@@ -1684,13 +1928,9 @@ function coverAll(S: Scratch, k: number): number {
     for (let dj = -ri; dj <= ri; dj++)
       for (let di = -ri; di <= ri; di++) if (di * di + dj * dj <= r2) COV[(gj + dj) * gw + gi + di]! += 1;
   }
+  const E = S.gE;
   let cost = 0;
-  for (let c = 0; c < gw * gh; c++) {
-    const t = G[c]!;
-    if (t & 1) {
-      if (COV[c] === 0) cost++;
-    } else if (!(t & 2) && COV[c]! > 0) cost++;
-  }
+  for (let c = 0; c < gw * gh; c++) cost += COV[c]! > 0 ? G[c]! + E[c]! : G[c]!;
   for (let m = 0; m < k; m++) cost += sepPenalty(k, m, GC[m * 2]!, GC[m * 2 + 1]!) / 2;
   return cost;
 }
@@ -1704,22 +1944,19 @@ function removeDelta(S: Scratch, gi: number, gj: number, apply: boolean): number
       if (di * di + dj * dj > r2) continue;
       const c = (gj + dj) * gw + gi + di;
       const n = S.dist[c]!;
-      if (n === 1) {
-        const t = S.grid[c]!;
-        d += t & 1 ? 1 : t & 2 ? 0 : -1;
-      }
+      if (n === 1) d -= S.gE[c]!;
       if (apply) S.dist[c] = n - 1;
     }
   return d;
 }
 
-/** Blob cells under a disc centred on grid cell (gi, gj). */
+/** Blob cells under a disc centred on grid cell (gi, gj) (blob samples / samples per cell). */
 function discBlobCells(S: Scratch, gi: number, gj: number): number {
   const { gw, ri, r2 } = DG;
   let n = 0;
   for (let dj = -ri; dj <= ri; dj++)
-    for (let di = -ri; di <= ri; di++) if (di * di + dj * dj <= r2 && S.grid[(gj + dj) * gw + gi + di]! & 1) n++;
-  return n;
+    for (let di = -ri; di <= ri; di++) if (di * di + dj * dj <= r2) n += S.grid[(gj + dj) * gw + gi + di]!;
+  return n / DG.ns;
 }
 
 /**
@@ -1738,6 +1975,11 @@ function localSearch(S: Scratch, k: number, focus: number, sweeps = 10): number 
         const du = GC[m * 2]! - GC[focus * 2]!;
         const dv = GC[m * 2 + 1]! - GC[focus * 2 + 1]!;
         if (du * du + dv * dv > near2) continue;
+      } else if (focus === FOCUS_POINT) {
+        // Only the centres around a point (where a disc was just removed).
+        const du = GC[m * 2]! - FOC[0]!;
+        const dv = GC[m * 2 + 1]! - FOC[1]!;
+        if (du * du + dv * dv > near2) continue;
       }
       // The separation penalty where centre m stands now (recomputed only when it moves).
       let pa = sepPenalty(k, m, GC[m * 2]!, GC[m * 2 + 1]!);
@@ -1751,15 +1993,15 @@ function localSearch(S: Scratch, k: number, focus: number, sweeps = 10): number 
           const bv = av + dv;
           if (bu < ri || bv < ri || bu > gw - 1 - ri || bv > gh - 1 - ri) continue;
           const type = (2 - step) * 8 + dir;
-          const cov = tables ? moveDeltaT(S.grid, S.dist, au, av, type, false) : moveDelta(S.grid, S.dist, au, av, bu, bv, false);
+          const cov = tables ? moveDeltaT(S.gE, S.dist, au, av, type, false) : moveDelta(S.gE, S.dist, au, av, bu, bv, false);
           // The new penalty is ≥ 0, so a move that does not pay even without it cannot pay with it.
           if (cov - pa >= -1e-9) continue;
           const pb = sepPenalty(k, m, bu, bv);
           const d = cov + pb - pa;
           if (d < -1e-9) {
             pa = pb;
-            if (tables) moveDeltaT(S.grid, S.dist, au, av, type, true);
-            else moveDelta(S.grid, S.dist, au, av, bu, bv, true);
+            if (tables) moveDeltaT(S.gE, S.dist, au, av, type, true);
+            else moveDelta(S.gE, S.dist, au, av, bu, bv, true);
             GC[m * 2] = bu;
             GC[m * 2 + 1] = bv;
             total += d;
@@ -1778,7 +2020,7 @@ function deepestUncovered(S: Scratch): number {
   const D = S.dist2;
   const G = S.grid;
   const COV = S.dist;
-  for (let c = 0; c < gw * gh; c++) D[c] = G[c]! & 1 && COV[c] === 0 ? BIG : 0;
+  for (let c = 0; c < gw * gh; c++) D[c] = 2 * G[c]! >= DG.ns && COV[c] === 0 ? BIG : 0;
   chessboardDT(D, gw, gh);
   let best = -1;
   let bd = 0;
@@ -1790,38 +2032,82 @@ function deepestUncovered(S: Scratch): number {
   return best;
 }
 
+/** Insertion candidates: cells of PEAKS[0..n). */
+const PEAKS = new Int32Array(8);
+/** Disc half-width per row offset (index dv + ri) for the fit's disc; row prefix sums; gain map. */
+const HW = new Int32Array(64);
+let ROWSUM = new Int32Array(0);
+let GAINMAP = new Int32Array(0);
+
 /**
- * Occlusion self-consistency of the current fit (centres in GC): the part of a ball no nearer ball
- * hides is in plain view, so it must be ball (or unknown), not cloth. Returns the largest share of
- * known cloth over the visible part of any disc.
+ * Insertion candidates: the residual (uncovered blob +1, uncovered known cloth −1, else 0) summed over a
+ * disc at every centre, i.e. what one more disc would gain before anything moves (a matched filter of
+ * the residual, by row prefix sums: O(cells · disc diameter)). Up to `max` peaks, each more than a disc
+ * radius from the others, with a positive gain go to PEAKS. A disc wedged between two balls leaves a
+ * pocket on each side; the deepest uncovered cell alone may be a cloth-hued ball's sliver elsewhere.
  */
-function maxVisibleCloth(S: Scratch, k: number): number {
-  const { gw, ri, r2 } = DG;
-  let worst = 0;
-  for (let m = 0; m < k; m++) {
-    const mu = GC[m * 2]!;
-    const mv = GC[m * 2 + 1]!;
-    let vis = 0;
-    let cl = 0;
-    for (let dj = -ri; dj <= ri; dj++)
-      for (let di = -ri; di <= ri; di++) {
-        if (di * di + dj * dj > r2) continue;
-        const gi = mu + di;
-        const gj = mv + dj;
-        let hidden = false;
-        for (let o = 0; o < k && !hidden; o++) {
-          if (o === m || GC[o * 2]! >= mu) continue; // only a nearer ball (smaller u) can hide it
-          const ei = gi - GC[o * 2]!;
-          const ej = gj - GC[o * 2 + 1]!;
-          if (ei * ei + ej * ej <= r2) hidden = true;
-        }
-        if (hidden) continue;
-        vis++;
-        if (!(S.grid[gj * gw + gi]! & 3)) cl++;
-      }
-    if (vis > 0 && cl / vis > worst) worst = cl / vis;
+function residualPeaks(S: Scratch, first: number, max: number): number {
+  const { gw, gh, ri, r2 } = DG;
+  const COV = S.dist;
+  const n = gw * gh;
+  if (ROWSUM.length < (gw + 1) * gh) ROWSUM = new Int32Array(Math.ceil((gw + 1) * gh * 1.5));
+  if (GAINMAP.length < n) GAINMAP = new Int32Array(Math.ceil(n * 1.5));
+  for (let dv = -ri; dv <= ri; dv++) HW[dv + ri] = Math.floor(Math.sqrt(Math.max(0, r2 - dv * dv)) + 1e-9);
+  for (let y = 0; y < gh; y++) {
+    let acc = 0;
+    const o = y * (gw + 1);
+    ROWSUM[o] = 0;
+    for (let x = 0; x < gw; x++) {
+      const c = y * gw + x;
+      if (COV[c] === 0) acc -= S.gE[c]!;
+      ROWSUM[o + x + 1] = acc;
+    }
   }
-  return worst;
+  GAINMAP.fill(0, 0, n);
+  for (let y = ri; y < gh - ri; y++)
+    for (let x = ri; x < gw - ri; x++) {
+      let s = 0;
+      for (let dv = -ri; dv <= ri; dv++) {
+        const hw = HW[dv + ri]!;
+        const o = (y + dv) * (gw + 1);
+        s += ROWSUM[o + x + hw + 1]! - ROWSUM[o + x - hw]!;
+      }
+      GAINMAP[y * gw + x] = s;
+    }
+  for (let p = 0; p < first; p++) {
+    const pu = PEAKS[p]! % gw;
+    const pv = (PEAKS[p]! - pu) / gw;
+    for (let y = Math.max(0, pv - ri); y <= Math.min(gh - 1, pv + ri); y++) for (let x = Math.max(0, pu - ri); x <= Math.min(gw - 1, pu + ri); x++) GAINMAP[y * gw + x] = 0;
+  }
+  let np = first;
+  while (np < max) {
+    let best = -1;
+    let bg = 0;
+    for (let c = 0; c < n; c++)
+      if (GAINMAP[c]! > bg) {
+        bg = GAINMAP[c]!;
+        best = c;
+      }
+    if (best < 0) break;
+    PEAKS[np++] = best;
+    const pu = best % gw;
+    const pv = (best - pu) / gw;
+    for (let y = Math.max(0, pv - ri); y <= Math.min(gh - 1, pv + ri); y++) for (let x = Math.max(0, pu - ri); x <= Math.min(gw - 1, pu + ri); x++) GAINMAP[y * gw + x] = 0;
+  }
+  return np;
+}
+
+/** Best configuration found per count k (grid cells, k centres at KCFG[k·K_MAX·2…]) and its cost. */
+const KCFG = new Int32Array((K_MAX + 1) * K_MAX * 2);
+const KCOST = new Float64Array(K_MAX + 1);
+/** localSearch focus: move only the centres near the point FOC (grid cells). */
+const FOCUS_POINT = -2;
+const FOC = new Int32Array(2);
+
+function recordK(k: number, cost: number): void {
+  if (!(cost < KCOST[k]!)) return;
+  KCOST[k] = cost;
+  KCFG.set(GC.subarray(0, k * 2), k * K_MAX * 2);
 }
 
 /** Cost one more disc must save (cells): DISC_GAIN·πR². */
@@ -1853,30 +2139,55 @@ function fitDiscs(ctx: Ctx, cnt: number, lab: number, cx: number, cy: number, ax
   DG.r2 = rp * rp;
   DG.sinEl = sinEl;
   DG.minSep = MIN_SEP * ctx.rp;
-  const G = S.grid; // bit0 blob, bit1 unknown
+  DG.hardSep = MIN_SEP_SPLIT * ctx.rp;
+  // One cell spans 1/sinEl rectified px along the view: sample the mask that many times along it (not
+  // once, which would alias the silhouette's edge by up to a cell as the calibration shifts the
+  // sampling phase). Per cell: G = blob samples (the cost while uncovered), gE = cloth − blob samples
+  // (the cost change once covered); unknown samples are free either way.
+  const ns = Math.max(1, Math.min(NS_MAX, Math.round(1 / sinEl)));
+  DG.ns = ns;
+  const G = S.grid;
+  const E = S.gE;
   for (let gj = 0; gj < gh; gj++)
     for (let gi = 0; gi < gw; gi++) {
-      const u = u0 + gi + 0.5;
       const v = v0 + gj + 0.5;
-      const i = Math.floor(cx + (u / sinEl) * ax + v * bx);
-      const j = Math.floor(cy + (u / sinEl) * ay + v * by);
-      let cell = 2;
-      if (i >= 0 && j >= 0 && i < w && j < h) {
+      let nb = 0;
+      let nc = 0;
+      for (let q = 0; q < ns; q++) {
+        const u = u0 + gi + (q + 0.5) / ns;
+        const i = Math.floor(cx + (u / sinEl) * ax + v * bx);
+        const j = Math.floor(cy + (u / sinEl) * ay + v * by);
+        if (i < 0 || j < 0 || i >= w || j >= h) continue;
         const k = j * w + i;
         const l = S.label[k]!;
-        cell = l === lab ? 1 : S.unknown[k] || l === -1 ? 2 : 0;
+        if (l === lab) nb++;
+        else if (!S.unknown[k] && l !== -1) nc++;
       }
-      G[gj * gw + gi] = cell;
+      G[gj * gw + gi] = nb;
+      E[gj * gw + gi] = nc - nb;
     }
   const lo = ri;
   const hiU = gw - 1 - ri;
   const hiV = gh - 1 - ri;
-  const thresh = discToll(ctx);
+  const thresh = discToll(ctx) * ns;
+  const gLow = Math.max(2, GROW_FRAC * thresh);
   KMI.m0 = 0;
   KMI.m1 = 0;
+  KCOST.fill(Infinity, 0, K_MAX + 1);
+  // The k-means restarts run on a regular subsample of the blob's pixels: their centres move by a
+  // fraction of a pixel, and the local search polishes them on the full grid anyway.
+  const st = Math.max(1, Math.ceil(cnt / KM_PIX));
+  let nkm = 0;
+  for (let q = 0; q < cnt; q += st) {
+    S.dqs[nkm * 2] = S.dq[q * 2]!;
+    S.dqs[nkm * 2 + 1] = S.dq[q * 2 + 1]!;
+    nkm++;
+  }
   let k = 0;
   let cost = coverAll(S, 0);
-  while (k < K_MAX) {
+  recordK(0, cost);
+  let kStop = K_MAX;
+  while (k < K_MAX && k < kStop + GROW_PAST) {
     GSAVE.set(GC.subarray(0, k * 2));
     const deep = deepestUncovered(S);
     if (deep < 0) break;
@@ -1884,23 +2195,27 @@ function fitDiscs(ctx: Ctx, cnt: number, lab: number, cx: number, cy: number, ax
     // Incremental start (for a pack, polishing only the new disc and its neighbours), then two short
     // k-means restarts (an incremental placement can trap a pair or a row). Kept cheap so a 15-ball
     // rack stays within the frame budget.
-    const starts = k === 0 ? 2 : 3;
+    PEAKS[0] = deep;
+    const nPk = k === 0 ? 1 : residualPeaks(S, 1, N_PEAKS);
+    const starts = nPk + (k === 0 ? 1 : 2);
     for (let start = 0; start < starts; start++) {
-      if (start === 0) {
+      const inc = start < nPk;
+      if (inc) {
         GC.set(GSAVE.subarray(0, k * 2));
-        GC[k * 2] = clampCell(deep % gw, lo, hiU);
-        GC[k * 2 + 1] = clampCell(Math.floor(deep / gw), lo, hiV);
+        const pk = PEAKS[start]!;
+        GC[k * 2] = clampCell(pk % gw, lo, hiU);
+        GC[k * 2 + 1] = clampCell(Math.floor(pk / gw), lo, hiV);
       } else {
-        kmeansStart(S, cnt, k + 1, start - 1);
+        kmeansStart(S, nkm, k + 1, start - nPk);
         for (let m = 0; m <= k; m++) {
           GC[m * 2] = clampCell(TRIAL[m * 2]! - u0 - 0.5, lo, hiU);
           GC[m * 2 + 1] = clampCell(TRIAL[m * 2 + 1]! - v0 - 0.5, lo, hiV);
         }
       }
       let c = coverAll(S, k + 1);
-      c += localSearch(S, k + 1, start === 0 && k >= 3 ? k : -1, start === 0 ? 10 : 4);
+      c += localSearch(S, k + 1, inc && k >= 3 ? k : -1, inc ? 10 : 4);
       let viol = false;
-      for (let m = 0; m <= k && !viol; m++) if (sepPenalty(k + 1, m, GC[m * 2]!, GC[m * 2 + 1]!) > SEP_W * (MIN_SEP - MIN_SEP_SPLIT) * ctx.rp) viol = true;
+      if (tooClose(k + 1)) viol = true;
       // Each of several balls must stand on blob pixels, not mostly on unknown ones (a pocket hole).
       if (k > 0) for (let m = 0; m <= k && !viol; m++) if (discBlobCells(S, GC[m * 2]!, GC[m * 2 + 1]!) < DISC_MIN_BLOB * Math.PI * rp * rp) viol = true;
       if (!viol && c < bestCost) {
@@ -1908,16 +2223,84 @@ function fitDiscs(ctx: Ctx, cnt: number, lab: number, cx: number, cy: number, ax
         GTRY.set(GC.subarray(0, (k + 1) * 2));
       }
     }
-    if (bestCost > cost - thresh) {
+    if (!(bestCost <= cost - gLow)) {
       GC.set(GSAVE.subarray(0, k * 2));
       coverAll(S, k);
       break;
     }
+    if (bestCost > cost - thresh && kStop === K_MAX) kStop = k;
     k++;
     GC.set(GTRY.subarray(0, k * 2));
     cost = coverAll(S, k);
+    recordK(k, cost);
   }
+  if (k > 1) {
+    cost += localSearch(S, k, -1);
+    recordK(k, cost);
+  }
+  // Backward elimination from the deepest fit: drop the disc that explains least, let its neighbours
+  // settle, record the cost at each count.
+  const kLow = Math.max(1, Math.min(kStop, k) - PRUNE_BELOW);
+  while (k > kLow) {
+    let wm = 0;
+    let wg = Infinity;
+    for (let m = 0; m < k; m++) {
+      const g = removeDelta(S, GC[m * 2]!, GC[m * 2 + 1]!, false);
+      if (g < wg) {
+        wg = g;
+        wm = m;
+      }
+    }
+    FOC[0] = GC[wm * 2]!;
+    FOC[1] = GC[wm * 2 + 1]!;
+    for (let j = wm; j < k - 1; j++) {
+      GC[j * 2] = GC[(j + 1) * 2]!;
+      GC[j * 2 + 1] = GC[(j + 1) * 2 + 1]!;
+    }
+    k--;
+    cost = coverAll(S, k);
+    cost += localSearch(S, k, FOCUS_POINT, 6);
+    recordK(k, cost);
+  }
+  // Model selection over the count: least whole-cluster cost plus the toll per ball.
+  let kSel = -1;
+  let jSel = Infinity;
+  for (let kk = 0; kk <= K_MAX; kk++) {
+    const J = KCOST[kk]! + thresh * kk;
+    if (J < jSel - 1e-9) {
+      jSel = J;
+      kSel = kk;
+    }
+  }
+  k = kSel;
+  GC.set(KCFG.subarray(kSel * K_MAX * 2, kSel * K_MAX * 2 + kSel * 2));
+  coverAll(S, k);
   if (k > 3) localSearch(S, k, -1);
+  if (k >= 3) {
+    // Leave-one-out with re-settling: a ball is counted only if the cluster cannot be explained nearly
+    // as well without it once its neighbours have moved (within one toll). A disc squeezed between two
+    // pushed-apart balls, or a ball whose slice of the outline its neighbours can take over, is not
+    // evidence of a ball (Constitution II): the image does not say it is there.
+    let cur = coverAll(S, k);
+    for (let m = k - 1; m >= 0 && k > 3; m--) {
+      GSAVE.set(GC.subarray(0, k * 2));
+      FOC[0] = GC[m * 2]!;
+      FOC[1] = GC[m * 2 + 1]!;
+      for (let j = m; j < k - 1; j++) {
+        GC[j * 2] = GC[(j + 1) * 2]!;
+        GC[j * 2 + 1] = GC[(j + 1) * 2 + 1]!;
+      }
+      let c = coverAll(S, k - 1);
+      c += localSearch(S, k - 1, FOCUS_POINT, 6);
+      if (c - cur < thresh) {
+        k--;
+        cur = c;
+      } else {
+        GC.set(GSAVE.subarray(0, k * 2));
+        coverAll(S, k);
+      }
+    }
+  }
   // Backward check: drop any disc whose own contribution (cells only it explains, minus cloth only it
   // covers) has fallen below the threshold once its neighbours settled.
   for (let m = k - 1; m >= 0 && k > 1; m--) {
@@ -1929,6 +2312,7 @@ function fitDiscs(ctx: Ctx, cnt: number, lab: number, cx: number, cy: number, ax
     }
     k--;
   }
+  FITQ.J = coverAll(S, k) / ns + (thresh / ns) * k;
   if (k === 0) {
     BEST[0] = 0;
     BEST[1] = 0;
@@ -1938,7 +2322,6 @@ function fitDiscs(ctx: Ctx, cnt: number, lab: number, cx: number, cy: number, ax
     BEST[m * 2] = u0 + GC[m * 2]! + 0.5;
     BEST[m * 2 + 1] = v0 + GC[m * 2 + 1]! + 0.5;
   }
-  FITQ.visCloth = k > 1 && k <= SMALL_CLUSTER ? maxVisibleCloth(S, k) : 0;
   return k;
 }
 
@@ -1953,7 +2336,7 @@ const INIT1 = new Float64Array(K_MAX * 2);
 
 /** Fill TRIAL[0..k) with the seeding of variant 0 (farthest point) or 1 (k-means++, fixed seed). */
 function kmeansInit(S: Scratch, n: number, k: number, variant: number): void {
-  const { dq } = S;
+  const dq = S.dqs;
   const D = variant === 0 ? S.km0 : S.km1;
   const P = variant === 0 ? INIT0 : INIT1;
   let m0 = variant === 0 ? KMI.m0 : KMI.m1;
@@ -2040,7 +2423,8 @@ function rnd(): number {
  * otherwise k-means++ with a fixed seed (deterministic).
  */
 function kmeansStart(S: Scratch, n: number, k: number, variant: number): void {
-  const { dq, dmin } = S;
+  const { dmin } = S;
+  const dq = S.dqs;
   kmeansInit(S, n, k, variant);
   // Lloyd iterations; once no pixel changes cluster the centres are final. Hamerly's bounds skip the
   // pixels whose nearest centre cannot have changed (same assignments as a full search: a pixel is
@@ -2134,6 +2518,8 @@ function kmeansStart(S: Scratch, n: number, k: number, variant: number): void {
 }
 
 const RESHIST = new Float64Array(81);
+/** The silhouette radius refineCircles settled on (de-stretched px). */
+const REFR = { rp: 0 };
 
 /**
  * Circle fit (Gauss-Newton, Huber-weighted) of every centre to the silhouette edge points it explains
@@ -2189,6 +2575,7 @@ function refineCircles(ctx: Ctx, nEdge: number, k: number, sinEl: number, rad: n
       }
     }
   }
+  REFR.rp = rp;
   const minSep2 = (MIN_SEP_SPLIT * ctx.rp) ** 2;
   for (let a = 0; a < k; a++)
     for (let b = a + 1; b < k; b++) {
