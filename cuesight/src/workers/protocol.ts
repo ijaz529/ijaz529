@@ -6,7 +6,7 @@
  * (one-shot full pipeline on a photo) and `player-view` (pose of a table-level photo against a known
  * layout). The app and both workers ship in one bundle, so the bump is atomic.
  */
-import type { PhysicsParams, Recommendation, ShotRequest, ShotSuggestion, TableLayout, TableSpec, Vec2 } from '../core/types';
+import type { PhysicsParams, PocketId, Recommendation, ShotPlan, ShotRequest, ShotSuggestion, Stroke, TableLayout, TableSpec, Vec2 } from '../core/types';
 import type { Frame } from '../vision/image';
 import type { VisionResult } from '../vision/pipeline';
 import type { PlayerViewInput, PlayerViewResult } from '../vision/player-view';
@@ -20,6 +20,12 @@ export interface StillOptions {
   swapAxes?: boolean;
   /** Pipeline passes over the same frame (default 6: the tracker locks after 5 calm frames). */
   iterations?: number;
+  /**
+   * Horizontal field of view hint (degrees) for this photo, e.g. Snap's current Settings value; it
+   * wins over the latest config's. The pipeline uses it only when it is a usable lens (calibration.ts
+   * usableFovDeg), as for the live config.
+   */
+  fovDeg?: number;
 }
 
 // --- Vision worker -------------------------------------------------------------------------------
@@ -46,13 +52,26 @@ export type VisionOut =
  */
 export type PlannerPerEvalMs = Record<string, number>;
 
+/** The planShot options a `plan` request may pass (the worker always plans with the advice on). */
+export interface PlannerPlanOptions {
+  names?: Partial<Record<PocketId, string>>;
+  recommended?: Stroke;
+}
+
 export type PlannerIn =
   | (V & { type: 'recommend'; id: number; layout: TableLayout; request: ShotRequest; params: PhysicsParams; perEvalMs?: PlannerPerEvalMs })
+  /**
+   * Optional (non-breaking v2 extension): the full plan, with the frozen power advice the app's own
+   * plan skips (PlanOptions.advice false: for a too-soft frozen cue ball its stroke search costs
+   * 8–70 ms on a desktop, more on a phone, at every slider step). Replied to with `plan`.
+   */
+  | (V & { type: 'plan'; id: number; layout: TableLayout; request: ShotRequest; params: PhysicsParams; opts?: PlannerPlanOptions })
   | (V & { type: 'suggest'; id: number; layout: TableLayout; params: PhysicsParams; max: number })
   | (V & { type: 'heatmap'; id: number; layout: TableLayout; nextBallId: string; excludeIds: string[]; params: PhysicsParams; cols: number; rows: number });
 
 export type PlannerOut =
   | (V & { type: 'recommendation'; id: number; perEvalMs?: PlannerPerEvalMs } & Recommendation)
+  | (V & { type: 'plan'; id: number; plan: ShotPlan })
   | (V & { type: 'suggestions'; id: number; items: ShotSuggestion[] })
   | (V & { type: 'heatmap'; id: number; cols: number; rows: number; values: Float32Array })
   | (V & { type: 'error'; id?: number; message: string });

@@ -94,7 +94,7 @@ async function spyVision(page: Page) {
     } as typeof orig;
   });
 }
-const posted = (page: Page) => page.evaluate(() => (window as unknown as { __posted: { type: string; opts?: { swapAxes?: boolean; manualCorners?: unknown }; targetId?: string; manual?: boolean }[] }).__posted);
+const posted = (page: Page) => page.evaluate(() => (window as unknown as { __posted: { type: string; opts?: { swapAxes?: boolean; manualCorners?: unknown; fovDeg?: number }; targetId?: string; manual?: boolean }[] }).__posted);
 
 /**
  * Counts the recommendation requests sent to the planner worker and their replies (test instrumentation
@@ -251,7 +251,9 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await stepIs(page, ['review', 'overview-error']);
     const still = (await posted(page)).filter((m) => m.type === 'still');
     expect(still).toHaveLength(1);
-    expect(still[0]!.opts).toMatchObject({ swapAxes: false, manualCorners: null });
+    // The field of view in Settings is this photo's lens hint (StillOptions.fovDeg).
+    const fov = await page.evaluate(() => (window as unknown as { __cuesight: { state: { settings: { fovDeg: number } } } }).__cuesight.state.settings.fovDeg);
+    expect(still[0]!.opts).toMatchObject({ swapAxes: false, manualCorners: null, fovDeg: fov });
     expect((await H(page)).step).toBe('review');
     // Live's setting is left as it was.
     expect(await page.evaluate(() => (window as unknown as { __cuesight: { state: { swapAxes: boolean } } }).__cuesight.state.swapAxes)).toBe(true);
@@ -281,6 +283,176 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await expect.poll(async () => ((await H(page)) as Snap & { player: { fitTargetId?: string } }).player.fitTargetId, { timeout: 15_000 }).toBe(other);
     expect((await H(page)).step).toBe('guide');
     await expect(page.locator('#snap-fit')).toContainText(/Fit: (good|fair|low) · \d+%/);
+  });
+
+  test('a frozen cue ball too soft: the power advice comes from the planner worker, not the main thread', async ({ page }) => {
+    // Records the full-plan requests ('plan', worker-protocol v2) sent to the planner worker.
+    await page.addInitScript(() => {
+      const w = window as unknown as { __plans: { power: number; vert: number }[] };
+      w.__plans = [];
+      const orig = Worker.prototype.postMessage;
+      Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
+        const msg = m as { type?: string; request?: { stroke?: { power: number; vert: number } } };
+        if (msg?.type === 'plan') w.__plans.push({ power: msg.request?.stroke?.power ?? -1, vert: msg.request?.stroke?.vert ?? 0 });
+        return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
+      } as typeof orig;
+    });
+    await tablePhoto(page);
+    type S = {
+      snap: { layout: { id: string; kind: string; pos: V2 }[] };
+      strokeMode: string;
+      myStroke: { power: number; side: number; vert: number };
+      plan: { pocketId: string; adviceSkipped?: boolean; warnings: { code: string; message: string }[] } | null;
+    };
+    // Fix the layout by hand: the cue ball frozen to an object ball (the merge-coherence chain's layout).
+    const target = await page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: { state: S; selectBall(id: string): void } }).__cuesight;
+      const layout = h.state.snap.layout.map((b) => ({ ...b }));
+      const cue = layout.find((b) => b.kind === 'cue')!;
+      const ob = layout.find((b) => b.kind !== 'cue')!;
+      cue.pos = { x: -0.2451160266459315, y: 0.23962167347191393 };
+      ob.pos = { x: -0.1891063642501831, y: 0.25098126053810116 };
+      const rest = layout.filter((b) => b !== cue && b !== ob && Math.hypot(b.pos.x - ob.pos.x, b.pos.y - ob.pos.y) > 0.2);
+      h.state.snap = { ...h.state.snap, layout: [cue, ob, ...rest] } as S['snap'];
+      h.selectBall(ob.id);
+      return ob.id;
+    });
+    await page.waitForFunction(() => !!(window as unknown as { __cuesight: { state: S } }).__cuesight.state.plan);
+    // The player's own stroke: power 1 with draw, too soft for this frozen shot.
+    await page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: { state: S; selectPocket(id: string): void } }).__cuesight;
+      h.state.strokeMode = 'mine';
+      h.state.myStroke = { power: 1, side: 0, vert: -0.4 };
+      h.selectPocket(h.state.plan!.pocketId);
+    });
+    // The full plan arrives from the worker and replaces the quick one: a power figure (or "no power").
+    await page.waitForFunction(
+      () => {
+        const p = (window as unknown as { __cuesight: { state: S } }).__cuesight.state.plan;
+        const soft = p?.warnings.find((w) => w.code === 'too-soft');
+        return !!p && !p.adviceSkipped && !!soft && /(Use power|Power) \d|no power/i.test(soft.message);
+      },
+      undefined,
+      { timeout: 20_000 },
+    );
+    const plans = await page.evaluate(() => (window as unknown as { __plans: { power: number; vert: number }[] }).__plans);
+    expect(plans.length).toBeGreaterThanOrEqual(1);
+    expect(plans[plans.length - 1]).toEqual({ power: 1, vert: -0.4 });
+    const plan = await page.evaluate(() => (window as unknown as { __cuesight: { state: S & { targetId: string } } }).__cuesight.state);
+    expect(plan.targetId).toBe(target);
+    expect(plan.plan!.warnings.some((w) => w.code === 'frozen')).toBe(true);
+  });
+
+  test('the player’s own frozen soft stroke: no power minimum until the advice comes, and a late recommendation keeps the full plan', async ({ page }) => {
+    // Holds the planner's 'recommend' and 'plan' messages until the test lets them go, so the replies
+    // come in a fixed order: the full plan first, then the recommendation the tap asked for.
+    await page.addInitScript(() => {
+      type Held = { worker: Worker; m: unknown };
+      const w = window as unknown as { __held: Record<string, Held[]>; __sent: Record<string, number>; __release(type: string): number };
+      w.__held = { recommend: [], plan: [] };
+      w.__sent = { recommend: 0, plan: 0 };
+      const orig = Worker.prototype.postMessage as (this: Worker, m: unknown, t?: unknown) => void;
+      Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
+        const type = (m as { type?: string })?.type;
+        if (type === 'recommend' || type === 'plan') {
+          w.__sent[type]!++;
+          w.__held[type]!.push({ worker: this, m });
+          return;
+        }
+        return orig.call(this, m, t as never);
+      } as typeof Worker.prototype.postMessage;
+      w.__release = (type) => {
+        const q = w.__held[type]!.splice(0);
+        for (const h of q) orig.call(h.worker, h.m);
+        return q.length;
+      };
+    });
+    await tablePhoto(page);
+    type P = { adviceSkipped?: boolean; noWorkingPower?: string; stroke: { power: number; side: number; vert: number }; warnings: { code: string; message: string }[] };
+    type S = {
+      snap: { layout: { id: string; kind: string; pos: V2 }[] };
+      strokeMode: string;
+      myStroke: { power: number; side: number; vert: number };
+      settings: { showDetails: boolean };
+      recommended: { pending: boolean; stroke: unknown } | null;
+      plan: P | null;
+    };
+    type W = { __cuesight: { state: S; selectBall(id: string): void }; __sent: Record<string, number>; __held: Record<string, unknown[]>; __release(type: string): number; __full?: unknown };
+    // The cue ball frozen to an object ball (the merge-coherence chain's layout), the ball tapped in
+    // the recommended mode: a recommendation is asked for (and held).
+    await page.evaluate(() => {
+      const h = (window as unknown as W).__cuesight;
+      const layout = h.state.snap.layout.map((b) => ({ ...b }));
+      const cue = layout.find((b) => b.kind === 'cue')!;
+      const ob = layout.find((b) => b.kind !== 'cue')!;
+      cue.pos = { x: -0.2451160266459315, y: 0.23962167347191393 };
+      ob.pos = { x: -0.1891063642501831, y: 0.25098126053810116 };
+      const rest = layout.filter((b) => b !== cue && b !== ob && Math.hypot(b.pos.x - ob.pos.x, b.pos.y - ob.pos.y) > 0.2);
+      h.state.snap = { ...h.state.snap, layout: [cue, ob, ...rest] } as S['snap'];
+      h.state.settings = { ...h.state.settings, showDetails: true };
+      h.selectBall(ob.id);
+    });
+    await page.waitForFunction(() => (window as unknown as W).__sent.recommend >= 1, undefined, { timeout: 10_000 });
+    expect(await page.evaluate(() => (window as unknown as W).__cuesight.state.strokeMode)).toBe('recommended');
+    // Before it lands, the player sets their own stroke: draw (as the spin pad would), then power 1 on
+    // the slider — too soft for this frozen shot. The recommendation stays pending meanwhile.
+    await page.evaluate(() => {
+      const h = (window as unknown as W).__cuesight;
+      h.state.myStroke = { ...h.state.myStroke, side: 0, vert: -0.4 };
+      const r = document.querySelector<HTMLInputElement>('#power')!;
+      r.value = '1';
+      r.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    // The plan on show was made without the power advice; its full plan is asked of the worker (held).
+    await page.waitForFunction(() => (window as unknown as W).__sent.plan >= 1, undefined, { timeout: 10_000 });
+    const meter = page.locator('#shot-card .power-meter');
+    await expect(meter).toHaveAttribute('aria-label', /^Power 1 of 10/);
+    const quick = await page.evaluate(() => (window as unknown as W).__cuesight.state.plan!);
+    expect(quick.adviceSkipped).toBe(true);
+    expect(quick.stroke).toEqual({ power: 1, side: 0, vert: -0.4 });
+    expect(quick.warnings.find((w) => w.code === 'too-soft')?.message).toBe('Too soft — object ball stops short.');
+    // No minimum while the advice is worked out: the advice-off one is not the power to play.
+    expect(await meter.getAttribute('aria-label')).not.toMatch(/Minimum|full power/);
+    const card = page.locator('#shot-card');
+    await expect(card).toContainText('Too soft — object ball stops short.');
+    expect(await card.textContent()).not.toMatch(/NaN|Infinity|Min power/);
+
+    // The full plan comes: its figure is on the meter, in the warning and in the details.
+    expect(await page.evaluate(() => (window as unknown as W).__release('plan'))).toBe(1);
+    await page.waitForFunction(
+      () => {
+        const p = (window as unknown as W).__cuesight.state.plan;
+        return !!p && !p.adviceSkipped && /Use power \d/.test(p.warnings.find((w) => w.code === 'too-soft')?.message ?? '');
+      },
+      undefined,
+      { timeout: 20_000 },
+    );
+    await page.evaluate(() => {
+      const w = window as unknown as W;
+      w.__full = w.__cuesight.state.plan;
+    });
+    await expect(meter).toHaveAttribute('aria-label', /^Power 1 of 10, .*Minimum \d/);
+    await expect(card).toContainText('Min power');
+    const fullText = await page.evaluate(() => (window as unknown as W).__cuesight.state.plan!.warnings.find((w) => w.code === 'too-soft')!.message);
+
+    // Now the recommendation lands: the player's stroke is played, so the full plan stays as it is.
+    expect(await page.evaluate(() => (window as unknown as W).__release('recommend'))).toBe(1);
+    await page.waitForFunction(() => !(window as unknown as W).__cuesight.state.recommended?.pending, undefined, { timeout: 30_000 });
+    // Not vacuous: a stroke was recommended (the plan options would have carried it).
+    expect(await page.evaluate(() => (window as unknown as W).__cuesight.state.recommended?.stroke)).toBeTruthy();
+    await page.waitForTimeout(600); // well past the 120 ms plan debounce
+    const after = await page.evaluate(() => {
+      const w = window as unknown as W;
+      return { same: w.__cuesight.state.plan === w.__full, sent: w.__sent.plan, held: w.__held.plan!.length, plan: w.__cuesight.state.plan! };
+    });
+    expect(after.same, 'the full plan is still the one on show').toBe(true);
+    expect(after.plan.adviceSkipped).toBeUndefined();
+    expect(after.plan.warnings.find((w) => w.code === 'too-soft')?.message).toBe(fullText);
+    expect(after.sent, 'no second full-plan request').toBe(1);
+    expect(after.held).toBe(0);
+    await expect(meter).toHaveAttribute('aria-label', /Minimum \d/);
+    // The plan spoken is the full one, with its figure (the figure-less one was never queued).
+    await expect(page.locator('#plan-live')).toContainText(fullText, { timeout: 5_000 });
   });
 
   test('a photo it cannot line up → reason → two taps → guide (manual fallback)', async ({ page }) => {

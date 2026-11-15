@@ -79,9 +79,9 @@ describe('evaluation budget: the calibration times what the search evaluates', (
     // Not vacuous: on this layout the default plan's advice runs (its wording differs) and costs
     // several times the simulations of the plan the search evaluates.
     const words = (o: object) => planShot(lay, req, P, o).warnings.map((w) => w.message).join(' | ');
-    expect(words({ record: false })).not.toBe(words(SEARCH_PLAN_OPTIONS));
+    expect(words({ record: false, advice: true })).not.toBe(words(SEARCH_PLAN_OPTIONS));
     sims.mockClear();
-    planShot(lay, req, P, { record: false });
+    planShot(lay, req, P, { record: false, advice: true });
     const withAdvice = sims.mock.calls.length;
     sims.mockClear();
     planShot(lay, req, P, SEARCH_PLAN_OPTIONS);
@@ -91,6 +91,12 @@ describe('evaluation budget: the calibration times what the search evaluates', (
     sims.mockClear();
     createEvaluationBudget(clock(1)).budget(lay, req, P);
     expect(sims.mock.calls.length).toBe(4 * searched);
+    // And a caller that only says record: false (a search) no longer pays for the advice either: the
+    // core's default is advice = record !== false.
+    sims.mockClear();
+    planShot(lay, req, P, { record: false });
+    expect(sims.mock.calls.length).toBe(searched);
+    expect(words({ record: false })).toBe(words(SEARCH_PLAN_OPTIONS));
   });
 
   it('the budget is RECOMMEND_BUDGET_MS / per-evaluation ms, between MIN_EVALUATIONS and FULL_EVALUATIONS', () => {

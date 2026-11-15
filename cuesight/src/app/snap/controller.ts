@@ -29,7 +29,7 @@ import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
 import { decodePhoto, frameOf, loadSample, photoFromVideo, releasePhoto, type Photo } from './photo';
-import { SNAP_MESSAGES, fitCheck, snapStage, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
+import { SNAP_MESSAGES, fitCheck, snapAimText, snapGuideInstruction, snapStage, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
 
 export const SAMPLE_PHOTOS = { table: './samples/snap-table.png', player: './samples/snap-player.png' } as const;
 
@@ -328,8 +328,9 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     const id = ++nextId;
     pending = { id, kind: 'still' };
     // Snap's own settings, never Live's: the corners tapped on this photo (or none), and no rail swap
-    // (Live's "Rotate" fixes the live camera's view; a still is detected from the photo alone).
-    host.visionWorker().postMessage({ v: PROTOCOL_VERSION, type: 'still', id, frame, opts: { manualCorners: corners, swapAxes: false } }, [frame.data.buffer]);
+    // (Live's "Rotate" fixes the live camera's view; a still is detected from the photo alone). The
+    // field of view in Settings is the lens hint for this photo too (StillOptions.fovDeg).
+    host.visionWorker().postMessage({ v: PROTOCOL_VERSION, type: 'still', id, frame, opts: { manualCorners: corners, swapAxes: false, fovDeg: S().settings.fovDeg } }, [frame.data.buffer]);
   }
 
   function knownBalls(): KnownBall[] {
@@ -393,7 +394,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       const kind = pending.kind;
       pending = null;
       console.warn('snap vision error', m.message);
-      host.dispatch(kind === 'still' ? { type: 'overview-failed', message: SNAP_MESSAGES.noTable } : { type: 'player-failed', message: "I couldn't line up this photo. Tap the cue ball, then your target." });
+      // Detection itself failed on this photo (not "no table"): say that, with the ways on.
+      host.dispatch(kind === 'still' ? { type: 'overview-failed', message: SNAP_MESSAGES.detectionStopped } : { type: 'player-failed', message: "I couldn't line up this photo. Tap the cue ball, then your target." });
       return true;
     }
     if (!pending || m.id !== pending.id) return true; // stale reply for an older photo
@@ -609,6 +611,13 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       el.innerHTML = html;
     }
   }
+  /** Writes only on change (the HUD is refreshed on every render). */
+  function setText(el: HTMLElement, text: string): void {
+    if (el.textContent !== text) el.textContent = text;
+  }
+  function setAttr(el: HTMLElement, name: string, value: string): void {
+    if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+  }
   function setInstr(text: string, ic: IconName = 'info', tone: 'info' | 'warn' = 'info'): void {
     setHtml(instr, text ? `${iconMarkup(ic, 18)}<span>${esc(text)}</span>` : '');
     instr.dataset.tone = tone;
@@ -716,7 +725,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
         fit = fc === 'current' ? confidenceLabel(r?.confidence ?? 0) : fc === 'checking' ? { word: 'checking', text: 'Fit: checking…' } : null;
         // The how-to (strike, power, aim) is in the sheet's peek right under the photo: the top card
         // is one row, so the photo gets the screen.
-        setInstr(s.plan ? (playable(s.plan) ? `Aim at the ghost ball. Strike ${strikeWords(s.plan.stroke)} (the blue dot on the ball's face).` : 'This shot cannot be played as planned.') : 'Pick a target ball to see the guide.', 'target');
+        // A frozen cue ball has no ghost ball: aim the stroke (the planner's frozen warning and tip).
+        setInstr(s.plan ? (playable(s.plan) ? snapGuideInstruction(s.plan, strikeWords) : 'This shot cannot be played as planned.') : 'Pick a target ball to see the guide.', 'target');
         if (r?.reason) warnings.push(r.reason);
         if (guide) warnings.push(...guide.messages);
         actions = iconBtn('take-player', 'New player photo', 'camera') + iconBtn('edit-layout', 'Edit the layout', 'layers') + iconBtn('start-over', 'Start over', 'refresh');
@@ -753,6 +763,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     dock.querySelector('[data-act="mark-cue"]')?.setAttribute('aria-pressed', String(s.interaction === 'mark-cue'));
     dock.querySelector('[data-act="inspect"]')?.setAttribute('aria-pressed', String(inspect));
     drawStage(s);
+    // Every render: the plan can change without a redraw of the photo (the worker's power advice).
+    renderHud(s, guide);
     drawThumb(s);
     // Fit confidence (FR-116): a chip on the photo's top-left corner.
     const pr = fit ? photoCanvas.photoRect() : null;
@@ -831,7 +843,6 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       const fr = fitEl.hidden ? null : fitEl.getBoundingClientRect();
       avoidRects.push(fr && fr.width > 0 ? { left: fr.left - r.left - 4, top: fr.top - r.top - 4, right: fr.right - r.left + 4, bottom: fr.bottom - r.top + 4 } : { left: 0, top: 0, right: 176, bottom: 50 });
     }
-    renderHud(s, g);
     photoCanvas.draw(
       g
         ? (c, m) => drawGuide(c, m, g, { showCuePath: true, makeable: s.plan ? playable(s.plan) : true, clip: photoCanvas.photoRect(), avoidRects, ...(note ? { strikeNote: note } : {}) })
@@ -864,31 +875,34 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     if (!playable(plan)) {
       // No strike point, no power: the reason, and what to try instead.
       const u = unplayableHeadline(plan);
-      hudStrike.textContent = u.title;
-      hudAim.textContent = u.reason;
+      setText(hudStrike, u.title);
+      setText(hudAim, u.reason);
       setHtml(hudMeter, '');
-      hudPower.textContent = '';
-      hudSpeed.textContent = '';
+      setHtml(hudPower, '');
+      setText(hudSpeed, '');
       setHtml(hudSpin, `<span class="hud-no">${iconMarkup('alert', 40)}</span>`);
-      hudSpin.setAttribute('aria-label', u.title);
+      setAttr(hudSpin, 'aria-label', u.title);
       const alt = u.altPocketId;
       setHtml(hudActs, alt ? `<button type="button" class="btn primary" data-hud-pocket="${esc(alt)}">${iconMarkup('target', 18)}<span>Try the ${esc(host.pocketName?.(alt) ?? alt)}</span></button>` : '');
       return;
     }
     setHtml(hudActs, '');
-    hudStrike.textContent = strikeHeadline(st, strikeWords);
-    const minPower = Number.isFinite(plan.minPower) ? plan.minPower : null;
-    hudMeter.setAttribute('aria-label', powerText(st.power, minPower));
+    setText(hudStrike, strikeHeadline(st, strikeWords));
+    // No minimum on the meter when none is known yet (the worker's power advice is on its way) or when
+    // no power works with this tip (minPower 10.5 is then not "more than full power": the warning says why).
+    const minPower = Number.isFinite(plan.minPower) && !plan.noWorkingPower && !plan.adviceSkipped ? plan.minPower : null;
+    setAttr(hudMeter, 'aria-label', powerText(st.power, minPower));
     setHtml(hudMeter, powerMeterSvg(st.power, minPower));
-    hudPower.innerHTML = `${esc(st.power.toFixed(st.power % 1 ? 1 : 0))}<small>/10</small>`;
+    setHtml(hudPower, `${esc(st.power.toFixed(st.power % 1 ? 1 : 0))}<small>/10</small>`);
     const ref = speedReference(plan.obPocketSpeed, s.table.length, s.params);
-    hudSpeed.textContent = ref ? `${speedWord(st.power)} · ${ref}` : `${speedWord(st.power)} · ${powerToSpeed(st.power).toFixed(1)} m/s`;
-    hudAim.textContent = `Aim at the ghost ball · ${plan.cutAngleDeg.toFixed(0)}° cut, ${plan.fractionPhrase.replace(/\u002D/g, '\u2011')}`;
+    setText(hudSpeed, ref ? `${speedWord(st.power)} · ${ref}` : `${speedWord(st.power)} · ${powerToSpeed(st.power).toFixed(1)} m/s`);
+    const layout = s.snap.layout ?? [];
+    setText(hudAim, snapAimText(plan, layout.find((b) => b.kind === 'cue')?.pos ?? null, layout.find((b) => b.id === plan.targetId)?.pos ?? null));
     // The cue ball's face, drawn flat as coaches do (never a photo crop: from a raised camera a
     // high strike point lands below the visible centre and reads as the opposite instruction).
     void g;
-    hudSpin.setAttribute('role', 'img');
-    hudSpin.setAttribute('aria-label', spinText(st.side, st.vert));
+    setAttr(hudSpin, 'role', 'img');
+    setAttr(hudSpin, 'aria-label', spinText(st.side, st.vert));
     setHtml(hudSpin, spinBallSvg(st.side, st.vert, 72, 'hud'));
   }
 

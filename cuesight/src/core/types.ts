@@ -220,6 +220,22 @@ export interface ShotPlan {
   minPowerCapture?: number;
   /** @deprecated Same as minPower (kept for consumers of an earlier draft). */
   minPowerSafe?: number;
+  /**
+   * Frozen cue ball, a stroke too soft at the played power, and no power on the scale pots it with
+   * pace and keeps the cue ball up (minPower is then 10.5, and the too-soft warning says so): more
+   * power is not the answer, so the app must not say "needs more than full power". 'throw': harder
+   * throws it less (from some power on it misses for lack of throw); 'other': no power works for
+   * another reason (it scratches, or never drops with pace). Absent otherwise.
+   */
+  noWorkingPower?: 'throw' | 'other';
+  /**
+   * True when the frozen power advice was skipped (PlanOptions.advice false, the default for a plan
+   * with record: false): the too-soft warning then gives no power figure, minPower is the minimum
+   * for the stroke angle at the played power and noWorkingPower is not known. Plan again with the
+   * advice on (planner worker 'plan' message, contracts/worker-protocol-v2.md) before showing it as
+   * final. Absent whenever nothing was skipped.
+   */
+  adviceSkipped?: boolean;
   cuePath: Trajectory;
   objectPath: Trajectory;
   otherPaths: Trajectory[];

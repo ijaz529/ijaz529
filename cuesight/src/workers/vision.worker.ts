@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 /**
  * Vision worker (protocol v2, specs/002-3d-visual-ios/contracts/worker-protocol-v2.md):
- *  - `config` / `frame` / `reset`: the live 001 pipeline (unchanged behaviour);
+ *  - `config` / `frame` / `reset`: the live 001 pipeline (`reset` keeps the ball-id counter);
  *  - `still`: the full pipeline run several times on one photo through a *separate* pipeline, so live
  *    tracking state is never touched; configuration comes from the latest `config` (+ optional opts);
  *  - `player-view`: `estimatePlayerView` on a table-level photo; its failures are `ok: false` results
@@ -32,7 +32,9 @@ export const STILL_ITERATIONS = 6;
 export function processStill(frame: Frame, cfg: VisionConfig, opts: StillOptions = {}): VisionResult {
   const t0 = performance.now();
   const manualCorners = opts.manualCorners !== undefined ? opts.manualCorners : cfg.manualCorners;
-  const pipeline = createPipeline({ table: cfg.table, fovDeg: cfg.fovDeg, manualCorners, swapAxes: opts.swapAxes ?? cfg.swapAxes });
+  // The photo's own lens hint (Snap sends the Settings field of view) wins over the latest config's.
+  const fovDeg = typeof opts.fovDeg === 'number' && Number.isFinite(opts.fovDeg) ? opts.fovDeg : cfg.fovDeg;
+  const pipeline = createPipeline({ table: cfg.table, fovDeg, manualCorners, swapAxes: opts.swapAxes ?? cfg.swapAxes });
   const n = Math.max(1, Math.min(20, Math.round(opts.iterations ?? STILL_ITERATIONS)));
   let result = pipeline.process(frame);
   for (let i = 1; i < n; i++) result = pipeline.process(frame);
@@ -47,7 +49,7 @@ export interface VisionReply {
 /** Stateful message handler: returns the reply to post (and what to transfer), or null for none. */
 export function createVisionHandler(): (msg: VisionIn) => VisionReply | null {
   let cfg: VisionConfig = { table: makeTable('pool9'), fovDeg: 65, manualCorners: null, swapAxes: false };
-  let pipeline = createPipeline({ ...cfg });
+  const pipeline = createPipeline({ ...cfg });
   const error = (message: string, id?: number, buffer?: ArrayBuffer): VisionReply => ({
     msg: { v: PROTOCOL_VERSION, type: 'error', ...(id !== undefined ? { id } : {}), message, ...(buffer ? { buffer } : {}) },
     transfer: buffer ? [buffer] : [],
@@ -63,7 +65,9 @@ export function createVisionHandler(): (msg: VisionIn) => VisionReply | null {
           pipeline.configure({ ...cfg });
           return null;
         case 'reset':
-          pipeline = createPipeline({ ...cfg });
+          // Forget the table, the cloth and the tracks, but keep the id counter: a fresh pipeline would
+          // issue b1, b2… again, and ids the app still holds would name other balls.
+          pipeline.reset();
           return null;
         case 'frame': {
           const data = new Uint8ClampedArray(msg.buffer);

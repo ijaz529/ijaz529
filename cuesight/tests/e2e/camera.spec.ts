@@ -3,7 +3,10 @@ import { expect, test, type Page } from '@playwright/test';
 type V2 = { x: number; y: number };
 type Hook = {
   state: {
-    vision: { status: string; balls: { id: string; kind: string; pos: V2 }[] } | null;
+    vision: { status: string; balls: { id: string; kind: string; pos: V2; label?: string }[]; calibration: { corners: V2[] } | null } | null;
+    table: { length: number; width: number; cushionWidth: number };
+    plan: { targetId: string } | null;
+    toast: string | null;
     frozen: { layout: { balls: { id: string; kind: string }[] } } | null;
     targetId: string | null;
     cueOverrideId: string | null;
@@ -138,13 +141,95 @@ test.describe('live camera (US2) — synthetic table as the fake camera', () => 
     const box = (await page.locator('#overlay').boundingBox())!;
     // Four points on one line.
     for (let i = 0; i < 4; i++) await page.mouse.click(box.x + box.width * (0.2 + 0.2 * i), box.y + box.height * 0.5);
-    await expect(page.locator('#toast')).toContainText('don’t make a table');
+    await expect(page.locator('#toast')).toContainText('Those four taps aren’t the cloth corners');
     await expect(page.locator('#toast')).not.toContainText('Calibrated');
     const st = await page.evaluate(() => {
       const s = (window as unknown as { __cuesight: Hook }).__cuesight.state;
       return { interaction: s.interaction, manual: s.manualCorners };
     });
     expect(st).toEqual({ interaction: 'calibrate', manual: null });
+  });
+
+  /** The object ball nearest the table centre: its id, label and where it shows on screen. */
+  const pickCentral = (page: Page) =>
+    page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+      const b = h.state.vision!.balls.filter((x) => x.kind !== 'cue').sort((a, c) => Math.hypot(a.pos.x, a.pos.y) - Math.hypot(c.pos.x, c.pos.y))[0]!;
+      return { id: b.id, label: b.label ?? '', screen: h.overlayToScreen(b.pos)! };
+    });
+  /** The target now: its id, label, screen position and whether a plan is drawn for it. */
+  const targetNow = (page: Page) =>
+    page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+      const s = h.state;
+      const b = s.vision?.balls.find((x) => x.id === s.targetId);
+      return { id: s.targetId, label: b?.label ?? null, screen: b ? h.overlayToScreen(b.pos) : null, planFor: s.plan?.targetId ?? null };
+    });
+
+  test('Rotate, then Rotate back: the target stays on the same ball (found again where the camera sees it)', async ({ page }) => {
+    await page.goto('/?mode=camera');
+    await locked(page);
+    const before = await pickCentral(page);
+    await page.mouse.click(before.screen.x, before.screen.y);
+    await expect.poll(async () => (await targetNow(page)).planFor, { timeout: 10_000 }).toBe(before.id);
+    // The synthetic camera's table is detected the right way round: one Rotate makes the frame wrong
+    // (no ball at the target's spot), so the selection waits; Rotate back and it is found again.
+    await pressTool(page, 'swap');
+    await page.waitForTimeout(300);
+    await pressTool(page, 'swap');
+    await expect(page.locator('#toast')).toContainText('Kept your selection', { timeout: 20_000 });
+    const after = await targetNow(page);
+    expect(after.id).not.toBeNull();
+    expect(after.id).not.toBe(before.id); // a new tracker issued new ids …
+    expect(after.label).toBe(before.label); // … for the same ball, at the same spot of the picture
+    expect(Math.hypot(after.screen!.x - before.screen.x, after.screen!.y - before.screen.y)).toBeLessThan(10);
+    await expect.poll(async () => (await targetNow(page)).planFor, { timeout: 10_000 }).toBe(after.id);
+    await expect(page.getByTestId('shot-card')).toBeVisible();
+  });
+
+  test('a single Rotate into a frame where the target is not found: the selection is cleared, and it says so', async ({ page }) => {
+    await page.goto('/?mode=camera');
+    await locked(page);
+    const before = await pickCentral(page);
+    await page.mouse.click(before.screen.x, before.screen.y);
+    await expect.poll(async () => (await targetNow(page)).planFor, { timeout: 10_000 }).toBe(before.id);
+    await pressTool(page, 'swap');
+    await expect(page.locator('#toast')).toContainText('Swapped long and short rails');
+    // No ball is taken from another spot: after the wait the selection is cleared, with a message.
+    await expect(page.locator('#toast')).toContainText('The selection was cleared: the table frame changed', { timeout: 20_000 });
+    expect((await targetNow(page)).id).toBeNull();
+  });
+
+  test('Calibrate with four taps on the cloth corners keeps the target on the same ball', async ({ page }) => {
+    await page.goto('/?mode=camera');
+    await locked(page);
+    const before = await pickCentral(page);
+    await page.mouse.click(before.screen.x, before.screen.y);
+    await expect.poll(async () => (await targetNow(page)).planFor, { timeout: 10_000 }).toBe(before.id);
+    // Where the cloth's outer corners show on screen (the calibration's corners: cushion noses).
+    const corners = await page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+      const t = h.state.table;
+      const x = t.length / 2 + t.cushionWidth;
+      const y = t.width / 2 + t.cushionWidth;
+      return [
+        { x: -x, y: -y },
+        { x, y: -y },
+        { x, y },
+        { x: -x, y },
+      ].map((p) => h.overlayToScreen(p, 'cloth')!);
+    });
+    await pressTool(page, 'calibrate');
+    for (const c of corners) await page.mouse.click(c.x, c.y);
+    // "Corners set — checking…", which the first result with these corners replaces with "Calibrated
+    // from your four corners." — under load often before this line looks (seen: only the second).
+    await expect(page.locator('#toast')).toContainText(/Corners set|Calibrated from your four corners/, { timeout: 5_000 });
+    await expect(page.locator('#toast')).toContainText('Kept your selection', { timeout: 20_000 });
+    const after = await targetNow(page);
+    expect(after.id).not.toBe(before.id);
+    expect(after.label).toBe(before.label);
+    expect(Math.hypot(after.screen!.x - before.screen.x, after.screen!.y - before.screen.y)).toBeLessThan(10);
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.manualCorners?.length)).toBe(4);
   });
 
   test('overlapping camera starts leave exactly one live camera (and none after leaving Live)', async ({ page }) => {

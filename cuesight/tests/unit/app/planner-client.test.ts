@@ -1,5 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPlannerClient, recommendationOutcome, watchWorker, type PlannerKind, type RecommendationReply } from '../../../src/app/planner-client';
+import {
+  cardDetailsShown,
+  cardPlanOf,
+  createPlannerClient,
+  fullPlanOptions,
+  planRequestKey,
+  recommendationOutcome,
+  recommendedFromReply,
+  watchWorker,
+  type PlannerKind,
+  type RecommendationReply,
+} from '../../../src/app/planner-client';
+import { renderShotCard, type CardContext } from '../../../src/app/ui/shot-card';
+import { DEFAULT_PHYSICS } from '../../../src/core/physics/params';
+import { planShot } from '../../../src/core/shot/planner';
+import { advisePower } from '../../../src/core/shot/power';
+import { makeTable } from '../../../src/core/table';
+import type { ShotRequest, TableLayout } from '../../../src/core/types';
 import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut } from '../../../src/workers/protocol';
 
 /** A planner worker the test answers by hand. */
@@ -216,6 +233,103 @@ describe('planner client: stale replies are dropped (the stale-result rule)', ()
   });
 });
 
+describe('planner client: the full plan (frozen power advice) is computed in the worker', () => {
+  // A too-soft frozen cue ball's advice re-plans the stroke at every half step (8–70 ms on a desktop,
+  // more on a phone): main.ts shows the plan without it at once and asks the worker for the rest.
+  let workers: FakeWorker[];
+  let plans: [string, number][];
+  let fails: [PlannerKind, string | undefined][];
+  let client: ReturnType<typeof createPlannerClient>;
+  const planMsg = (target: string, power: number) => ({ type: 'plan' as const, layout: { target } as never, request: { targetId: target, stroke: { power, side: 0, vert: 0 } }, params: {} as never });
+  const planReply = (id: number): PlannerOut => ({ v: PROTOCOL_VERSION, type: 'plan', id, plan: {} as never });
+  beforeEach(() => {
+    vi.useFakeTimers();
+    workers = [];
+    plans = [];
+    fails = [];
+    client = createPlannerClient({
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w as unknown as Worker;
+      },
+      onRecommendation: () => {},
+      onSuggestions: () => {},
+      onHeatmap: () => {},
+      onPlan: (key, m) => plans.push([key, m.id]),
+      onFailure: (kind, key) => fails.push([kind, key]),
+    });
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('is debounced (a slider drag asks once, for where it settles) and only the latest key is accepted', () => {
+    client.plan('p1', planMsg('b1', 1));
+    vi.advanceTimersByTime(60);
+    client.plan('p1.5', planMsg('b1', 1.5));
+    vi.advanceTimersByTime(60);
+    client.plan('p2', planMsg('b1', 2));
+    expect(workers.length).toBe(0); // nothing sent while the slider moves
+    vi.advanceTimersByTime(120);
+    const w = workers[0]!;
+    expect(w.posted.map((m) => m.type)).toEqual(['plan']);
+    expect((w.last('plan') as Extract<PlannerIn, { type: 'plan' }>).request.stroke!.power).toBe(2);
+    expect(client.pending('plan')).toBe(true);
+    w.reply(planReply(w.last('plan').id));
+    expect(plans).toEqual([['p2', w.last('plan').id]]);
+    expect(client.pending('plan')).toBe(false);
+  });
+
+  it('a reply for a plan the app no longer shows is dropped (newer request, or cancelled)', () => {
+    client.plan('p1', planMsg('b1', 1));
+    vi.advanceTimersByTime(120);
+    const w = workers[0]!;
+    const first = w.last('plan').id;
+    client.plan('p2', planMsg('b1', 2));
+    w.reply(planReply(first)); // lands inside p2's debounce
+    expect(plans).toEqual([]);
+    vi.advanceTimersByTime(120);
+    const second = w.last('plan').id;
+    client.cancel('plan'); // the next replan needed no advice
+    w.reply(planReply(second));
+    expect(plans).toEqual([]);
+    expect(client.pending('plan')).toBe(false);
+  });
+
+  it('a superseded recommendation is still abandoned by a restart; a pending plan request goes to the new worker', () => {
+    client.recommend('k1', msg('b1'));
+    vi.advanceTimersByTime(180);
+    client.plan('p', planMsg('b1', 1));
+    vi.advanceTimersByTime(120); // queued behind b1's search
+    client.recommend('k2', msg('b2'));
+    vi.advanceTimersByTime(180);
+    expect(workers.length).toBe(2);
+    expect(workers[0]!.terminated).toBe(true);
+    const w1 = workers[1]!;
+    expect(w1.posted.map((m) => m.type).sort()).toEqual(['plan', 'recommend']);
+    expect((w1.last('plan') as Extract<PlannerIn, { type: 'plan' }>).request.stroke!.power).toBe(1);
+    expect(client.pending('plan')).toBe(true);
+    w1.reply(planReply(w1.last('plan').id));
+    expect(plans.map((p) => p[0])).toEqual(['p']);
+    expect(fails).toEqual([]);
+  });
+
+  it('an error reply or a failed worker ends the wait (the plan without the advice stays)', () => {
+    client.plan('p', planMsg('b1', 1));
+    vi.advanceTimersByTime(120);
+    const w = workers[0]!;
+    w.reply({ v: PROTOCOL_VERSION, type: 'error', id: w.last('plan').id, message: 'boom' });
+    expect(fails).toEqual([['plan', 'p']]);
+    client.plan('q', planMsg('b1', 2));
+    vi.advanceTimersByTime(120);
+    w.onerror!({ preventDefault: vi.fn(), message: 'gone' } as unknown as Event);
+    expect(fails).toEqual([
+      ['plan', 'p'],
+      ['plan', 'q'],
+    ]);
+    expect(client.pending('plan')).toBe(false);
+  });
+});
+
 describe('recommendationOutcome: what the app shows for a recommendation', () => {
   it('keeps a found stroke, and says honestly when the spot cannot be reached', () => {
     expect(recommendationOutcome(recReply(1), false)).toEqual({ stroke, toast: null });
@@ -235,6 +349,141 @@ describe('recommendationOutcome: what the app shows for a recommendation', () =>
     expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 0, reachable: false }), true)).toEqual({ stroke: null, toast: null });
     expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 30, reachable: false }), true)).toEqual({ stroke: null, toast: 'No stroke reaches that spot cleanly — showing the basic stroke.' });
     expect(recommendationOutcome(recReply(1, { score: Number.NaN }), false).stroke).toBeNull();
+  });
+  it('says so when strokes were tried and none pots the ball (score −Infinity), with or without a landing spot', () => {
+    // Core types.ts: −Infinity only when no stroke pots the ball. The app falls back to the basic stroke.
+    expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 30, reachable: false }), false)).toEqual({
+      stroke: null,
+      // position.ts evaluate drops a stroke that scratches as well as one that misses: "without a scratch".
+      toast: 'None of the strokes tried pots this ball without a scratch — showing the basic stroke.',
+    });
+  });
+});
+
+describe('recommendedFromReply: what the app keeps of a recommendation (wave-1 Recommendation fields)', () => {
+  it('keeps fragile, timedOut, nextQuality and risks; absent stays absent (risks undefined = not known, never "safe")', () => {
+    const out = recommendationOutcome(recReply(1), false);
+    expect(recommendedFromReply(recReply(1), out)).toEqual({ stroke, pending: false, reachable: true, evaluated: 40 });
+    const risks = [{ pocketId: 'TR' as const, scratchIf: 'harder' as const }];
+    const full = { ...recReply(1, { reachable: false, evaluated: 77 }), fragile: true, timedOut: true, nextQuality: 0.42, risks } as RecommendationReply;
+    const r = recommendedFromReply(full, recommendationOutcome(full, false));
+    expect(r).toEqual({ stroke, pending: false, reachable: false, evaluated: 77, fragile: true, timedOut: true, nextQuality: 0.42, risks });
+    // An empty list is a real "no scratch seen", kept as such.
+    expect(recommendedFromReply(recReply(1, { risks: [] }), out).risks).toEqual([]);
+    expect('risks' in recommendedFromReply(recReply(1), out)).toBe(false);
+    // Only what the reply says: false and 0 are kept, non-finite qualities dropped.
+    const r2 = recommendedFromReply({ ...recReply(1), fragile: false, timedOut: false, nextQuality: 0 } as RecommendationReply, out);
+    expect(r2).toMatchObject({ fragile: false, timedOut: false, nextQuality: 0 });
+    expect('nextQuality' in recommendedFromReply({ ...recReply(1), nextQuality: Number.NaN } as RecommendationReply, out)).toBe(false);
+  });
+  it('the stroke is the outcome’s (null = the basic stroke when nothing pots it)', () => {
+    const none = recReply(1, { score: -Infinity, evaluated: 30, reachable: false });
+    expect(recommendedFromReply(none, recommendationOutcome(none, false)).stroke).toBeNull();
+  });
+});
+
+/** The merge-coherence top-right chain: the cue ball frozen to the 1 (pool9), too soft at power 1 with draw. */
+const T9 = makeTable('pool9');
+const frozenTR: TableLayout = {
+  table: T9,
+  balls: [
+    { id: 'cue', kind: 'cue', pos: { x: -0.2451160266459315, y: 0.23962167347191393 }, label: 'cue' },
+    { id: 'b1', kind: 'object', pos: { x: -0.1891063642501831, y: 0.25098126053810116 }, label: '1' },
+  ],
+  source: 'virtual',
+  frozen: false,
+};
+const softDraw: ShotRequest = { targetId: 'b1', stroke: { power: 1, side: 0, vert: -0.4 } };
+
+describe('the full-plan request carries only what planShot reads (verifier r1: no flicker when a recommendation lands)', () => {
+  // planShot ignores opts.recommended whenever the request has a stroke (planner.ts: request.stroke ??
+  // opts.recommended ?? default). Keyed with it, a recommendation reply landing after the player set
+  // a stroke re-keyed the same plan: the full plan was thrown away, asked for again, and the card flickered.
+  const rec = { power: 6, side: 0.1, vert: 0.2 };
+  const names = { TR: 'far right corner' };
+  it('a stroke the player set: the recommended stroke is in neither the options sent nor the key', () => {
+    expect(fullPlanOptions(softDraw, { names, recommended: rec })).toEqual({ names });
+    expect(planRequestKey(frozenTR, softDraw, DEFAULT_PHYSICS, { names, recommended: rec })).toBe(planRequestKey(frozenTR, softDraw, DEFAULT_PHYSICS, { names }));
+    // And the plan is indeed the same: what the key leaves out does not change it.
+    const a = planShot(frozenTR, softDraw, DEFAULT_PHYSICS, { names, recommended: rec, advice: false });
+    const b = planShot(frozenTR, softDraw, DEFAULT_PHYSICS, { names, advice: false });
+    expect(a).toEqual(b);
+  });
+  it('no stroke set: the recommended stroke is the stroke planned, so it stays in both', () => {
+    const req: ShotRequest = { targetId: 'b1' };
+    expect(fullPlanOptions(req, { names, recommended: rec })).toEqual({ names, recommended: rec });
+    expect(planRequestKey(frozenTR, req, DEFAULT_PHYSICS, { names, recommended: rec })).not.toBe(planRequestKey(frozenTR, req, DEFAULT_PHYSICS, { names }));
+  });
+  it('tables are told apart by their size, not only by the preset id', () => {
+    const wider: TableLayout = { ...frozenTR, table: { ...T9, width: T9.width + 0.01 } };
+    expect(planRequestKey(wider, softDraw, DEFAULT_PHYSICS, {})).not.toBe(planRequestKey(frozenTR, softDraw, DEFAULT_PHYSICS, {}));
+  });
+});
+
+describe('the shot card never shows a power minimum the frozen advice has not worked out (verifier r1)', () => {
+  // Without the advice, minPower is the minimum for the stroke angle at the played power — not the
+  // power to play (harder throws less, so the angle and the minimum move). Drawn as "Minimum x" it
+  // differed from the advice's figure on 55 of 72 frozen soft plans, for 0.1–1.2 s, or for good when
+  // the worker failed.
+  const ctx = (over: Partial<CardContext> = {}): CardContext => ({ targetLabel: '1', pocketName: 'far right corner', status: null, recommendedPending: false, showDetails: true, hint: '', ...over });
+  const stub = () => {
+    let html = '';
+    const el = {
+      dataset: {} as Record<string, string>,
+      get innerHTML() {
+        return html;
+      },
+      set innerHTML(v: string) {
+        html = v;
+      },
+      closest: () => null,
+      contains: () => false,
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      addEventListener: () => {},
+    };
+    return el as unknown as HTMLElement;
+  };
+  const meterLabel = (html: string) => /class="power-meter" role="img" aria-label="([^"]*)"/.exec(html)?.[1] ?? '';
+  const quick = planShot(frozenTR, softDraw, DEFAULT_PHYSICS, { advice: false });
+  const full = planShot(frozenTR, softDraw, DEFAULT_PHYSICS);
+
+  it('a plan whose advice is still coming: no minimum on the meter, no "NaN", no details row with a figure', () => {
+    expect(quick.adviceSkipped).toBe(true);
+    expect(quick.warnings.find((w) => w.code === 'too-soft')!.message).toBe('Too soft — object ball stops short.');
+    // Why it is withheld: the advice-off minimum is not the figure the advice gives (2.5 against 4.3
+    // here), so a card that drew it would tell the player a wrong power.
+    expect(Number.isFinite(quick.minPower)).toBe(true);
+    expect(advisePower(quick.minPower)).not.toBe(advisePower(full.minPower));
+    // As main.ts hands it to the card: no figure until the advice is known.
+    const el = stub();
+    renderShotCard(el, cardPlanOf(quick), ctx({ showDetails: cardDetailsShown(quick, true) }));
+    expect(meterLabel(el.innerHTML)).toMatch(/^Power 1 of 10, /);
+    expect(meterLabel(el.innerHTML)).not.toMatch(/Minimum|full power/);
+    expect(el.innerHTML).not.toMatch(/NaN|Infinity/);
+    expect(el.innerHTML).not.toContain('Min power');
+    expect(el.innerHTML).toContain('Too soft — object ball stops short.');
+    // Everything else is the plan as planned.
+    const { minPowerCapture: _c, ...rest } = quick;
+    expect({ ...cardPlanOf(quick)!, minPower: 0, minPowerSafe: 0 }).toEqual({ ...rest, minPower: 0, minPowerSafe: 0 });
+  });
+  it('the full plan, and any plan with nothing skipped, goes to the card as it is (its minimum is the advice’s)', () => {
+    expect(full.adviceSkipped).toBeUndefined();
+    expect(cardPlanOf(full)).toBe(full);
+    expect(cardDetailsShown(full, true)).toBe(true);
+    expect(cardDetailsShown(full, false)).toBe(false);
+    expect(cardDetailsShown(quick, false)).toBe(false);
+    expect(cardDetailsShown(null, true)).toBe(true);
+    expect(cardPlanOf(null)).toBeNull();
+    const el = stub();
+    renderShotCard(el, cardPlanOf(full), ctx());
+    expect(full.warnings.find((w) => w.code === 'too-soft')!.message, 'this layout has a working band').toMatch(/Use power [\d.]+/);
+    expect(meterLabel(el.innerHTML)).toMatch(/Minimum [\d.]+/);
+    expect(el.innerHTML).toContain('Min power');
+  });
+  it('the same plan gives the same card plan (the card redraws only for a new plan object)', () => {
+    expect(cardPlanOf(quick)).toBe(cardPlanOf(quick));
+    expect(cardPlanOf(quick)).not.toBe(quick);
   });
 });
 
