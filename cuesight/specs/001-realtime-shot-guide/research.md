@@ -2,6 +2,10 @@
 
 Each decision lists what was chosen, why, and what was rejected.
 
+**Revised 2026-11-15** after the code review (see analysis.md, "Post-review"). R-03, R-06, R-08,
+R-09, R-10, R-11 and R-12 now describe the code on `fix/wave1`. Where the earlier text was wrong,
+the correction is stated in the decision itself.
+
 ## R-01 Platform: installable PWA
 
 - **Decision**: a browser PWA (Vite + TypeScript), using `getUserMedia` for the rear camera and Web
@@ -21,8 +25,10 @@ Each decision lists what was chosen, why, and what was rejected.
   over typed arrays.
 - **Rationale**: the table is a near-uniform cloth with a strong prior (rectangle with a known aspect
   ratio), and balls are fixed-size disks after rectification. Classical methods are deterministic,
-  explainable, testable on synthetic ground truth, and about 10 ms per frame. The bundle stays tiny
-  (Principle VII).
+  explainable and testable on synthetic ground truth. They are fast enough: the whole pipeline
+  takes a few tens of ms per 640×480 frame in Node (32 ms median in the 2026-11-15 run; the guard
+  is 150 ms, against a 100 ms device budget). The earlier "about 10 ms" estimate was optimistic.
+  The bundle stays tiny (Principle VII).
 - **Alternatives rejected**:
   - OpenCV.js: ~8 MB of wasm, slow first load on bar Wi-Fi. We only need ~5 algorithms.
   - A learned detector (YOLO via ONNX Runtime Web or TF.js): better for occlusion and ball-number
@@ -31,20 +37,51 @@ Each decision lists what was chosen, why, and what was rejected.
 
 ## R-03 Table geometry: robust quad + homography + focal-length estimate
 
-- **Decision**:
-  1. Learn the cloth colour as the modal hue of the frame centre, and mask cloth-coloured pixels.
-  2. Take the largest connected component near the centre.
+- **Decision** (`vision/table-detect.ts`, `vision/calibration.ts`, `vision/homography.ts`):
+  1. **Cloth colour.** First try the pipeline's established cloth model. Keep it while it still
+     segments a plausible table that the camera is aimed at (component ≥ 5 % of the frame, quality
+     ≥ 0.6). Otherwise learn the cloth as the modal hue of the frame centre. When that chromatic
+     model finds no good table but the centre is mostly grey, try a low-saturation **neutral**
+     (grey) model. Its `hue` is meaningless (0), and it matches on low S and V near the median.
+  2. Mask the cloth-coloured pixels. Take the connected component the camera is aimed at (its
+     outline contains the frame centre, or it covers most of the central window); otherwise take
+     the largest component.
   3. Collect boundary points from per-row and per-column extremes, then take their convex hull.
   4. Reduce the hull to 4 vertices, then **refit each side by least squares** on boundary points
-     away from the corners. Intersect the sides. This recovers true corners even though corner
-     pockets chamfer the cloth mask.
-  5. Compute the homography by 4-point DLT.
-  6. Estimate focal length *f* from the known rectangle: the orthogonality and equal-norm
-     constraints on K⁻¹h₁ and K⁻¹h₂ (Zhang's single-plane calibration with one unknown).
-  7. Choose the long/short side assignment whose two *f* estimates agree best. Fall back to a 65°
-     horizontal FOV when the view is near fronto-parallel (f unobservable).
+     away from the corners and away from the image border. The search band adapts so that it
+     reaches past the corner-pocket cut-outs, and a second pass follows. Intersect the sides. A
+     side with no supporting points, or a sharp or far-off corner, gives no quad.
+  5. **Truncated tables.** A table cut off by the image border is accepted only when every side is
+     still supported by real edge points and the outline runs off the frame wherever the cloth
+     does. Otherwise the result is `null`, never a border-hugging quad. A frame with no table is
+     also `null`.
+  6. **Quality** is the intersection over union of the cloth component and the fitted quad. The
+     pipeline locks only on quality ≥ 0.6 (`MIN_TABLE_QUALITY`, an ASSUMPTION from the synthetic
+     renders: a correct outline scores 0.96–0.98).
+  7. **Calibration.** Reject quads that cannot be a table outline: points not distinct (> 3 % of
+     the diagonal apart), not strictly convex, or covering ≤ 2 % of the frame. Compute the
+     homography to the outer cloth-edge rectangle by 4-point DLT.
+  8. Estimate the focal length *f* from the known rectangle with Zhang's single-plane constraints
+     and one unknown: K⁻¹h₁ ⊥ K⁻¹h₂ and ‖K⁻¹h₁‖ = ‖K⁻¹h₂‖. Each constraint is used only when it is
+     well conditioned (axis tilt above a 0.1 floor). A one-constraint estimate reports the other
+     constraint's residual as its inconsistency, so it is never "perfectly consistent".
+  9. **Long/short assignment.** Score both assignments at one common focal: the orthogonality
+     focal, which is the same for both, when it is plausible, else the assumed one. The score is
+     the equal-norm residual, plus a weak prior toward the assumed focal, plus a penalty when the
+     equal-norm constraint has no solution. Near-ties (< 0.05) keep the previous frame's choice; on
+     a first lock they go to the longer-looking sides. The wrong assignment is off by about
+     |log((L/W)²)| ≈ 1.3. `swapAxes` is an absolute override.
+  10. **0°/180° frame.** It follows the previous frame's corners, so it never flips between
+      frames. On a first lock it is set by the table axis that runs most across the image.
+  11. Use the estimated *f* only when it is plausible (0.35–3.5 × the image width) and consistent
+      (inconsistency < 0.25). Otherwise use the settings' FOV: default 65°, and only 20–150° is
+      accepted. A pose that puts the camera less than 0.3 m above the cushion top is rejected
+      (ASSUMPTION: a phone is held at least that high).
 - **Rationale**: robust to pocket notches, side-pocket gaps and partial ball occlusion of the edge.
-  Focal estimation lets us correct ball parallax without device calibration.
+  Focal estimation lets us correct ball parallax without device calibration. The validation and
+  conditioning rules exist because the earlier "two *f* estimates agree best" rule scored a
+  single-constraint estimate as perfect, so about 1.5 px of corner noise could swap the rails
+  (review finding `single-constraint-focal-wins-axis-swap`).
 - **Alternatives rejected**:
   - Hough lines: more parameters, slower, and fragile with the rail diamonds.
   - Asking the user to calibrate: kept as the fallback (FR-003), not the default.
@@ -75,6 +112,16 @@ Each decision lists what was chosen, why, and what was rejected.
   resolve the impulse, continue. Friction updates velocities at the end of the step, with analytic
   clamping at the sliding→rolling and rolling→stop transitions. Ball state is 3D angular velocity
   plus 2D linear velocity.
+  - A contact counts only when its normal closing speed is above `APPROACH_EPS` = 1e-9 m/s, so
+    resting contacts cannot repeat at t = 0.
+  - Up to 64·n contacts are resolved exactly per step (a frozen rack needs about 40). If that
+    budget is spent, every touching contact is relaxed in sequential-impulse sweeps and exact
+    detection resumes. If it is spent again, the rest of the step is drifted in sub-steps of at
+    most R/8, with overlaps and cushion penetrations pushed out and resolved. No contact is skipped
+    on any path.
+  - Allocation: the step loop allocates only output records (one `SimEvent` per event, trajectory
+    points when `record` is on, and at most n first-hit records). Searches run with `record: false`.
+    The plan.md Complexity Tracking records this exception to Principle IV.
 - **Rationale**: simple, robust (no tunnelling, no quartic root-finding) and accurate enough. Position
   error is O(a·dt²) ≈ µm. A 5 s shot costs ~5k steps × O(moving × balls), a few ms. That fits
   Principle IV.
@@ -95,17 +142,44 @@ Each decision lists what was chosen, why, and what was rejected.
 - **Alternative rejected**: a frictionless collision plus an analytic throw angle (can't evolve spin
   transfer).
 
-## R-08 Cushion collision: simplified impulse model
+## R-08 Cushion collision: rigid-body impulse on the full contact slip
 
-- **Decision**:
-  - Restitution e_c(vₙ) = max(0.55, 0.88 − 0.035·|vₙ|).
-  - Tangential impulse Jt = min(μ_c·Jn, (2/7)·m·|u_t|) at the equatorial contact, with μ_c = 0.2.
-    Updates both velocity and sidespin (running/reverse english).
-- **Rationale**: captures the first-order effects players see: rebound angle shortens with no spin
-  and lengthens with running english, and speed loss. Topspin effects come afterwards through cloth
-  friction.
-- **Alternatives rejected**: Han (2005) and Mathavan et al. (2010) models: more accurate but need
-  cushion-specific constants. Upgrade path.
+- **Decision** (`core/physics/collide.ts`, `resolveCushion`; also used for jaw points):
+  - The contact is taken at the ball's equator, r = −R·n̂.
+  - Normal: speed-dependent restitution on the horizontal normal speed,
+    vₙ' = −e_c·vₙ with e_c(vₙ) = max(0.55, 0.88 − 0.035·|vₙ|) (ASSUMPTION, fitted to the typical
+    0.75–0.9 range).
+  - Friction: Coulomb friction (μ_c = 0.2, ASSUMPTION) on the **full 3-D contact slip**. That is
+    the horizontal slip u_t = (v + ω×r)·t̂ and the vertical slip u_z = (ω×r)_z, which comes from
+    top/back spin against the rail. The sticking impulse (−u_t/(7/2), −u_z/(5/2)) per unit mass is
+    scaled into the cone |P_f| ≤ μ_c·Jₙ. Then r × P_f updates ωx, ωy and ωz. So the rail changes
+    top/back spin as well as side spin: a rolling ball loses most of its topspin at the rail.
+  - This is the impulse structure of Han (2005, "Dynamics in carom and three cushion billiards",
+    J. Mech. Sci. Tech. 19(4)), the `han_2005` cushion model in pooltool, with the contact moved to
+    the equator. It needs no constants beyond e_c and μ_c. Scaling the sticking impulse, rather
+    than applying μ_c·Jₙ along −û, keeps every impact dissipative by construction.
+  - ASSUMPTION: the elevated contact (nose ≈ 1.27 R; WPA 62.5–64.5 % of the ball diameter,
+    `cushionHeight`) is not modelled geometrically. Its downward push is what keeps the ball on the
+    bed (no v_z) while the vertical friction acts. That holds while μ_c < tan θ ≈ 0.28. Cloth
+    friction during the impact (part of Mathavan's model) is ignored.
+- **Rationale**: the earlier model applied friction to the horizontal slip only, so top/back spin
+  passed through every rail unchanged. Its stated rationale ("topspin effects come afterwards
+  through cloth friction") was wrong. The kept topspin acted as draw against the rebound, so a
+  rolling ball ended up rolling away from a head-on rail at only 0.32 of its arrival speed. Kept
+  backspin acted as follow, so draw came back as follow (review findings
+  `cushion-ignores-topspin-backspin`, `cushion-keeps-topspin-speed-scale`).
+  - At the same e_c and μ_c, the review's ports of Han 2005 and of Mathavan, Jackson & Parkin
+    (2010) give, against this model:
+    - head-on natural roll leaving at ≈ 0.58 of the arrival speed (Han ≈ 0.54, Mathavan ≈ 0.51);
+    - a 45° roll-in leaving ≈ 32° off the rail (Han ≈ 31°, Mathavan ≈ 36°).
+  - Rail paths are therefore uncertain by a few degrees, and post-rail speed by about 10 %.
+    `tests/unit/core/collide.test.ts` pins them as ranges: 0.5–0.65 of the arrival speed, and
+    30–40° for a 45° roll-in.
+- **Alternatives**: the full Han (2005) model with the contact angle θ = asin(h/R − 1), from the
+  existing `cushionHeight`, and Mathavan et al. (2010). The old "needs cushion-specific constants"
+  reason for rejecting Han was wrong. The remaining reason is simplicity. On rebound angle this
+  model lands between the two published ones. On post-rail speed it is a little livelier than both
+  (0.58 against 0.51–0.54). Upgrade path: the elevated contact angle.
 
 ## R-09 Pocket model
 
@@ -116,6 +190,22 @@ Each decision lists what was chosen, why, and what was rejected.
   - Acceptance window from a ball: between the directions to the jaws, each rotated inward by
     asin(R/d). It is empty if the shot is too steep.
   - Aim at the window bisector. The window's half-width is the object-ball angular margin.
+  - **Ball frozen to a rail.** When the bisector's ghost ball would sit inside the cushion, the aim
+    moves to the centre of the longest part of the window whose ghost is on the table (1 mm
+    slack).
+  - **Corner hanger.** When the ball's centre is on or past the mouth line, the window is the arc
+    facing the pocket, which is then the long arc. The ball is already at the mouth: distance 0,
+    and `mouthHit` is the ball itself.
+  - **Cue ball touching the object ball** (centres ≤ 2R + 1 mm apart). There is no ghost ball: the
+    object ball leaves along the line of centres, turned only by throw.
+    - The shot is makeable when the line of centres is within the window's half-width plus the
+      largest throw the model allows. That throw is TP A.14 throw at the softest stroke that still
+      reaches the pocket: about 5° with the default physics, depending on `params`.
+    - The planner searches the stroke angle (scan, then bisection or golden section), because
+      throw is not monotonic in it: it peaks near 30° of stroke angle (31.5° at 0.6 m/s with the
+      default μ(v), where the bound is 4.96°).
+    - On snooker tables a touching ball is not makeable: moving it is a push stroke, a foul under
+      the "touching ball" rule.
   - In simulation, a ball is pocketed when its centre leaves the rectangle, which is only possible
     through a gap.
 - **Rationale**: one geometric model gives aim target, makeability, margin and simulation capture.
@@ -135,40 +225,104 @@ Each decision lists what was chosen, why, and what was rejected.
   - very hard < 0.04°
 
   We also report the tolerance as mm of contact-point error (2R·cosφ·w).
+  - d is floored at 2R, and cos φ at 0. A not-makeable shot has tolerance 0, never a negative
+    value (cuts past 90° are "wrong side").
+  - Frozen cue ball: the tolerance is the margin of the line of centres, plus the available throw,
+    inside the window (see R-09).
 - **Rationale**: one physically meaningful number that combines distance, cut and pocket. Thresholds
   are calibrated so a 1 m + 1 m, 30° corner shot is "medium", and are configurable.
 
 ## R-11 Stroke recommendation and position play
 
-- **Decision**: grid search over tip offset and speed, simulating each candidate on the full layout.
-  - Vertical offsets: −0.4, −0.25, −0.1, 0.1, 0.25, 0.4 R.
-  - Side offsets: −0.2, 0, +0.2 R.
-  - Speeds: power levels between the minimum feasible level and 10.
-  - Score = objective − penalties.
-    - Objective: next-shot quality from the CB rest position (best log-tolerance over remaining
-      balls and pockets), or −distance to the player's target spot.
-    - Penalties: speed (0.06·power + 0.1·max(0, power − 6)², a coach's bias toward controllable
-      pace), spin magnitude, OB not pocketed, any kiss.
-    - Hard rejection: scratch.
-  - Robustness: each finalist is re-simulated at ±12 % speed and scored by its worst case.
-- **Rationale**: transparent, deterministic, and fast enough in a worker (~200–600 short sims). The
-  robustness check prefers forgiving strokes, which is what a coach does.
+- **Decision** (`core/shot/position.ts`, `recommendStroke`): a grid search over tip offset and
+  speed. Each candidate is a full `planShot` on the whole layout, with throw compensation and
+  `record: false`.
+  - **Grid.**
+    - Vertical offsets: −0.4, −0.25, −0.1, 0.1, 0.25, 0.4 R. Side offsets: −0.2, 0, +0.2 R.
+    - Power levels: every integer from ⌊`minPowerCapture`⌋ (the bare capture minimum, see
+      data-model.md) to 10.
+    - **Coarse to fine.** Centre ball at vert −0.4, 0.1 and 0.4 for every power comes first, then
+      the rest of the grid. So a smaller budget thins every power evenly instead of dropping the
+      hard strokes.
+  - **Rejection.** A stroke is rejected when the object ball does not drop in the chosen pocket,
+    the cue ball scratches, or the cue ball has no rest position.
+  - **Score** = objective − penalty.
+    - Objective with a landing spot: −(rest error) / 0.15 m.
+    - Objective without one: 3 × next-shot quality (0..1), judged on the **post-shot table**: the
+      target, the cue ball and any pocketed ball are removed, and balls the shot moved sit at their
+      rest spots. Quality is the best log-scaled cue-ball tolerance over the remaining balls and
+      pockets (0.02° → 0, ≥ 1° → 1).
+    - Penalty: 0.06·power + 0.1·max(0, power − 6)² (a coach's bias toward controllable pace) +
+      0.6·|side| + 0.3·|vert| + 1 for a kiss + 0.5 for any cue-ball contact with another ball.
+  - **Reachable.** A landing spot is reachable when any potting stroke ends within 15 cm of it.
+    Then only those strokes compete.
+  - **Robustness** (the "most reliable stroke" of FR-020):
+    - Candidates are walked in score order. Each is re-simulated as the same cue line (no re-aim,
+      same tip) at 0.88, 0.94, 1.06 and 1.12 × its true speed. Underhits below power 1 are
+      simulated at their real speed.
+    - **Any scratch or miss at those speeds disqualifies the candidate.**
+    - A survivor's robust score is min(nominal score, worst variant objective − its penalty), i.e.
+      the **worst case**.
+    - The walk stops after 5 candidates pass, or when the budget runs out. It continues past the
+      first 5 when they fail.
+    - Overhits past full power (7.0 m/s) cannot be played or tested. A stroke that needs them is
+      used only when no fully tested one survives.
+    - If nothing survives, the best nominal stroke is returned with `fragile: true`.
+  - **Score reported**: the robust score. It is −∞ only when no stroke pots the ball.
+  - **Budget (Constitution III).** The search is bounded by an evaluation count, `maxEvaluations`
+    (default `FULL_EVALUATIONS` = 10 × 18 grid strokes + 12 × 4 variants = 228). The result is a
+    deterministic function of the inputs and that count. The core reads the clock only when the
+    caller sets the optional safety net `timeCapMs`, and the result then says `timedOut: true`.
+    - The planner worker picks the count once per device and ball count: about 1.2 s divided by
+      the measured cost of one `planShot`, clamped to 60–228.
+    - It sets `timeCapMs: 1500` as the safety net (the < 1.5 s budget of Principle IV).
+- **Rationale**: transparent, deterministic for a given budget, and fast enough in a worker. The
+  robustness rule prefers forgiving strokes, which is what a coach does. The review found that the
+  earlier rule (a mean of nominal and worst, a fixed 3-point scratch cost, only the top 5 checked,
+  a wall-clock budget in core) let scratch-prone strokes win and varied with device speed (findings
+  `robustness-allows-scratch-prone-strokes`, `wall-clock-budget-in-core`, `contract-docs-false`).
 - **Alternative rejected**: gradient-based optimisation (discontinuous objective at collisions and
   pockets).
 
 ## R-12 Power scale
 
 - **Decision**: power levels 1–10 map to CB speeds [0.6, 0.9, 1.2, 1.6, 2.1, 2.7, 3.4, 4.3, 5.5, 7.0]
-  m/s. Speed words:
-  - soft (1–2)
-  - medium-soft (3)
-  - medium (4–5)
-  - medium-firm (6)
-  - firm (7)
-  - hard (8)
-  - power (9–10)
-- **Rationale**: spans lag to firm-break speeds (Alciatore's speed categories). The non-linear spacing
+  m/s, with linear interpolation between levels. The speed word uses the power rounded to the
+  nearest level, so each word covers this band of cue-ball speed:
+
+  | Word | Power | CB speed (m/s) | MASTER_PROMPT §5 word for that speed |
+  |---|---|---|---|
+  | soft | 1–2 | 0.6 – 1.05 | soft |
+  | medium-soft | 3 | 1.05 – 1.4 | soft |
+  | medium | 4–5 | 1.4 – 2.4 | soft (< 1.5) / medium |
+  | medium-firm | 6 | 2.4 – 3.05 | medium / firm (≥ 3) |
+  | firm | 7 | 3.05 – 3.85 | firm |
+  | hard | 8 | 3.85 – 4.9 | firm |
+  | power | 9–10 | 4.9 – 7.0 | firm (< 5) / hard |
+
+- **Rationale**: the scale spans very soft position play (0.6 m/s, 1.3 mph) to a hard power stroke
+  (7.0 m/s, 15.7 mph). Break speeds (≥ 8 m/s in MASTER_PROMPT §5) are **out of scope**: the earlier
+  claim that it "spans lag to firm-break speeds (Alciatore's speed categories)" was wrong, and the
+  attribution was never checked against the source, so it is withdrawn. The non-linear spacing
   matches how players perceive speed.
+- **Deliberate deviation from MASTER_PROMPT §5** (soft ≈ 0.5–1.5, medium ≈ 1.5–3, firm ≈ 3–5,
+  hard ≈ 5–8, break ≥ 8 m/s). The words follow the spec.md clarification, which splits the
+  playable range more finely. As a result 4.3 m/s is "hard" here but "firm" there, and
+  5.5–7.0 m/s is "power" here but "hard" there. The m/s value is always available as secondary
+  detail (FR-012).
+- **What a level means on the table** (model output, not a measurement: pool9, default cloth
+  μᵣ = 0.01, a centre-ball stroke from 0.3 m off the head cushion along the long axis; the total
+  cue-ball path in table lengths L):
+
+  | Power | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | Path (L), cushion model of R-08 | 0.39 | 0.87 | 1.12 | 1.54 | 1.98 | 2.32 | 2.76 | 3.09 | 3.68 | 3.97 |
+  | Path (L), old model (before 2026-11-15) | 0.39 | 0.87 | 0.96 | 1.12 | 1.35 | 1.68 | 1.89 | 2.00 | 2.57 | 3.02 |
+
+  The old cushion model kept topspin through each rail (R-08), so it under-predicted cue-ball
+  travel after a rail by up to about a third. The power scale itself was not recalibrated: the
+  planner chooses power through the simulation, so fixing the cushion fixes the recommendation.
+  Whether the default μᵣ matches real lag speed is still unchecked against a measurement.
 
 ## R-13 Testing strategy
 

@@ -54,6 +54,10 @@ describe('squirt (Alciatore TP A.31)', () => {
     expect(ld).toBeLessThan(std);
     expect(squirtAngle(0, 23)).toBe(0);
   });
+  it('matches TP A.31 at half-tip-radius english: 2.40° standard shaft (m/me 23), 1.64° low-deflection (35)', () => {
+    expect(Math.abs(deg(squirtAngle(0.5, 23)) - 2.4)).toBeLessThan(0.05);
+    expect(Math.abs(deg(squirtAngle(0.5, 35)) - 1.64)).toBeLessThan(0.05);
+  });
 });
 
 describe('rolling distance', () => {

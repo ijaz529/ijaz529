@@ -19,7 +19,8 @@ describe('vision pipeline (synthetic camera feed)', () => {
     for (let i = 0; i < 5; i++) times.push(p.process(frame).ms);
     times.sort((a, b) => a - b);
     console.log(`pipeline 640×480: median ${times[2]!.toFixed(1)} ms/frame`);
-    expect(times[2]!).toBeLessThan(250); // device budget 100 ms (≥10 Hz); generous CI guard
+    // Device budget 100 ms (≥ 10 Hz); about 58 ms measured on the shared CI runner.
+    expect(times[2]!).toBeLessThan(150);
   });
 
   it('works from four manually tapped corners (manual calibration)', () => {

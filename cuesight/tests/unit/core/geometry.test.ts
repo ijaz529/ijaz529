@@ -30,4 +30,30 @@ describe('aiming geometry', () => {
     expect(fractionOf(rad(48.6)).label).toBe('¼');
     expect(fractionOf(rad(85)).label).toBe('thin');
   });
+  it('fraction labels are never more than 2° off the real cut without saying thick/thin (coarse-fraction-labels)', () => {
+    const REFS: Record<string, number> = { full: 1, '⅞': 7 / 8, '¾': 3 / 4, '⅝': 5 / 8, '½': 1 / 2, '⅜': 3 / 8, '¼': 1 / 4, '⅛': 1 / 8 };
+    const refCut = (f: number) => deg(Math.asin(1 - f));
+    for (let c = 0; c <= 80; c += 0.25) {
+      const { label } = fractionOf(rad(c));
+      const m = /^(thick |thin )?(.+)$/.exec(label)!;
+      const qual = m[1]?.trim();
+      const ref = m[2]!;
+      if (ref === 'thin') {
+        // Catch-all for very thin hits: only used beyond the ⅛-ball cut.
+        expect(qual, `${c}°`).toBeUndefined();
+        expect(c, `${c}° labelled thin`).toBeGreaterThan(refCut(1 / 8) + 2);
+        continue;
+      }
+      expect(REFS[ref], `${c}° → ${label}`).toBeDefined();
+      const rc = refCut(REFS[ref]!);
+      if (!qual) expect(Math.abs(c - rc), `${c}° → ${label} (ref ${rc.toFixed(1)}°)`).toBeLessThanOrEqual(2 + 1e-9);
+      else if (qual === 'thin') expect(c, `${c}° → ${label}`).toBeGreaterThan(rc);
+      else expect(c, `${c}° → ${label}`).toBeLessThan(rc);
+    }
+    for (const c of [7.2, 22]) expect(['full', '¾']).not.toContain(fractionOf(rad(c)).label);
+    expect(fractionOf(rad(30)).label).toBe('½');
+    expect(fractionOf(rad(40)).label).not.toBe('¼'); // a 40° cut is not a ¼-ball (48.6°) hit
+    expect(fractionOf(rad(1)).label).toBe('full'); // ≥ 97 % overlap, as the fraction glyph says
+    expect(fractionOf(rad(3)).label).not.toBe('full');
+  });
 });

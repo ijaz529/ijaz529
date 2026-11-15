@@ -53,7 +53,8 @@ export interface PlayerViewInput {
   /**
    * Optional (non-breaking extension): the cloth colour learned from the overview photo
    * (`VisionResult.cloth`). Used when this photo's own cloth estimate fails or disagrees with it,
-   * e.g. when the floor or the near rail fills the bottom of the frame.
+   * e.g. when the floor or the near rail fills the bottom of the frame. A neutral (grey) model is
+   * ignored: it carries no hue.
    */
   clothHint?: ClothModel | null;
 }
@@ -1745,7 +1746,10 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
   const learned = learnClothBand(frame);
   const meanV = learned.meanV;
   let cloth = learned.model;
-  const hint = input.clothHint;
+  // A neutral (grey) overview cloth has no hue (ClothModel: `hue` is then meaningless): it must not
+  // steer this photo toward hue 0. Known limit: this matcher is hue-based, so a grey cloth is not
+  // read here yet (the photo then fails honestly).
+  const hint = input.clothHint && input.clothHint.kind !== 'neutral' ? input.clothHint : null;
   if (hint && (!cloth || hueDiff(cloth.hue, hint.hue) > 35)) cloth = clothFromHint(frame, hint) ?? cloth;
   if (!cloth || meanV < 0.05 || cloth.val < 0.12) return fail(PLAYER_VIEW_REASONS.dark, t0);
   const sc = getScratch(w, h);

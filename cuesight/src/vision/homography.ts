@@ -71,18 +71,38 @@ export function homographyFrom4(src: Vec2[], dst: Vec2[]): Mat3 {
 export interface FocalEstimate {
   /** Estimated focal length in px (NaN if unobservable). */
   f: number;
-  /** |log(f_orthogonality / f_equalNorm)| when both constraints are usable; 0 with one; ∞ with none. */
+  /**
+   * How badly the estimate disagrees with the rectangle model (0 = perfect, ∞ = no estimate).
+   * Two usable constraints: |log(f_orthogonality / f_equalNorm)|. One: the residual of the other,
+   * ill-conditioned constraint at the estimated f (|cos∠(K⁻¹h₁, K⁻¹h₂)| or |log(‖K⁻¹h₁‖/‖K⁻¹h₂‖)|), so a
+   * single unverifiable constraint is never reported as perfectly consistent.
+   */
   inconsistency: number;
   /** Number of well-conditioned constraints used (0, 1 or 2). */
   constraints: number;
+  /**
+   * Focal length from the orthogonality constraint alone (NaN when it is not usable). Swapping which
+   * image sides are the long rails only rescales and swaps H's columns, so this value is the same for
+   * both assignments and cannot tell them apart.
+   */
+  fOrtho?: number;
+  /** The equal-norm constraint is well conditioned but has no positive solution: evidence against the assignment. */
+  normInfeasible?: boolean;
 }
+
+/**
+ * Conditioning floor on the axis tilts (≈ tan of the angle out of the image plane). ASSUMPTION
+ * (empirical, review exp10/exp9 on synthetic end and corner views): below ≈ 0.1 (≈ 6°) a constraint is
+ * switched on and off by ≈ 1 px of corner noise and its focal estimate is meaningless.
+ */
+const TILT_FLOOR = 0.1;
 
 /**
  * Focal length from a homography of a metric rectangle, assuming square pixels and a known principal
  * point (Zhang's constraints with one unknown): K⁻¹h₁ ⊥ K⁻¹h₂ and ‖K⁻¹h₁‖ = ‖K⁻¹h₂‖.
  * The orthogonality constraint degenerates when a vanishing point is at infinity (an axis parallel to
- * the image plane); the equal-norm one when both axes are equally tilted. Each is used only when
- * well-conditioned. `fRef` (≈ expected focal) only normalises the conditioning test.
+ * the image plane); the equal-norm one when both axes are equally tilted (or both barely tilted). Each
+ * is used only when well-conditioned. `fRef` (≈ expected focal) only normalises the conditioning test.
  */
 export function estimateFocal(H: Mat3, cx: number, cy: number, fRef = 2 * cx): FocalEstimate {
   const a = [H[0]! - cx * H[6]!, H[3]! - cy * H[6]!, H[6]!];
@@ -94,12 +114,17 @@ export function estimateFocal(H: Mat3, cx: number, cy: number, fRef = 2 * cx): F
   // Tilt of each axis toward the camera (≈ tan of the angle out of the image plane).
   const za = (Math.abs(a[2]!) * fRef) / Math.hypot(a[0]!, a[1]!);
   const zb = (Math.abs(b[2]!) * fRef) / Math.hypot(b[0]!, b[1]!);
-  const orthoOk = Math.min(za, zb) > 0.03;
-  const normOk = Math.abs(za * za - zb * zb) > 0.03 * Math.max(za * za, zb * zb, 1e-9);
+  const orthoOk = Math.min(za, zb) > TILT_FLOOR;
+  const normOk = Math.max(za, zb) > TILT_FLOOR && Math.abs(za * za - zb * zb) > 0.03 * Math.max(za * za, zb * zb, 1e-9);
   const w1 = -c1 / A1;
   const w2 = -c2 / A2;
   const ok1 = orthoOk && Number.isFinite(w1) && w1 > 0;
   const ok2 = normOk && Number.isFinite(w2) && w2 > 0;
+  // Residuals of each constraint at w = 1/f² (dimensionless; 0 for an exact rectangle at the true f).
+  const na = (w: number) => (a[0]! ** 2 + a[1]! ** 2) * w + a[2]! ** 2;
+  const nb = (w: number) => (b[0]! ** 2 + b[1]! ** 2) * w + b[2]! ** 2;
+  const orthoRes = (w: number) => Math.abs(A1 * w + c1) / Math.sqrt(na(w) * nb(w));
+  const normRes = (w: number) => Math.abs(0.5 * Math.log(na(w) / nb(w)));
   let w = NaN;
   let inconsistency = Infinity;
   if (ok1 && ok2) {
@@ -107,9 +132,30 @@ export function estimateFocal(H: Mat3, cx: number, cy: number, fRef = 2 * cx): F
     inconsistency = Math.abs(0.5 * Math.log(w2 / w1));
   } else if (ok1 || ok2) {
     w = ok1 ? w1 : w2;
-    inconsistency = 0;
+    inconsistency = ok1 ? normRes(w) : orthoRes(w);
   }
-  return { f: w > 0 ? 1 / Math.sqrt(w) : NaN, inconsistency, constraints: Number(ok1) + Number(ok2) };
+  return {
+    f: w > 0 ? 1 / Math.sqrt(w) : NaN,
+    inconsistency: Number.isFinite(inconsistency) ? inconsistency : Infinity,
+    constraints: Number(ok1) + Number(ok2),
+    fOrtho: ok1 ? 1 / Math.sqrt(w1) : NaN,
+    normInfeasible: normOk && !(Number.isFinite(w2) && w2 > 0),
+  };
+}
+
+/**
+ * Equal-norm residual |log(‖K⁻¹h₁‖ / ‖K⁻¹h₂‖)| of a table homography at focal f (0 when the two metric
+ * axes have equal scale, as a correctly assigned rectangle does at the true f).
+ */
+export function normResidual(H: Mat3, cx: number, cy: number, f: number): number {
+  const w = 1 / (f * f);
+  const a0 = H[0]! - cx * H[6]!;
+  const a1 = H[3]! - cy * H[6]!;
+  const b0 = H[1]! - cx * H[7]!;
+  const b1 = H[4]! - cy * H[7]!;
+  const na = (a0 * a0 + a1 * a1) * w + H[6]! * H[6]!;
+  const nb = (b0 * b0 + b1 * b1) * w + H[7]! * H[7]!;
+  return Math.abs(0.5 * Math.log(na / nb));
 }
 
 export function intrinsics(f: number, cx: number, cy: number): Mat3 {

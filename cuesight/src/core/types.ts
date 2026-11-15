@@ -129,6 +129,7 @@ export interface Trajectory {
 
 export type WarningCode =
   | 'not-makeable'
+  /** The cue ball stops before it reaches the object ball (the shot cannot happen at this power and spin). */
   | 'cb-short'
   | 'blocked-cue'
   | 'blocked-object'
@@ -138,7 +139,9 @@ export type WarningCode =
   | 'ob-missed'
   | 'thin-cut'
   | 'frozen'
-  | 'miscue-risk';
+  | 'miscue-risk'
+  /** The simulated ball misses because no aim with the ghost clear of the rail cancels the throw. */
+  | 'throw-uncompensable';
 
 export interface Warning {
   code: WarningCode;
@@ -154,29 +157,61 @@ export interface ShotPlan {
   makeable: boolean;
   ghost: Vec2;
   ghostUncorrected: Vec2;
+  /** Unit direction the cue ball travels (cue ball → ghost ball): the line the app draws. */
   aimDir: Vec2;
+  /** Same vector as cueDir (the name wave-1 consumers use); optional for older producers. */
+  cueAimDir?: Vec2;
   contactPoint: Vec2;
   obDir: Vec2;
   cutAngleDeg: number;
   /** Signed cut: + means the object ball goes to the left of the cue-ball line (CCW). */
   cutSide: 1 | -1 | 0;
   fraction: number;
+  /**
+   * Coaching label (geometry.ts fractionOf): 'full' (≥ 97 % overlap), the nearest eighth ('⅞' … '⅛')
+   * prefixed 'thin '/'thick ' when the cut is more than 1.5° off that eighth's own cut, or 'thin'
+   * below 1/16 overlap. A frozen cue ball has cut 0, so 'full'.
+   */
   fractionLabel: string;
-  /** The label in words, qualified when the cut is more than 1.5° off it ("a touch thinner than ½-ball"). */
+  /** The same label in words, qualified by the same 1.5° rule ("a touch thinner than ½-ball"). */
   fractionPhrase: string;
   throwDeg: number;
   throwShiftMm: number;
   /**
-   * Which way the throw-compensated ghost ball moved from the plain one, as the player aims it:
-   * thinner/thicker on a cut, left/right of full ball on a straight-in; null when there is no shift.
+   * Which way the throw-compensated ghost ball moved from the plain one (ghostUncorrected), as the
+   * player aims it: 'thinner' (the usual cut-induced throw) or 'thicker' (outside english throws the
+   * ball thin) on a cut, 'left'/'right' of full ball on a hit the fraction label calls "full"; null
+   * when there is no shift (and for a frozen cue ball, which has no ghost ball).
    */
   throwAim: 'thinner' | 'thicker' | 'left' | 'right' | null;
+  /** Same as throwAim, absent instead of null (the name an earlier wave-1 draft used). */
+  throwShiftDir?: 'thinner' | 'thicker' | 'left' | 'right';
   squirtDeg: number;
-  /** Direction to point the cue (unit): the cue-ball path (aimDir) turned by the squirt compensation. */
+  /**
+   * Unit direction of the cue stick: aimDir rotated by the squirt correction (clockwise for right
+   * english), so the ball squirts onto aimDir. Equal to aimDir without side spin. The app draws the
+   * cue (3D cue, Snap strike point) along it; the drawn ball path stays aimDir.
+   */
   cueDir: Vec2;
   stroke: Stroke;
   strokeSource: 'player' | 'recommended' | 'default';
+  /**
+   * Lowest power (analytic chain) at which the object ball reaches the pocket mouth with some pace
+   * (≥ params.pocketArrivalSpeed); > 10: not even at full power. The minimum the app shows and the
+   * figure the "too soft" advice quotes (unchanged meaning).
+   */
   minPower: number;
+  /**
+   * Lowest power (analytic chain) at which the cue ball reaches the object ball and the object ball
+   * just crosses the pocket's capture line (≤ minPower; > 10: not even at full power). Below it the
+   * ball stops short; between it and minPower it only just drops. Optimistic: the chain ignores the
+   * backspin a rolling cue ball gives the object ball, and the simulation needs ≈6 % more cue-ball
+   * speed (median of 50 random pool9 layouts, up to 12 %). The position search starts here.
+   * Always set by planShot.
+   */
+  minPowerCapture?: number;
+  /** @deprecated Same as minPower (kept for consumers of an earlier draft). */
+  minPowerSafe?: number;
   cuePath: Trajectory;
   objectPath: Trajectory;
   otherPaths: Trajectory[];
@@ -221,11 +256,33 @@ export interface StrokeRisk {
 
 export interface Recommendation {
   stroke: Stroke;
+  /**
+   * Robust score: the worst of the nominal stroke and the same cue line mis-hit at ±6/±12 % of its
+   * true speed, averaged half and half with the worst tip/aim/shaft mis-hit (position.ts header);
+   * the nominal score when fragile; −Infinity only when no stroke pots the ball.
+   */
   score: number;
   reachable: boolean;
   restError?: number;
   rest?: Vec2 | null;
+  /** Simulations run: grid plans, half steps and robustness mis-hits (deterministic for a given layout, request and budget). */
   evaluated: number;
-  /** Scratches seen in the robustness probes of the chosen stroke (empty when it is safe). */
+  /**
+   * Cue-ball scratches seen when the chosen stroke was mis-hit in the robustness checks (speed, tip,
+   * aim, shaft squirt). An array, empty when none scratched, whenever the stroke was checked and
+   * passed (fragile unset). For a fragile stroke it lists the scratches its check found, and is
+   * absent when that check found none or never ran: absent means "not known", never "safe".
+   */
   risks?: StrokeRisk[];
+  /**
+   * True when no stroke was verified against ±6/±12 % speed errors (every candidate checked scratched
+   * or missed at some speed, or the evaluation budget ran out first): treat the stroke as possibly
+   * speed-sensitive and say so. Overhits past full power can't be played and are never tested, so a
+   * stroke near full power is verified against its underhits only.
+   */
+  fragile?: boolean;
+  /** Next-shot quality (0..1) of the chosen stroke on the post-shot table (default objective only). */
+  nextQuality?: number;
+  /** The optional wall-clock safety cap (RecommendOptions.timeCapMs) cut the search short. */
+  timedOut?: boolean;
 }

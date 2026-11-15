@@ -34,9 +34,18 @@ access requires HTTPS or localhost. Or deploy `dist/` to any static host.
 | Q12 | Suggest | *Suggest* → up to 3 ranked shots in < 2 s. No blocked shots | US4 |
 | Q13 | Position | *Position* → tap a spot. Recommended stroke. Rest marker near the spot (≤ 15 cm when reachable) | US5-AS1 |
 | Q14 | Heatmap | *Zones* → choose the next ball. Coloured zones drawn | US5-AS3 |
-| Q15 | Offline | Build + preview, load once, go offline, reload. App works | FR-026 |
+| Q15 | Offline | Build + preview, load once, go offline, reload. App works. Automated by `tests/e2e/offline.spec.ts` (zero external requests, then an offline reload) | FR-025, FR-026 |
+| Q16 | Mark the cue ball | Camera mode → *Cue ball* → tap the white ball. The status says "Cue ball set." and the plan is redrawn from that ball. On `fix/wave1` this works on the live layout only: on a frozen layout the toast appears but nothing changes (open, wave 2) | FR-007 |
+| Q17 | Cue ball not identified | Fake camera or real table with two whites side by side, or none. No ball is marked as the cue ball. The spec asks for a "Tap the cue ball" prompt; on `fix/wave1` the card says "Waiting for the cue ball and target…" (open, wave 2) | Edge case "Cue ball not found" |
+| Q18 | Frozen cue ball | Practice table: drag the cue ball against the object ball, with the line of centres a few degrees off the pocket. "Frozen" warning with a stroke angle. On a snooker preset: "Not makeable … push stroke" | Edge case "cue ball touching" |
+| Q19 | Rail return (automated) | `tests/unit/core/collide.test.ts`: a ball rolling at 1 m/s from 0.3 m before the foot cushion comes back at least 1.0 m. Draw and stun come off a rail within 0.05 m/s of each other | FR-014, research.md R-08 |
 
 ## Accuracy self-check
 
 `npm test -- vision` prints per-scene corner and ball-position errors. Compare them with the
 targets in `contracts/core-api.md`.
+
+On `fix/wave1` (2026-11-15), `npx vitest run` gives 538 tests in 37 files: 532 pass and 6 fail. The
+failures are the touching-cluster and 4:2:0 corner-pair cases in `ball-detect-edge.test.ts`
+(analysis.md "Post-review"). Timing tests can fail when the CPU is shared. Re-run a failing timing
+test on its own before concluding.

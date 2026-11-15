@@ -286,6 +286,22 @@ describe('player-view honesty: no guide from a photo it cannot read (Principle I
     const r = estimatePlayerView({ frame: render(base), table: base.table, balls: knownOf(pool).map((b) => (b.isCue ? b : { ...b, pos: { x: b.pos.x, y: -b.pos.y } })), cueId: 'cue', targetId: 'b1' });
     expect(r.ok).toBe(false);
   });
+
+  it("a neutral (grey) overview cloth hint carries no hue: it never turns a red floor into the cloth, and changes nothing on green", () => {
+    // The overview pipeline now locks grey cloth with ClothModel {kind: 'neutral', hue: 0}. Read as a
+    // hue, that hint made this photo's cloth the red floor (reason "can't see enough balls" instead of
+    // the no-hint "too dark").
+    const neutral = { hue: 0, sat: 0.06, val: 0.47, kind: 'neutral' as const };
+    const grey = renderSyntheticTable({ table: base.table, balls: base.balls, camera: base.cam, width: W, height: H, ss: 1, cloth: [110, 116, 124], floor: [170, 40, 35] });
+    const without = run(base, {}, grey);
+    const withHint = run(base, { clothHint: neutral }, grey);
+    expect(without.ok).toBe(false);
+    expect(withHint.ok).toBe(false);
+    expect(withHint.reason).toBe(without.reason);
+    const green = run(base, { clothHint: neutral });
+    expect(green.ok).toBe(true);
+    expect(green.pose).toEqual(run(base).pose);
+  });
 });
 
 // --- Snap chain on the committed fixtures, through the v2 worker protocol ----------------------------

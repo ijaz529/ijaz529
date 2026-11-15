@@ -4,7 +4,8 @@
 
 **Created**: 2026-11-14
 
-**Status**: Draft (clarified, ready for planning)
+**Status**: Implemented (v1). Clarifications amended on 2026-11-15 after the code review (see
+"Session 2026-11-15" below and analysis.md "Post-review").
 
 **Input**: User description: "Pool / snooker real-time shot guide. I point the camera at a table and it
 shows me where, and on exactly which line, I have to hit the cue ball to pocket a particular target
@@ -23,14 +24,47 @@ Expanded by `docs/MASTER_PROMPT.md`.
 - Q: Which table types are supported at launch? → A: 9-ft, 8-ft and 7-ft pool, UK 7-ft pool and 12-ft
   snooker, as presets the player selects. The default is 9-ft pool.
 - Q: How should power be communicated? → A: A 1–10 scale with a speed word (soft, medium-soft,
-  medium, firm, hard, power). Estimated cue-ball speed is secondary detail.
+  medium, medium-firm, firm, hard, power). Estimated cue-ball speed is secondary detail. The m/s band
+  of each word is in research.md R-12.
 - Q: How should spin be communicated? → A: A tip position drawn on a cue-ball face, plus words ("½ tip
-  low, ¼ tip right"). One "tip" equals one tip-width (≈ ¼ of the ball radius from centre per tip,
-  max 2 tips).
+  low, ¼ tip right"). One "tip" is ¼ of the ball radius of offset from centre (max 2 tips, the ½ R
+  miscue limit). *Amended 2026-11-15:* this line used to say "one tip-width", but ¼ R (≈ 7 mm on a
+  pool ball) is about one cue-tip radius, half a tip-width. See the 2026-11-15 session.
 - Q: What does the app do when the phone moves after the player locks a layout? → A: The locked layout
   stays and is shown on the top-down map. The camera overlay is hidden until the table is re-acquired.
 - Q: What if no camera is available or permission is denied? → A: The player gets the virtual practice
   table with the full planner.
+
+### Session 2026-11-15 (post-review)
+
+These answers record what the reviewed implementation does, and they flag the open decisions.
+
+- Q: What does "1 tip" of spin mean? → A: The implemented unit is ¼ R of tip offset: ≈ 7 mm on a
+  pool ball, about one cue-tip radius. So the natural-roll height 0.4 R reads "1½ tip high" and the
+  miscue limit reads "2 tip high" (the missing plural is a known wording bug). Most players mean a
+  tip-width (a 13 mm tip ≈ 0.45 R on a pool ball, ≈ 0.37 R on a snooker ball).
+  - **Open decision**: keep ¼ R or switch to tip-widths (analysis.md P-F2).
+  - Until it is decided, the shot card also gives the offset in mm (wave 2a).
+- Q: Do the speed words follow MASTER_PROMPT §5? → A: No, deliberately. The words from the power
+  clarification above stand, and their m/s bands are in research.md R-12. The scale tops out at
+  7.0 m/s, so break speeds (≥ 8 m/s) are out of scope.
+- Q: How precise is the fractional-aim label? → A: The nearest eighth of a ball (⅞ … ⅛). It is
+  prefixed "thin" or "thick" when the real cut is more than 2° away from that eighth. "full" needs
+  97 % overlap, and "thin" means below 1/16 overlap. The exact cut angle is always shown as well.
+- Q: What if the cue ball touches the object ball? → A: There is no ghost ball. The object ball
+  leaves along the line of centres, turned only by throw (at most ≈ 5° with default physics).
+  - The plan gives the stroke angle that throws it toward the pocket, and is not makeable when even
+    that cannot reach the pocket window.
+  - On snooker tables a touching ball is never makeable or suggested: moving it is a push stroke, a
+    foul.
+- Q: What if the cue ball cannot be told apart (none visible, or two whites too close to call)? →
+  A: Vision marks no ball as the cue ball, and the player is asked to tap it (edge case below).
+  On `fix/wave1` the app shows "Waiting for the cue ball and target…" instead of the tap prompt
+  (open, wave 2).
+- Q: What does "most reliable stroke" (FR-020) mean? → A: The stroke whose worst outcome is best,
+  over the nominal speed and ±6 % / ±12 % speed errors. Any scratch or miss at those speeds rules a
+  stroke out. When no stroke survives, the best one is still offered, marked speed-sensitive (the
+  `fragile` flag; the app shows it from wave 2) (research.md R-11).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -188,7 +222,9 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 - Balls touching each other or frozen to a cushion → each ball is still detected separately. A plan
   with the object ball frozen to the rail is still computed.
 - Cue ball not found, or several white-ish candidates → the player is asked to tap the cue ball.
-- The cue ball touching the object ball → the plan warns that a frozen ball changes the throw.
+- The cue ball touching the object ball → the plan warns that the balls are frozen. It aims the
+  stroke along the line of centres plus throw, not at a ghost ball (on snooker: not makeable, a push
+  stroke).
 - Object ball already in the pocket jaws → handled like any short shot; the margin reflects the jaws.
 - Very thin cuts (> 80°) → allowed but flagged "very thin". Cuts ≥ 88° are not makeable.
 - The phone moves while frozen → the locked layout stays; the overlay is hidden until re-acquired.

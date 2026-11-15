@@ -13,7 +13,10 @@ export function difficultyOf(toleranceDeg: number): Difficulty {
   return 'very hard';
 }
 
-/** Top/back spin of the cue ball at impact; 'short' = it never gets there (stops on the way). */
+/**
+ * Top/back spin of the cue ball at impact; 'short' = it never gets there (it stops on the way, so
+ * there is no impact and no spin to name).
+ */
 export type ContactSpin = 'stun' | 'draw' | 'follow' | 'roll' | 'overspin' | 'short';
 
 /** Classify the cue ball's top/back spin at impact from w/v (w = R·ω, v = speed). */
@@ -28,13 +31,18 @@ export function contactSpinOf(v: number, w: number): ContactSpin {
   return 'overspin';
 }
 
+/** Which way the throw correction moved the ghost ball (see ShotPlan.throwAim). */
+export type ThrowShiftDir = 'thinner' | 'thicker' | 'left' | 'right';
+
 export interface TipInput {
   cutDeg: number;
   contact: ContactSpin;
   throwDeg: number;
   throwShiftMm: number;
   /** Direction of the throw compensation as the player aims it (see ShotPlan.throwAim). */
-  throwAim?: 'thinner' | 'thicker' | 'left' | 'right' | null;
+  throwAim?: ThrowShiftDir | null;
+  /** Same as throwAim (the wave-1 name); throwAim wins when both are set. Default 'thinner'. */
+  shiftDir?: ThrowShiftDir;
   squirtDeg: number;
   side: number;
   /** Tip height of the stroke (fraction of R): a low hit that arrives with follow is explained. */
@@ -42,16 +50,24 @@ export interface TipInput {
   scratch: boolean;
   blocked: boolean;
   makeable: boolean;
+  /** False when the cue ball stops before it reaches the object ball (default true). */
+  cbReachesOb?: boolean;
+  /** Power to advise in the "too soft" tip (planShot passes ShotPlan.minPower; > 10: full power won't do). */
+  minPower?: number;
+  /** Same as minPower (an earlier name); minPower wins when both are set. */
+  needPower?: number;
   /** Cue ball → ghost-ball distance (m): turns the squirt angle into an aim offset at the ghost ball. */
   cbDistance?: number;
   /** Ball radius (m), for the offset in balls. */
   ballRadius?: number;
   /** Target ball's name ("1", "yellow") for sentences about it. */
   targetLabel?: string;
-  /** Power the stroke needs so the shot can happen at all (when the cue ball stops short). */
-  needPower?: number;
   /** The cue ball meets a cushion within a few ms of the object ball (a "rail and ball together" shot). */
   railFirst?: boolean;
+  /** Name of the best clear pocket for this ball when the chosen one is blocked. */
+  altPocketName?: string;
+  /** The cue ball touches the object ball: the object ball leaves along the line of centres. */
+  frozen?: boolean;
 }
 
 /** "the 1" / "the yellow" / "the object ball". */
@@ -61,21 +77,25 @@ function theBall(label?: string): string {
 
 /**
  * Squirt compensation as something a player can execute: where the cue points at the ghost ball's
- * distance (tan(squirt) × distance), in mm and in balls, e.g. "about 17 mm (⅓ of a ball) right of the
- * ghost ball". Null when it is too small to aim (< 2 mm).
+ * distance (tan(squirt) × distance), in mm and, given the ball radius R, in balls, e.g. "about ⅓ of
+ * a ball (17 mm) right of the ghost ball". Null when it is too small to aim (< 2 mm).
  */
-export function squirtOffsetText(squirtDeg: number, side: number, cbDistance: number, R: number): string | null {
+export function squirtOffsetText(squirtDeg: number, side: number, cbDistance: number, R?: number): string | null {
   const mm = Math.tan((Math.abs(squirtDeg) * Math.PI) / 180) * cbDistance * 1000;
   if (!(mm >= 2)) return null;
-  const balls = mm / (2 * R * 1000);
-  const amount = balls < 0.19 ? `about ${mm.toFixed(0)} mm` : `about ${balls < 0.29 ? '¼ of a ball' : balls < 0.42 ? '⅓ of a ball' : balls < 0.62 ? '½ a ball' : balls < 0.87 ? '¾ of a ball' : 'a ball or more'} (${mm.toFixed(0)} mm)`;
+  const balls = R !== undefined && R > 0 ? mm / (2 * R * 1000) : 0;
+  const amount =
+    balls < 0.19
+      ? `about ${mm.toFixed(0)} mm`
+      : `about ${balls < 0.29 ? '¼ of a ball' : balls < 0.42 ? '⅓ of a ball' : balls < 0.62 ? '½ a ball' : balls < 0.87 ? '¾ of a ball' : 'a ball or more'} (${mm.toFixed(0)} mm)`;
   return `${amount} ${side > 0 ? 'right' : 'left'} of the ghost ball`;
 }
 
 /**
  * The stroke's name as coaches say it, from the cue ball's spin at impact (and the tip height):
  * stop shot, stun, stun-run-through, drag, draw, follow, plus the english side. Null when the cue
- * ball never reaches the object ball.
+ * ball never reaches the object ball. For a frozen cue ball planShot passes the stroke's angle off
+ * the line of centres as `cutDeg` (there is no ghost ball to cut).
  */
 export function strokeName(p: { contact: ContactSpin; contactRatio: number; cutDeg: number; vert: number; side: number }): string | null {
   if (p.contact === 'short') return null;
@@ -90,21 +110,45 @@ export function strokeName(p: { contact: ContactSpin; contactRatio: number; cutD
   return base;
 }
 
-/** One or two sentences, most important first. */
+/** Thresholds for mentioning a correction (below them the sentence would be noise). */
+const SQUIRT_MENTION_DEG = 0.3;
+const THROW_MENTION_DEG = 1;
+const THROW_MENTION_MM = 0.1;
+
+/**
+ * Up to three short sentences, most important first: how to approach the shot (frozen balls, rail
+ * and ball together, a low hit that still arrives with follow), what the cue ball does at contact,
+ * then the aim corrections (squirt, throw) the player has to make or should know about. A scratch
+ * replaces the corrections: the stroke itself has to change.
+ *
+ * The blue line the app draws is the cue ball's path (cue ball → ghost ball, ShotPlan.aimDir), so the
+ * squirt sentence tells the player to aim the cue off that line, once, in degrees and as the offset
+ * at the ghost ball; it never claims the correction is already in the line.
+ */
 export function coachingTip(t: TipInput): string {
   if (!t.makeable) return 'No clean path to this pocket. Try another pocket, or play safe.';
-  if (t.blocked) return 'Another ball is in the way. Pick a different pocket or ball, or play a safety.';
-  if (t.contact === 'short') {
-    const need = t.needPower && t.needPower <= 10 ? ` Use power ${(Math.ceil(t.needPower * 2) / 2).toString()} or more.` : ' Even full power may not get there.';
-    return `This stroke is too soft: the cue ball stops before it reaches ${theBall(t.targetLabel)}.${need}`;
+  if (t.blocked)
+    return t.altPocketName
+      ? `Another ball is in the way. Try the ${t.altPocketName} instead, or play a safety.`
+      : 'Another ball is in the way. No other pocket is clear for this ball: pick another ball or play a safety.';
+  if (t.cbReachesOb === false || t.contact === 'short') {
+    const p = t.minPower ?? t.needPower;
+    if (p !== undefined && p > 10) return 'Too far: the cue ball stops before it reaches the object ball, even at full power.';
+    // minPower is for this stroke's tip height: only a stroke without draw is told draw needs more.
+    const more = (t.vert ?? 0) > -0.04 ? '; draw needs more pace still' : '';
+    return `Too soft: the cue ball stops before it reaches the object ball.${p !== undefined ? ` Use power ${p.toFixed(1)}+${more}.` : ' Hit it harder.'}`;
   }
   const out: string[] = [];
   const straight = t.cutDeg < 3;
-  if (t.railFirst) out.push(`Rail and ball together: the cue ball meets the cushion as it hits ${theBall(t.targetLabel)}, so aim at the contact point on the ball and trust the line.`);
+  if (t.frozen) out.push('Frozen balls: the object ball leaves along the line of centres, so aim the stroke, not a ghost ball.');
+  else if (t.railFirst)
+    out.push(`Rail and ball together: the cue ball meets the cushion as it hits ${theBall(t.targetLabel)}, so aim at the contact point on the ball and trust the line.`);
   // A below-centre hit that still arrives rolling forward: say why, or the words contradict the dot.
   const lowButForward = (t.vert ?? 0) <= -0.04 && (t.contact === 'follow' || t.contact === 'roll' || t.contact === 'overspin');
   if (lowButForward) out.push(`Hit ${describeSpin({ side: 0, vert: t.vert! })}: the backspin wears off on the way, so the cue ball arrives with a little follow.`);
-  if (straight) {
+  if (t.frozen) {
+    // No ghost ball and no cut to describe: the line-of-centres sentence above is the aim.
+  } else if (straight) {
     if (t.contact === 'stun') out.push('Straight-in stun: hit it full and the cue ball stops dead — a stop shot.');
     else if (t.contact === 'draw') out.push('Straight-in draw: the backspin pulls the cue ball straight back toward you.');
     else out.push('Straight-in with follow: the cue ball rolls through along the same line.');
@@ -129,36 +173,39 @@ export function coachingTip(t: TipInput): string {
         break;
     }
   }
-  if (t.scratch) out.push('Careful: this stroke sends the cue ball into a pocket. Change speed or spin.');
-  else if (Math.abs(t.squirtDeg) >= 0.3) {
-    // The blue line is the cue ball's path. Right english squirts the ball left of the cue, so the cue
-    // points right of the line (and vice versa); the cue stick drawn on the table already does. Said as
-    // an offset at the ghost ball (degrees are in the details): the amount depends on the cue (the
-    // shaft setting), and on long shots swerve gives some of it back.
-    const off = t.cbDistance && t.ballRadius ? squirtOffsetText(t.squirtDeg, t.side, t.cbDistance, t.ballRadius) : null;
-    const dir = t.side > 0 ? 'right' : 'left';
+  if (t.scratch) return [...out.slice(0, 2), 'Careful: this stroke sends the cue ball into a pocket. Change speed or spin.'].join(' ');
+  if (Math.abs(t.squirtDeg) >= SQUIRT_MENTION_DEG) {
+    // Right english squirts the ball left of the cue, so the cue points right of the line (and vice
+    // versa). The amount depends on the cue (the shaft setting), and on long shots swerve gives some
+    // of it back: the figure is a starting point for the player's own cue.
+    const a = Math.abs(t.squirtDeg).toFixed(1);
+    const off = t.cbDistance !== undefined && t.cbDistance > 0 ? squirtOffsetText(t.squirtDeg, t.side, t.cbDistance, t.ballRadius) : null;
     out.push(
-      off
-        ? `Aim the cue ${off}, so it points ${dir} of the blue line; the cue ball squirts back onto it.`
-        : `Aim the cue ${Math.abs(t.squirtDeg).toFixed(1)}° ${dir} of the blue line; the cue ball squirts back onto it.`,
+      `Side spin squirts the cue ball ${a}° off-line: aim the cue ${a}° to the ${t.side > 0 ? 'right' : 'left'} of the blue line${off ? `, ${off}` : ''} — the line is where the cue ball travels.`,
     );
   }
-  else if (Math.abs(t.throwDeg) >= 1) out.push(throwSentence(t));
-  return out.slice(0, 2).join(' ');
+  if (!t.frozen && Math.abs(t.throwDeg) >= THROW_MENTION_DEG && t.throwShiftMm >= THROW_MENTION_MM) out.push(throwSentence(t));
+  return out.slice(0, 3).join(' ');
 }
 
-/** Throw compensation in the player's terms: which way to move the aim, by how much. */
-export function throwSentence(t: Pick<TipInput, 'throwDeg' | 'throwShiftMm' | 'throwAim'>): string {
+/**
+ * Throw compensation in the player's terms: which way the ghost ball shown was moved for it, and by
+ * how much. `side` (the stroke's english) names outside english as the cause of a thicker shift.
+ */
+export function throwSentence(t: Pick<TipInput, 'throwDeg' | 'throwShiftMm' | 'throwAim' | 'shiftDir'> & { side?: number }): string {
   const mm = t.throwShiftMm.toFixed(1);
   const deg = Math.abs(t.throwDeg).toFixed(1);
-  switch (t.throwAim) {
+  const dir = t.throwAim ?? t.shiftDir;
+  switch (dir) {
     case 'thinner':
-      return `Throw ≈ ${deg}° pushes the object ball off line: aim ${mm} mm thinner (the ghost ball shown is already moved).`;
+      return `Throw ≈ ${deg}° pushes the object ball thick, so the ghost ball is shifted ${mm} mm thinner.`;
     case 'thicker':
-      return `Throw ≈ ${deg}° pushes the object ball off line: aim ${mm} mm thicker (the ghost ball shown is already moved).`;
+      return t.side !== undefined && t.side !== 0
+        ? `Outside english throws the object ball thin here, so the ghost ball is shifted ${mm} mm thicker.`
+        : `Throw pushes the object ball thin here, so the ghost ball is shifted ${mm} mm thicker.`;
     case 'left':
     case 'right':
-      return `Side spin throws the object ball ≈ ${deg}°: aim ${mm} mm ${t.throwAim} of full ball (the ghost ball shown is already moved).`;
+      return `Side-spin throw: the ghost ball is shifted ${mm} mm to the ${dir} of full ball.`;
     default:
       return `Throw ≈ ${deg}° is already allowed for in the ghost ball shown.`;
   }

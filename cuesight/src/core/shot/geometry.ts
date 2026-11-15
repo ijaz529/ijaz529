@@ -26,11 +26,11 @@ export function cutSide(cue: Vec2, ghost: Vec2, obDir: Vec2): 1 | -1 | 0 {
 }
 
 /**
- * Coaching aim labels, every ⅛ of overlap. The ⅞, ⅝ and ⅜ steps matter: without them a 38° cut reads
- * "½-ball" (30°), which undercuts it by 8° and misses.
+ * Coaching aim labels, every ⅛ of overlap (cut = asin(1 − fraction): ⅞ 7.2°, ¾ 14.5°, … ⅛ 61.0°).
+ * The ⅞, ⅝ and ⅜ steps matter: without them a 38° cut reads "½-ball" (30°), which undercuts it by
+ * 8° and misses.
  */
 const FRACTIONS: [number, string][] = [
-  [1, 'full'],
   [0.875, '⅞'],
   [0.75, '¾'],
   [0.625, '⅝'],
@@ -38,30 +38,43 @@ const FRACTIONS: [number, string][] = [
   [0.375, '⅜'],
   [0.25, '¼'],
   [0.125, '⅛'],
-  [0.03, 'thin'],
 ];
+/** "full" only from 97 % overlap (cut ≤ 1.7°), the same rule as the fraction glyph. */
+export const FULL_FRACTION = 0.97;
+/** Below 1/16 overlap (cut > 69.6°) the hit is just "thin": no eighth describes it. */
+const THIN_FRACTION = 1 / 16;
 
 /** Cut angle (rad) at which a hit has overlap `fraction` (inverse of fraction = 1 − sin cut). */
 export function cutOfFraction(fraction: number): number {
   return Math.asin(Math.max(0, Math.min(1, 1 - fraction)));
 }
 
-/** Within this many degrees of a label's own angle the label is said plainly; further away it is qualified. */
+/**
+ * Within this many degrees of an eighth's own cut the label is said plainly; further away both the
+ * label ("thin ⅜") and the phrase ("a touch thinner than ⅜-ball") say which way, so a player aiming
+ * by the label does not over- or undercut. ASSUMPTION (coaching choice, not measured): a plain label
+ * is never more than 1.5° off the real cut; label and phrase share the rule so they never disagree.
+ */
 export const FRACTION_EXACT_DEG = 1.5;
 
 /**
- * Ball-overlap fraction (1 = full, 0.5 = half-ball at 30°), the nearest coaching label, and a phrase
- * that says which way the cut differs from that label when it is more than 1.5° away
- * ("a touch thinner than ½-ball"), so a player aiming by the label does not over- or undercut.
+ * Ball-overlap fraction (1 = full, 0.5 = half-ball at 30°), a coaching label and the same label in
+ * words: "full" from 97 % overlap, otherwise the nearest eighth, prefixed "thin " or "thick " when the
+ * real cut is more than FRACTION_EXACT_DEG thinner or thicker than that eighth's cut (a 38.7° cut is
+ * "⅜", 35.7° is "thick ⅜" / "a touch thicker than ⅜-ball"), and "thin" ("a thin hit") below 1/16.
  */
 export function fractionOf(cut: number): { fraction: number; label: string; phrase: string } {
   const fraction = Math.max(0, 1 - Math.sin(Math.min(cut, Math.PI / 2)));
+  if (fraction >= FULL_FRACTION) return { fraction, label: 'full', phrase: 'full-ball' };
+  if (fraction < THIN_FRACTION) return { fraction, label: 'thin', phrase: 'a thin hit' };
   let best = FRACTIONS[0]!;
   for (const f of FRACTIONS) if (Math.abs(f[0] - fraction) < Math.abs(best[0] - fraction)) best = f;
-  const label = best[1];
-  const name = label === 'thin' ? 'a thin hit' : `${label}-ball`;
-  const offDeg = ((cut - cutOfFraction(best[0])) * 180) / Math.PI;
-  let phrase = name;
-  if (label !== 'thin' && Math.abs(offDeg) > FRACTION_EXACT_DEG) phrase = `a touch ${offDeg > 0 ? 'thinner' : 'thicker'} than ${name}`;
-  return { fraction, label, phrase };
+  const offDeg = ((Math.min(cut, Math.PI / 2) - cutOfFraction(best[0])) * 180) / Math.PI;
+  const name = `${best[1]}-ball`;
+  if (Math.abs(offDeg) <= FRACTION_EXACT_DEG) return { fraction, label: best[1], phrase: name };
+  return {
+    fraction,
+    label: `${offDeg > 0 ? 'thin' : 'thick'} ${best[1]}`,
+    phrase: `a touch ${offDeg > 0 ? 'thinner' : 'thicker'} than ${name}`,
+  };
 }
