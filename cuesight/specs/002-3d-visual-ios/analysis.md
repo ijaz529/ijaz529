@@ -22,11 +22,11 @@ This is the `/speckit-analyze` cross-artifact pass for feature 002 (T172), dated
 
 <!-- RELEASE: keep these counts in step with the README "Test status" line. -->
 **Tests on the release branch**:
-- `npx vitest run`: 1024 tests in 68 files.
-  - 1023 passed in the full run on a busy 4-core machine.
-  - 1 failed: the player-view CPU guard for failing photos, at p95 256 ms against 250.
-  - Run alone, that guard passes (p95 241 ms).
-- `npm run e2e`: 132 tests, all passing.
+- `npx vitest run`: 1032 tests in 68 files, all passing after the release-verification fixes.
+  - In full runs on a busy 4-core machine, the player-view CPU guard for failing photos has read
+    206–256 ms at p95 against a 250 ms limit.
+  - Run alone, it reads 214–242 ms.
+- `npm run e2e`: 135 tests, all passing.
 - `tsc --noEmit`: clean.
 
 ## Findings
@@ -56,6 +56,9 @@ This is the `/speckit-analyze` cross-artifact pass for feature 002 (T172), dated
 | R-21 | Coverage | LOW | colour names | Stripe 9 read as yellow; red vs maroon; the maroon stripe read as "white?" on the Live fake camera | Open. It belongs to the grey-cloth / colour-name vision branch, which is still in repair |
 | R-22 | Drift | — | data-model, render3d-api, worker-protocol-v2, quickstart | States, picks, gestures, presets, toScreen, destroy, v2 messages, commands | Resolved (docs passes) |
 | R-23 | Inconsistency | LOW | spec edge case | "A player photo without the cue ball is fitted from the other balls" | Open, marked "Not yet met" in the spec, README and R-24. The fit asks for the two taps instead |
+| R-25 | II / SC-107 | — | player-view.ts | Low ultra-wide photos (5–9 cm up, 92–100°) with 2–3 balls returned ok fits 5–9 % off at high confidence | Resolved by the release verification. Cushion lines count as crossing only at ≥ 10° in the photo. The s101053-neighbourhood tests (44 + 44 photos, green and grey) now give 0 ok fits off tolerance |
+| R-26 | FR-118 | — | snap/session.ts | Dark, grainy and no-cloth photos looped on the two taps | Resolved: taps are offered once (dark, grainy) or refused (no cloth, moved), and a better photo is asked for (snap.spec) |
+| R-27 | FR-121 | LOW | player-view.ts | A target moved along the line of sight still fitted "good" | Resolved for moves of ≥ 0.4 R in the photo. Smaller moves are a known limit (README) |
 | R-24 | Risk | LOW | player-view CPU guards | p95 sits near the 250 ms per-photo budget on a slow (2.1 GHz) or busy CPU | Accepted. The guards measure process CPU time; on CI runners and current phones the tail is lower. Re-run alone before concluding |
 
 ## Coverage

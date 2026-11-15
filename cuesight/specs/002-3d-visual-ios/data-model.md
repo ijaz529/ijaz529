@@ -197,6 +197,22 @@ its true cause (Principle II). The last column is what Snap does next (`snap/ses
 Precedence on a failed fit: `dark` for a dark photo, then `noisy` (unless the reason is `moved`), then
 `dark` for a dim cloth, then `noCloth`, then the fit's own reason.
 
+**Taps by reason** (`session.ts` `playerFailAction`, `tapsOffered`, `retakeInstruction`):
+- `moved`: taps refused; Snap offers *Retake the table photo*, *New player photo* and *Start over*,
+  and shows the fit's own hedged sentence once.
+- `noCloth`: taps refused ("Taps can't help on this photo — retake it first."); a new photo is asked for.
+- `dark`, `noisy`: the top instruction asks for a better photo ("Retake your photo with more light on the
+  table." / "…, holding the phone steady."), and the two taps are offered once. If the two-tap fit fails
+  for the same reason, the chip says "The two taps didn't help on this photo." and further taps are
+  refused.
+- `tooFewBalls`, `noCue`, `noFit`: the two taps.
+
+**Pose checks** (SC-107): two cushion lines count as crossing only when they meet at ≥ 10° in the photo
+(`EDGE_CROSS_MIN_DEG`; from 5–9 cm up the side and end cushions lie on one line). On untinted grey
+cloth an ok fit that puts the target on bare cloth is not used. A key ball (target or cue) whose circle
+is off its predicted spot by ≥ 0.4 radii along its line of sight, rests ≥ 2.5 R away on the bed, and
+cannot be reached by a refit with the ball pinned there, is `moved` (FR-121).
+
 ### Strike point
 
 `strikePoint(c: Vec3, aimDir: Vec2, side, vert, R) = c − aimDir·R·√(1 − side² − vert²) +

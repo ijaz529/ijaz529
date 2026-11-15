@@ -228,12 +228,15 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   its neighbours' outline (the middle of a pack seen from low down) is not invented (Constitution II;
   the allowances are in the SC-003 notes). A white ball walled in by a rack's balls on opposite
   sides could be a stripe whose band is out of sight, so it is the cue ball only when no other ball
-  is white.
+  that could itself be the cue ball (whole and shaded) is white.
 - Cue ball not found, or several white-ish candidates → the player is asked to tap the cue ball.
   The hint says 'No cue ball found — tap “Cue ball”, then tap the cue ball.', or, with two whites too
   close to call (both "white?"), 'Two white balls — tap “Cue ball”, then tap the one you play with.'.
   Tapping an object ball keeps it as the target and asks for the cue ball first (toast "I can’t find
-  the cue ball — tap it first." or "Two white balls — tap the one you play with first."). While the
+  the cue ball — tap it first." or "Two white balls — tap the one you play with first."). Suggest
+  without a cue ball does not say "No clean pot": it says "I can't find the cue ball — tap it, then
+  Suggest again." (or "Two white balls — tap the one you play with, then Suggest again.") and turns
+  on cue marking. While the
   *Cue ball* tool is on, the hint reads "Tap the cue ball.", also when vision found a cue ball and
   after a frame change that keeps the tool on. Marking the cue ball works on a frozen layout too
   (FR-007).

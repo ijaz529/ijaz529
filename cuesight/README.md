@@ -62,9 +62,9 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 "Starting camera…". Timing tests can fail on a busy CPU; re-run them alone before concluding.
 
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
-**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1024 tests in 68 files**, all
+**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1032 tests in 68 files**, all
 passing; the two player-view CPU guards (p95 < 250 ms per photo) sit close to their limit on a slow or
-busy CPU, so re-run them alone before concluding. `npm run e2e` runs **132 tests**, all passing.
+busy CPU, so re-run them alone before concluding. `npm run e2e` runs **135 tests**, all passing.
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
 HTTPS host (GitHub Pages, Netlify, Cloudflare Pages) and open it on the phone. Then use "Add to Home
@@ -302,7 +302,15 @@ The power scale itself was not changed; R-12 in research.md lists the travel per
   - a few photos say "moved" when nothing moved (1 of 77 on untinted grey cloth; 2 from 8 cm up with
     a 100° lens);
   - a photo without the cue ball is not yet fitted from the other balls: it fails with "I can't find
-    the cue ball" (or "I couldn't line up this photo"); retake it with the cue ball in view.
+    the cue ball" (or "I couldn't line up this photo"); retake it with the cue ball in view;
+  - very low ultra-wide photos (5–9 cm up, 90–100° lens) that show only 2–3 balls ask for the two taps
+    more often: there the side and end cushions look like one line, so they no longer count as a check
+    on the pose;
+  - a target moved along your line of sight by less than about 0.4 of its radius in the photo (about
+    12 cm from a low camera far from it) is not detected as "moved".
+- **Snap with a dark, grainy or cloth-less photo.** The two taps are offered once on a dark or grainy
+  photo; if they do not line it up either, CueSight says so and asks for a better photo. With no cloth
+  in view, it asks for a new photo straight away.
 - **Ball identity and rules.** Planning is rule-agnostic: any object ball can be the target.
 - **Out of scope for now.** Bank, kick and combination shots.
 

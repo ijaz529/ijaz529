@@ -485,14 +485,18 @@ appear in TestFlight.
 - **FR-118**: When the estimate fails or its confidence is below the threshold, the system MUST NOT draw
   the guide as if it were right. It MUST show the reason and offer the manual fallback: tap the cue
   ball and the target ball in the photo. After the two taps it MUST draw the guide and show its
-  confidence.
+  confidence. Exceptions: when the balls have moved since the table photo the taps are refused and a
+  new table photo is asked for; with no cloth in view a new photo is asked for; on a dark or grainy
+  photo the taps are offered once, and a better photo is asked for if they fail too.
 - **FR-119**: The system MUST handle partial visibility. When the cue ball, the strike point or the
   target is outside the photo or hidden, it MUST draw what is visible, say what is missing and how to
   fix it, and show the strike point on the spin ball.
 - **FR-120**: Changing the target, pocket or stroke MUST redraw the guide on the current player photo
   without retaking it. The player MUST be able to take further player photos against the same layout.
 - **FR-121**: The system MUST warn when the player photo contradicts the layout ("the balls seem to
-  have moved") and when the camera was not behind the cue ball.
+  have moved") and when the camera was not behind the cue ball. This includes a target or cue ball
+  moved along the line of sight (off its predicted spot by ≥ 0.4 radii in the photo); smaller moves
+  along the line of sight are a known limit.
 - **FR-122**: Snap photos MUST be processed on the device, kept in memory only for the Snap session,
   never stored or sent, and discarded on *Start over* or on leaving Snap. The photo canvas and its
   thumbnail are cleared then too, and a photo still being decoded or loaded at that moment MUST be
