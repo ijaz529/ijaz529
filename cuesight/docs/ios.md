@@ -64,7 +64,7 @@ Xcode) and then customised:
 `App/App/config.xml` and `capacitor-cordova-ios-plugins/`. Build output goes to `build/` (ignored).
 
 The web app needs no service worker inside the app: `capacitor://` pages cannot use one, and the assets are
-already bundled. `src/app/main.ts` should therefore register `sw.js` only when
+already bundled. `src/app/main.ts` therefore registers `sw.js` only in production web builds, when
 `window.Capacitor?.isNativePlatform?.()` is not true and the page is served over http(s).
 
 ## The Simulator smoke test
@@ -75,18 +75,22 @@ already bundled. `src/app/main.ts` should therefore register `sw.js` only when
 2. `xcodebuild ... -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO build`;
 3. boots it (dark appearance, 9:41 status bar), installs, grants photo-library access;
 4. launches with the console attached and waits for Capacitor's `Loading app at capacitor://localhost` and
-   the web app's `[CueSight] ready` log line;
+   the web app's `[CueSight] ready` log line, which is required;
 5. screenshots the launch, the home screen, every `[CueSight] tour <step>` (web build with
    `VITE_CUESIGHT_TOUR=1`), then relaunches with `?mode=practice` and `?mode=snap` and screenshots those;
-6. fails on a build or install error, a crash, a web bundle that does not load, or a blank screen; a missing
-   `ready` marker is a warning.
+6. fails on a build or install error, a crash, a web bundle that does not load, a blank screen, or a launch
+   (default, Practice or Snap) after which `[CueSight] ready` is not logged within `READY_TIMEOUT` seconds
+   (default 90; the first CI run logged it 22 s after a cold launch). The screenshots are still taken.
 
 Everything lands in `build/sim/` (`*.png`, `console-*.log`, `xcodebuild.log`, `summary.md`).
 
 ## CI: `.github/workflows/cuesight-ios.yml`
 
 The workflow lives at the **git root** (the app is in `cuesight/`). It runs on pushes to `main` and
-`claude/**` that touch `cuesight/**`, and on demand (Actions → **CueSight iOS** → Run workflow).
+`claude/**`, and on pull requests into `main`, that touch `cuesight/**` or the workflow file, and on demand
+(Actions → **CueSight iOS** → Run workflow). The check jobs skip a pull request whose head is a `claude/**`
+branch of this repository: that branch's push run already tests the same commits. Pull requests from other
+branches and from forks run in full.
 
 | Job | Runner | What it does |
 |---|---|---|
@@ -94,10 +98,13 @@ The workflow lives at the **git root** (the app is in `cuesight/`). It runs on p
 | `chromium-e2e` | ubuntu | the Playwright suite with Chromium (Pixel 7, plus iPhone SE and iPad layouts for the 3D table, Snap and 2D-fallback specs), the synthetic fake camera, the offline check and the bundle-size budget |
 | `ios-simulator` | macos-15 | newest Xcode, tour web build, `cap sync`, `scripts/ios-sim-smoke.sh`; artifact **ios-simulator-screenshots** |
 | `webkit-e2e` | macos-15 | `playwright.webkit.config.ts`: the e2e suite in WebKit with the iPhone 15 profile (tests tagged `@chromium-only`, the live fake-camera spec and the offline check, are skipped) |
-| `testflight` | macos-15 | after `web` and `ios-simulator`: archive + upload, only when the secrets below exist; otherwise a notice and a green, skipped job |
+| `testflight` | macos-15 | only after `web`, `chromium-e2e`, `ios-simulator` and `webkit-e2e` have all passed, and only for a push to `main` or a manual run with the upload box ticked (it is unticked by default). Archive + upload when the secrets below exist; otherwise a notice and a green, skipped job |
 
 The Xcode version is the newest one installed on the runner; pin one with the repository variable
-`XCODE_VERSION` (for example `26.1`). Superseded runs on the same branch are cancelled.
+`XCODE_VERSION` (for example `26.1`). A newer run cancels a superseded one on the same branch or pull
+request, except a run that may upload (a push to `main`, or a manual run with upload ticked): those have
+their own concurrency group and are never cancelled. The `testflight` job also runs in a group of its own
+(`cuesight-ios-testflight`) that never cancels an upload in progress; a newer upload waits for it.
 
 ## TestFlight: one-time setup
 
@@ -122,8 +129,8 @@ The Xcode version is the newest one installed on the runner; pin one with the re
      - `APPLE_TEAM_ID`: the Team ID (may also be a repository *variable*)
    - Variables (optional): `IOS_BUNDLE_ID` if you registered something other than `com.cuesight.app`;
      `XCODE_VERSION` to pin Xcode.
-6. **Run it**: push to `main` or a `claude/**` branch, or Actions → CueSight iOS → **Run workflow** (keep
-   "Upload the build to TestFlight" ticked). The `testflight` job builds the release web bundle, runs
+6. **Run it**: push to `main`, or Actions → CueSight iOS → **Run workflow** on any branch with
+   "Upload the build to TestFlight" ticked. The `testflight` job builds the release web bundle, runs
    `scripts/ios-testflight.sh` (`xcodebuild archive` with automatic signing through the API key, then
    `xcodebuild -exportArchive` with `ios/ExportOptions.plist`, which uploads to App Store Connect) and writes
    the version and build number to the run summary.
@@ -131,9 +138,10 @@ The Xcode version is the newest one installed on the runner; pin one with the re
    App Store Connect → your app → **TestFlight**. Add yourself to an internal testing group and install it
    with the TestFlight app. Export compliance is pre-answered by the Info.plist.
 
-Every push uploads a new build (build numbers are `<run number>.<attempt>`, always increasing). To upload
-only on demand, untick the box when dispatching and remove `'claude/**'` from the `push` branches, or delete
-the secrets.
+Only pushes to `main` upload a build on their own (build numbers are `<run number>.<attempt>`, always
+increasing). Pushes to `claude/**` and pull requests run the checks and the Simulator job but never upload.
+To upload a branch build, run the workflow by hand on that branch with the box ticked. To stop uploads
+altogether, delete the secrets.
 
 You can also upload from your Mac: `npm run cap:sync`, then
 `ASC_KEY_ID=… ASC_ISSUER_ID=… ASC_KEY_P8="$(cat AuthKey_….p8)" APPLE_TEAM_ID=… bash scripts/ios-testflight.sh`
@@ -149,7 +157,7 @@ You can also upload from your Mac: `npm run cap:sync`, then
 | `Invalid Pre-Release Train` / version closed | Bump `version` in `package.json` (the marketing version) after a version is released |
 | `module compiled with Swift … cannot be imported` | The runner picked an Xcode older than 26; set the variable `XCODE_VERSION` |
 | Simulator job: `Loading app at` never logged | `cap sync` did not run or `dist/` is empty; check the build step and `console-default.log` |
-| Simulator job: warning about the `ready` marker | The web app did not log `[CueSight] ready`; open the screenshots and `console-*.log` |
+| Simulator job fails: the web app did not log `[CueSight] ready` within `READY_TIMEOUT` | The web app did not finish its first render within 90 s of a launch (the error names the launch). Open the screenshots and `console-*.log`; on a slow machine raise `READY_TIMEOUT` (an environment variable of `scripts/ios-sim-smoke.sh`) |
 
 ## Limitations
 

@@ -190,7 +190,7 @@ own.
   - `tests/integration/pipeline-420.test.ts`: the 4:2:0 rack frame < 250 ms, with ball detection ≤ 2.25× the fixture frame's
   - The original text claimed "< 50 ms" and "< 100 ms" guards, but the only assertion was 250 ms (review finding `tests-looser-than-claimed`)
 - [X] T067 [P] Write `README.md`: what it is, run/test, architecture, "How accurate is this?", limitations, roadmap
-- [ ] T068 Accessibility pass (touch targets ≥ 44 px, aria labels, colour-blind-safe redundancy) in `src/app/styles.css` and the UI modules. **Reopened 2026-11-15**: ball hit targets on the mini-map, overlay and 3D view, and the settings fields, are below 44 px on `fix/wave1` (review findings `touch-targets-under-44px`, `a11y-touch-targets-aria`). Close it when the wave-2 app-ui fix (`fix2a/ui`) lands with its e2e check
+- [X] T068 Accessibility pass (touch targets ≥ 44 px, aria labels, colour-blind-safe redundancy) in `src/app/styles.css` and the UI modules. **Reopened 2026-11-15**: ball hit targets on the mini-map, overlay and 3D view, and the settings fields, were below 44 px on `fix/wave1` (review findings `touch-targets-under-44px`, `a11y-touch-targets-aria`). **Closed again on `fix2b/app`**: a 22 CSS px pick-radius floor on the 2D table, mini-map, overlay and 3D table (`src/app/render3d/picking.ts`, with the ball-vs-pocket rule), 44 px controls and settings fields, checked by `tests/e2e/ui.spec.ts` (hit areas by `elementFromPoint` at 393×852 and 375×667) and `tests/unit/app/render3d-picking.test.ts`
 - [X] T069 Run the quickstart validation (Q1–Q15) plus screenshots, and run `/speckit-analyze`. Fix inconsistencies. That analysis missed the drift the review found; see T077
 
 ---
@@ -213,9 +213,9 @@ finding's test spec, and the commit messages record the evidence.
 - [X] T076 [P] Docs, 001: the spec, plan, research, data model, contracts, quickstart and tasks describe the reviewed code (this revision)
 - [X] T077 Re-run the `/speckit-analyze` cross-checks and record them in analysis.md "Post-review"
 
-**Wave 2** (open on `fix/wave1`; in progress on the `fix2a/*` branches, then merged with T074 in wave 2b):
+**Wave 2** (`fix2a/*`, merged with wave 1 in wave 2b on `fix2b/app`; T074 still waits for the vision branch):
 
-- [ ] T078 App core (`src/app/main.ts`, camera, planner client):
+- [X] T078 App core (`src/app/main.ts`, `live-logic.ts`, camera, `planner-client.ts`). Done on `fix2b/app`, plus Rotate/Calibrate keeping the selection (`rememberInFrame`, `remapThroughFrame`), the frozen power advice in the planner worker (`plan` message) and the budget kept across worker restarts (`perEvalMs`). Tests: `live-logic.test.ts`, `planner-client.test.ts`, `camera-session.test.ts`, `camera.spec.ts`, `wiring.spec.ts`:
   - selections survive tracker id churn;
   - live plan and overlay only while locked (2-result grace);
   - frozen overlay needs the same ordered frame; Mark cue works on a frozen layout;
@@ -224,11 +224,11 @@ finding's test spec, and the commit messages record the evidence.
   - Position-mode taps; Zones refuses the cue ball and the target;
   - the app reads `fragile`, `timedOut`, `reason`, `cueAimDir`, `throwShiftDir`, `minPowerCapture` and the frozen-plan conventions;
   - grey cloth rendered grey (`fix2a/live`)
-- [ ] T079 App UI: settings dialog commit and validation, focus-safe re-renders, 44 px targets (closes T068), card texts (no "±-2.1 mm", throw direction), settings presets with source/ASSUMPTION notes (`fix2a/ui`)
-- [ ] T080 PWA: safe service-worker update for an open page, full precache with a build-level guard (`fix2a/platform`)
-- [ ] T081 Docs, README and 002: known limitations (cushion model, cue ball not marked when ambiguous, green on green, clusters), the v2 protocol contract, 002 quickstart (listed in analysis.md "Post-review")
-- [ ] T082 Decide the "tip" unit (¼ R vs a tip-width) and fix the "2 tip" plural (analysis.md P-F2)
-- [ ] T083 [P] Add an automated check for FR-007 (mark the cue ball, live and frozen); today it is manual (quickstart Q16)
+- [X] T079 App UI: settings dialog commit and validation, focus-safe re-renders, 44 px targets (closes T068), card texts (no "±-2.1 mm", throw direction), settings presets with source/ASSUMPTION notes (`fix2a/ui`, then the wave-2b card work: frozen tile, power gauge band, recommendation notes). Tests: `ui-components.test.ts`, `ui-review-fixes.test.ts`, `plan-ui.test.ts`, `settings.test.ts`, `ui.spec.ts`
+- [X] T080 PWA: safe service-worker update for an open page, full precache with a build-level guard (`fix2a/platform`). Tests: `sw-precache.test.ts`, `sw-update.test.ts`, `offline.spec.ts`, `update.spec.ts`
+- [X] T081 Docs, README and 002: known limitations (cushion model, cue ball not marked when ambiguous, green on green, clusters), the v2 protocol contract, 002 quickstart (listed in analysis.md "Post-review"). Done in the 2026-11-15 docs pass on `fix2b/app` (`fix2c/docs`)
+- [X] T082 Decide the "tip" unit (¼ R vs a tip-width) and fix the "2 tip" plural (analysis.md P-F2). **Decided: keep 1 tip = ¼ R** (≈ 7 mm; 2 tips = the 0.5 R miscue limit), with the mm offset in the card details (`tipOffsetMm`); the words now say "2 tips" (`power-tips.test.ts`)
+- [X] T083 [P] Add an automated check for FR-007 (mark the cue ball, live and frozen): `camera.spec.ts` "marking the cue ball on a frozen layout changes the frozen layout"; the live path shares `applyCueOverride` (`live-logic.test.ts`)
 
 ---
 

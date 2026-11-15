@@ -3,7 +3,8 @@
 Each decision lists what was chosen, why, and what was rejected.
 
 **Revised 2026-11-15** after the code review (see analysis.md, "Post-review"). R-03, R-06, R-08,
-R-09, R-10, R-11 and R-12 now describe the code on `fix/wave1`. Where the earlier text was wrong,
+R-09, R-10, R-11 and R-12 now describe the code on `fix/wave1`; R-11, R-12 (coaching vocabulary) and
+R-14 (palette) were revised again for `fix2b/app`. Where the earlier text was wrong,
 the correction is stated in the decision itself.
 
 ## R-01 Platform: installable PWA
@@ -252,29 +253,60 @@ the correction is stated in the decision itself.
       target, the cue ball and any pocketed ball are removed, and balls the shot moved sit at their
       rest spots. Quality is the best log-scaled cue-ball tolerance over the remaining balls and
       pockets (0.02° → 0, ≥ 1° → 1).
-    - Penalty: 0.06·power + 0.1·max(0, power − 6)² (a coach's bias toward controllable pace) +
-      0.6·|side| + 0.3·|vert| + 1 for a kiss + 0.5 for any cue-ball contact with another ball.
+    - Penalty (coaching heuristics, ASSUMPTION): 0.06·power + 0.1·max(0, power − 6)² (a coach's
+      bias toward controllable pace) + a pace cost of 0.06 per diamond the object ball would roll
+      past the pocket beyond 2 diamonds (a quarter of that with a landing spot; a firm ball meets a
+      smaller effective pocket, after Alciatore TP 3.5–3.6) + 0.05 per metre of cue-ball travel
+      beyond the first + 1.5·|side| + 0.3·|vert| + 1 for a kiss + 0.5 for any cue-ball contact with
+      another ball.
+    - Last resorts (penalty 10 each, larger than the whole objective range plus every other
+      penalty): `TOO_SOFT_PENALTY` for a stroke whose own plan warns `too-soft` ("Very soft"), so
+      the card never shows "recommended" next to "too soft" while a firmer stroke works; and
+      `NO_SIDE_PENALTY` for side on a near-straight shot (cut < 5°) with no landing spot while any
+      centre-line stroke pots the ball.
+  - **Half steps** (default objective only): the softest potting power that is not too soft is
+    refined half a step below and above, at every tip height (a stroke between whole numbers often
+    pots at pocket speed with a better leave). They run only while the robustness walk's whole
+    allowance (`WALK_RESERVE` = 108) still fits after them, so a device-sized budget keeps its speed
+    checks and recommends whole-number powers.
   - **Reachable.** A landing spot is reachable when any potting stroke ends within 15 cm of it.
     Then only those strokes compete.
-  - **Robustness** (the "most reliable stroke" of FR-020):
-    - Candidates are walked in score order. Each is re-simulated as the same cue line (no re-aim,
-      same tip) at 0.88, 0.94, 1.06 and 1.12 × its true speed. Underhits below power 1 are
-      simulated at their real speed.
-    - **Any scratch or miss at those speeds disqualifies the candidate.**
-    - A survivor's robust score is min(nominal score, worst variant objective − its penalty), i.e.
-      the **worst case**.
-    - The walk stops after 5 candidates pass, or when the budget runs out. It continues past the
-      first 5 when they fail.
+  - **Robustness** (the "most reliable stroke" of FR-020), spent in this order:
+    1. **Speed check.** Candidates are walked in score order. Each is re-simulated as the same cue
+       line (no re-aim, same tip) at 0.88, 0.94, 1.06 and 1.12 × its true speed. Underhits below
+       power 1 are simulated at their real speed. **Any scratch or miss at those speeds
+       disqualifies the candidate.** A survivor's robust score is min(nominal score, worst variant
+       objective − its penalty), i.e. the worst case. The walk stops after 5 candidates pass, or
+       when the budget runs out; it continues past the first 5 when they fail.
+    2. **Probes.** Each survivor is mis-hit the other ways a player does: ±0.05 R of tip height, an
+       aim error of 60 % of the shot's own tolerance, and (with side) a standard shaft's squirt
+       instead of the configured one. Half of the worst of those outcomes counts (a scratch costs 6,
+       a miss 3), and every cue-ball scratch seen is recorded in `Recommendation.risks`.
+    3. **Polish finalists**: the best three centre-line strokes and the best stroke at each of the
+       two softest powers, each checked in full, so side has a fair rival and a gentler stroke can
+       win.
+    - Only strokes whose checks all ran compete with each other.
     - Overhits past full power (7.0 m/s) cannot be played or tested. A stroke that needs them is
       used only when no fully tested one survives.
+    - Side only when it clearly pays: a side stroke must beat the best centre-line stroke by
+      `SIDE_MIN_GAIN` = 0.4. Among strokes within `SOFTEST_WITHIN` = 0.1 of the best, the softest
+      wins.
     - If nothing survives, the best nominal stroke is returned with `fragile: true`.
-  - **Score reported**: the robust score. It is −∞ only when no stroke pots the ball.
+  - **Score reported**: the robust score (the probe blend when the probes ran), with the coaching
+    penalties. It is −∞ only when no stroke pots the ball.
+  - **`risks`**: a list (empty when no scratch was seen) when every check ran. Absent means "not
+    known": a fragile stroke, or a budget that ran out before the probes. Never `[]` for a fragile
+    stroke.
   - **Budget (Constitution III).** The search is bounded by an evaluation count, `maxEvaluations`
-    (default `FULL_EVALUATIONS` = 10 × 18 grid strokes + 12 × 4 variants = 228). The result is a
-    deterministic function of the inputs and that count. The core reads the clock only when the
-    caller sets the optional safety net `timeCapMs`, and the result then says `timedOut: true`.
-    - The planner worker picks the count once per device and ball count: about 1.2 s divided by
-      the measured cost of one `planShot`, clamped to 60–228.
+    (default `FULL_EVALUATIONS` = 10 × 18 grid strokes + 2 × 18 half steps + `WALK_RESERVE`
+    12 × (4 + 5) = **324**). The result is a deterministic function of the inputs and that count.
+    The core reads the clock only when the caller sets the optional safety net `timeCapMs`, and the
+    result then says `timedOut: true`. `onEvaluate` reports every planned grid stroke, half steps
+    included.
+    - The planner worker picks the count once per device and ball count: 1.2 s divided by the
+      measured cost of one search plan (`record: false, advice: false`), clamped to 60–324
+      (`src/workers/eval-budget.ts`). The figures are kept across worker restarts (`perEvalMs`), so
+      the same request gets the same stroke for the page's life.
     - It sets `timeCapMs: 1500` as the safety net (the < 1.5 s budget of Principle IV).
 - **Rationale**: transparent, deterministic for a given budget, and fast enough in a worker. The
   robustness rule prefers forgiving strokes, which is what a coach does. The review found that the
@@ -323,6 +355,26 @@ the correction is stated in the decision itself.
   travel after a rail by up to about a third. The power scale itself was not recalibrated: the
   planner chooses power through the simulation, so fixing the cushion fixes the recommendation.
   Whether the default μᵣ matches real lag speed is still unchecked against a measurement.
+- **Coaching vocabulary** (2026-11-15, `core/shot/power.ts`, `coach.ts`, `planner.ts`), one wording
+  for the card, the 3D label, the coaching tip, Snap and the screen reader:
+  - **Spin**: `describeSpin` says "½ tip below centre", "1½ tips above centre, 1 tip right" or
+    "centre ball" (1 tip = ¼ R, spec.md clarification).
+  - **Stroke names**: "Stop shot", "Stun", "Draw", "Follow", with the english side ("Follow, right
+    english"); none when the cue ball never reaches the object ball.
+  - **Squirt** is said once: the degrees off the blue line plus the offset at the ghost ball ("aim
+    the cue 1.1° to the right of the blue line, about ⅓ of a ball (17 mm) right of the ghost ball").
+    The figure depends on the shaft setting.
+  - **Throw**: "Throw ≈ 1.2° pushes the object ball thick, so the ghost ball is shifted 1.3 mm
+    thinner."; outside english is named for a thicker shift; a full-ball hit says "Throw: …" (centre
+    ball) or "Side-spin throw: …".
+  - **Too soft**: `cb-short` ("The cue ball stops before it reaches the 3. Use power 4.5+.") and
+    `too-soft` are never emitted together. Every advice figure is `advisePower(minPower)`: `minPower`
+    rounded up to the 0.5 step the power control moves in, the same figure as the meter and the 3D
+    label.
+  - **Frozen cue ball**: the advice quotes the first run of half-step powers that pots with pace and
+    keeps the cue ball up ("A", "A–B" or "A+") and why it ends ("harder throws it less", or "the cue
+    ball follows it in" for a scratch). With none it says no power gets it in with pace and gives the
+    centre-ball alternative for a stroke with spin.
 
 ## R-13 Testing strategy
 
@@ -345,4 +397,13 @@ the correction is stated in the decision itself.
   - Cue-ball path: dashed sky (#56B4E9).
   - Ghost ball: dotted white ring.
   - Warnings: vermillion (#D55E00) plus an icon and text.
+  - Cue stick (2026-11-15): #F4F6FB at 60 %, long dashes 18/7, labelled "Cue stick", drawn behind
+    the cue ball along the cue's own line when |squirt| ≥ 0.1°, on the full 2D table and the camera
+    overlay (not the mini-map), so it is never read as a ball path.
+  - Table labels use the card tile's words: "30° · ½-ball hit", "36° · ⅜+ ball", "Frozen · stroke
+    12° left", "Not makeable".
+  - Balls: a ball vision could not name (`'ball'`) gets no letter and, without a measured colour,
+    neutral grey #9a9a9a in 2D, in 3D and on the card's chips. Snooker colours are canonical in 2D
+    too. Letters: on pool a colour-named ball shows its number as the 3D tags do; on snooker
+    R/Y/G/Br/Bl/P/Bk.
 - **Rationale**: Principle VI. Redundant encoding through dash patterns and labels.

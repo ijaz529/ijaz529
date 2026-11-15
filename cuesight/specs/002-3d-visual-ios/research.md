@@ -105,7 +105,10 @@ tests on synthetic fixtures must confirm or tune.
     the true rest positions within 4 s.
   - A pocketed ball, after its `pocket` event, moves to the pocket centre and falls under gravity
     (`POCKET_DROP_S` ≈ 0.4 s), then hides.
-  - The final frame holds for 600 ms. The renderer then shows the `Scene3DData` layout again.
+  - *Revised 2026-11-15:* a 0.5 s strike lead-in comes first, and the final frame holds for
+    3.5 s (×1.8 with reduced motion) so the player can study the end position; a tap, Skip or
+    Escape ends it at once. The renderer then shows the `Scene3DData` layout again. The 4 s cap is
+    on the balls' motion only (spec FR-108).
   - `stopPlayback()` restores at once.
   - Resting orientation: number up, tilted 20° toward the default camera, so numbers read in
     Overview.
@@ -117,6 +120,11 @@ tests on synthetic fixtures must confirm or tune.
 - **Alternative**: record per-point timestamps (`Trajectory.times?`) in `simulate()`. It would be a
   non-breaking optional field in core and would remove the reconstruction, but it touches the core API.
   Deferred until replay accuracy needs it. The SC-103 tests decide.
+- **Outcome (2026-11-15)**: the alternative was taken. `simulate()` records each point's time and
+  angular velocity (`Trajectory.times`, `Trajectory.spins`) when `record` is on, and the replay passes
+  every recorded point at its simulated time (scaled by the rate) and shows sliding from the recorded
+  spins. Hand-built tracks without times still use the reconstruction and match their event points
+  within 1 µm.
 
 ## R-18 Camera model, presets and gestures
 
@@ -125,26 +133,32 @@ tests on synthetic fixtures must confirm or tune.
     - User gestures clamp θ to [8°, 89°] and d to a fixed range (`DIST_MIN` … `DIST_MAX` in
       `camera.ts`). Pan moves T, which is clamped to the table's outer rectangle.
     - Presets may set θ = 90° (exact top-down).
-    - Transitions interpolate (T, ψ, θ, log d, fov) with the shared easing. A flight lasts 240 ms for
-      small changes and up to 600 ms for preset flights. With reduced motion it jumps.
+    - Transitions interpolate (T, ψ, θ, log d, fov) with an ease-in-out cubic over 720 ms
+      (`TRANSITION_MS`, revised 2026-11-15). With reduced motion it jumps.
   - **Defaults** (ASSUMPTION, tuned visually; the constants in `src/app/render3d/camera.ts` are
     authoritative):
     - **Overview**: θ = 90°, fov 30°. ψ is chosen so the table's long axis follows the screen's long
       axis. Landscape: +x right and +y up, like the 2D view. Portrait: +x up. d is fitted so the table
       plus rails fill the viewport (≈ 3.5 % margin, minus UI insets).
-    - **Player view**: eye ≈ 0.55 m behind the cue-ball centre along −aimDir and ≈ 0.30 m above the
-      bed. fov 50° (landscape) or 58° (portrait). The look point lies on the z = R plane along the aim
-      line, so that the ghost ball is in view and the cue ball sits in the lower part of the frame.
-      Without a plan, aimDir = the direction from the cue ball to the table centre.
+    - **Player view** (revised 2026-11-15 to `camera.ts`): eye 0.5 m behind the cue-ball centre
+      along −aimDir and 0.21 m above the bed, and at least 7 cm above the cue's rail-clearing line, so
+      beyond the rail when the ball is frozen to it. fov 50° (landscape) or 58° (portrait). To keep
+      the pocket, the object ball's path and the ghost ball in view, the fit may back off by up to
+      0.38 m, widen the fov by up to 17° and turn toward the pocket. The look point lies on the z = R
+      plane. Without a plan, aimDir = the direction from the cue ball to the table centre.
     - **Broadcast**: an elevated three-quarter view, fov 38°. Landscape: from the bottom long rail,
       turned toward a corner (ψ ≈ −112°, θ ≈ 34°). Portrait: from behind the left short rail,
       slightly off-axis (ψ ≈ 196°, θ ≈ 40°). d is fitted.
 - **Gestures**: a pointer state machine with `setPointerCapture` and `touch-action: none`.
   - **Tap**: movement < 8 px and duration < 350 ms → `onTap(pick)`.
-  - **Double-tap**: two taps on empty cloth within 300 ms and 24 px → the last preset.
+  - **Double-tap**: a second tap on empty cloth within 320 ms and 30 px → the last preset
+    (`gestures.ts`, revised 2026-11-15).
   - **Drag**: on a ball → `onBallDrag` (start/move/end) on the z = R plane, clamped to the bed. On
     empty cloth or background → orbit (0.3°/px), which sets the camera to `custom`.
-  - **Two pointers**: the distance ratio → zoom; the midpoint motion → pan. **Wheel**: zoom.
+  - **Two pointers**: the distance ratio → zoom; the midpoint motion → pan. **Wheel**: zoom by
+    exp(dy·0.0015); Ctrl + wheel (a trackpad pinch) by exp(dy·0.01).
+  - **pointercancel** ends any gesture and is never a tap. The machine is the pure
+    `src/app/render3d/gestures.ts`, tested in `tests/unit/app/render3d-gestures.test.ts`.
 - **Rationale**: an orbit camera is predictable for players. The presets map to what coaches show:
   the map view, the shooter's eye line and the TV angle. Thresholds match platform tap conventions.
 
@@ -153,10 +167,13 @@ tests on synthetic fixtures must confirm or tune.
 - **Decision**: unproject the pointer through the inverse view-projection into a world ray. Hits are
   tried in this order:
   1. Nearest ray–sphere hit among the balls (z = R).
-  2. Otherwise the nearest ball whose projected centre lies within max(projected radius, 22 CSS px).
-     This keeps the 44 px touch target (Principle VI).
-  3. Otherwise the ray–bed-plane hit inside a pocket's capture disc (mouth centre, radius = mouth/2 +
-     R) → pocket.
+  2. Otherwise the nearest ball whose closest approach to the ray is within 1.8·R + 12 CSS px at the
+     ball's distance (its natural radius), or the 22 CSS px floor that keeps the 44 px touch target
+     (Principle VI). A ball reached only through that floor yields to a pocket mouth nearer the tap
+     on screen, the same rule as the 2D table and the overlay (revised 2026-11-15).
+  3. Otherwise the ray–bed-plane hit inside a pocket's capture disc → pocket. The disc is centred
+     2 cm from the mouth centre into the pocket, with radius 0.75 × the mouth width and at least
+     22 CSS px.
   4. Otherwise a hit inside the bed → cloth.
   5. Otherwise `null`.
 
@@ -218,12 +235,16 @@ tests on synthetic fixtures must confirm or tune.
 - **Decision**:
   - Two file inputs, both `accept="image/*"`: one with `capture="environment"` (camera) and one
     without (library). They open the native camera and picker in Safari, WKWebView and Chrome.
-  - Decoding goes through an `HTMLImageElement` from an object URL plus `decode()`, drawn into a canvas
-    at the processing size: long side 1280 px for both photos. Modern browsers apply the EXIF
-    orientation in `drawImage` (`image-orientation: from-image` is the default).
-    `createImageBitmap(blob, { imageOrientation: 'from-image' })` is a fast path where supported.
+  - *Revised 2026-11-15 to `snap/photo.ts` and `snap/exif.ts`:* the processing size is **960 px** on
+    the long side for both photos (`SNAP_MAX_DIM`). The app reads the photo's size and EXIF
+    orientation from the header itself, sets the JPEG orientation tag to 1 in the bytes it decodes
+    (so no decoder turns the photo, whatever it supports) and turns the pixels itself. The platform
+    decodes straight to the processing size with `createImageBitmap` `resizeWidth`/`resizeHeight`
+    where it supports them; otherwise without them, or through an `HTMLImageElement` and
+    `decode()`. A full-size bitmap is drawn once and closed at once.
   - Then `getImageData` → `Frame` → transferred to the vision worker.
-  - The object URL is revoked and the full-size image dropped at once.
+  - The object URL is revoked and the full-size image dropped at once. A photo that finishes decoding
+    after Start over or leaving Snap is dropped too (FR-122).
   - HEIC is converted to JPEG by iOS for file inputs.
   - Nothing is written to storage (Principle V).
 - **Rationale**: the native camera UI is familiar and gives the best photo. `ImageCapture.takePhoto`
@@ -335,7 +356,7 @@ tests on synthetic fixtures must confirm or tune.
     - the miscue-limit ring (the 3D circle of points at offset 0.5 R, dashed);
     - a centre cross (the vertical and horizontal arcs through the back pole);
     - ¼-tip ticks.
-  - **Text label**: e.g. "Strike ½ tip low, ¼ tip right" from 001 `describeSpin`.
+  - **Text label**: e.g. "Strike ½ tip below centre, ¼ tip right" from 001 `describeSpin` (1 tip = ¼ R).
   - **Inset**: a magnified (2.5×) crop of the cue ball from the photo, with the same drawing.
   - **Visibility**: P is visible when (P − C)·(P − c) < 0. When it is hidden or off-frame, the guide
     shows the strike point on the shaded spin ball (`renderSpinBall`) with the message from FR-119.
@@ -346,10 +367,11 @@ tests on synthetic fixtures must confirm or tune.
 
 - **Decision**: Capacitor 8 with `@capacitor/cli`, `@capacitor/core` and `@capacitor/ios` as
   **devDependencies pinned exactly to 8.6.0** (verified on npm; the CLI requires Node ≥ 22).
-  - **iOS project**: the Capacitor 8 default Swift Package Manager template (no CocoaPods), minimum
-    iOS 15, committed under `ios/`.
-  - **Config**: `capacitor.config.json` with `webDir: "dist"`, no `server.url` (bundled assets
-    only), and the background colour `#070B14`.
+  - **iOS project**: the Capacitor 8 default Swift Package Manager template (no CocoaPods), committed
+    under `ios/`. Minimum **iOS 16.0** (revised 2026-11-15: the UI's CSS container queries need
+    Safari and WKWebView 16).
+  - **Config**: `capacitor.config.ts` (appId `com.cuesight.app`) with `webDir: "dist"`, no
+    `server.url` (bundled assets only), and the background colour `#070B14`.
   - **No plugins**, and app code never imports `@capacitor/core`. The native bridge injects
     `window.Capacitor`, and feature detection reads that global. The web bundle keeps **zero runtime
     npm dependencies**.
@@ -394,9 +416,15 @@ tests on synthetic fixtures must confirm or tune.
 
 ## R-29 CI on GitHub-hosted macOS runners
 
-- **Decision**: one workflow, `.github/workflows/ios.yml`, at the **git root** (`/`; the app lives in
-  `cuesight/`, so `defaults.run.working-directory: cuesight`). It runs on push, pull request and
-  `workflow_dispatch` (input `upload: boolean`), with a concurrency group per ref.
+- **Decision**: one workflow at the **git root** (`/`; the app lives in `cuesight/`, so
+  `defaults.run.working-directory: cuesight`). *As built (2026-11-15):* the file is
+  `.github/workflows/cuesight-ios.yml`. It runs on pushes to `main` and `claude/**`, on pull requests
+  into `main` (a pull request from a `claude/**` branch of this repository is covered by that branch's
+  push run) and on `workflow_dispatch` (input `upload: boolean`, off by default). A newer run cancels
+  a superseded one on the same branch or pull request, except runs that may upload, which have their
+  own never-cancelled group. The jobs as built are `web` (typecheck, Vitest, `vite build`, sizes),
+  `chromium-e2e` (`npm run e2e`), `ios-simulator` (`scripts/ios-sim-smoke.sh`), `webkit-e2e` and
+  `testflight`; [docs/ios.md](../../docs/ios.md) describes them. The original design follows.
   1. **`web`** (ubuntu-latest, Node 22): `npm ci`, `typecheck`, `test`, `fixtures`, `vite build`, and
      the Chromium e2e suite (SwiftShader WebGL flags).
   2. **`ios-simulator`** (macOS image with Xcode 26; the job prints `xcodebuild -version`):
@@ -410,7 +438,9 @@ tests on synthetic fixtures must confirm or tune.
         output tee'd to `sim.log`.
      5. **Smoke test**: the app logs `[CueSight] ready` (Capacitor forwards `console.*` to native stdout
         as `⚡️  [info] - …` in Debug builds, verified in the 8.6.0 sources). The job fails if the marker
-        doesn't appear within 60 s.
+        doesn't appear within `READY_TIMEOUT` after a launch: 90 s by default (revised from 60 s; the
+        first CI run reported ready after 22 s), checked after every launch (default, Practice,
+        Snap).
      6. **Screenshot tour**: the build-time flag `VITE_CUESIGHT_TOUR` makes the app step through
         Practice Overview → Player view → Broadcast → Snap (bundled sample photos, FR-123) → guide. It
         logs `[CueSight] tour <step>` at each step. CI runs `simctl io screenshot` on each marker.
@@ -418,8 +448,9 @@ tests on synthetic fixtures must confirm or tune.
   3. **`webkit-e2e`** (macOS): `npx playwright install webkit`, then `playwright test
      --project=webkit-iphone` (an iPhone device profile). The live-camera spec is skipped on WebKit,
      which has no fake camera. Practice, Snap (with `setInputFiles`) and UI specs run.
-  4. **`testflight`** (macOS; needs `ios-simulator` and `webkit-e2e`; runs on `main` or when
-     `inputs.upload`) — see R-30.
+  4. **`testflight`** (macOS; needs `web`, `chromium-e2e`, `ios-simulator` and `webkit-e2e`; runs
+     only for a push to `main` or a manual run with `inputs.upload`, in its own never-cancelled
+     concurrency group) — see R-30.
 - **Rationale**: the tour flag gives deterministic screenshots without an XCUITest target. It is a
   compile-time define, so release builds never contain it. Picking the simulator at run time survives
   runner-image updates.
@@ -443,8 +474,9 @@ tests on synthetic fixtures must confirm or tune.
      'generic/platform=iOS' -archivePath build/App.xcarchive -allowProvisioningUpdates
      -authenticationKeyPath … -authenticationKeyID … -authenticationKeyIssuerID …` and the settings
      `DEVELOPMENT_TEAM`, `CODE_SIGN_STYLE=Automatic`, `PRODUCT_BUNDLE_IDENTIFIER=${{ vars.IOS_BUNDLE_ID
-     }}`, `CURRENT_PROJECT_VERSION=${{ github.run_number }}${{ github.run_attempt }}` (strictly
-     increasing) and `MARKETING_VERSION` from `package.json`.
+     }}`, a strictly increasing build number and `MARKETING_VERSION` from `package.json`. As built,
+     `scripts/ios-testflight.sh` runs these steps; the build number is `<run number>.<run attempt>`
+     and the `.p8` may be given as PEM text or base64.
   5. `xcodebuild -exportArchive -exportOptionsPlist ios/ExportOptions.plist` with `method =
      app-store-connect`, `destination = upload`, `signingStyle = automatic`, `teamID` and
      `uploadSymbols = true`, plus the same authentication flags. This uploads straight to App Store

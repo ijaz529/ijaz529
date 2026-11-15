@@ -4,7 +4,8 @@
 
 **Created**: 2026-11-14
 
-**Status**: Draft (clarified, ready for planning)
+**Status**: Implemented on `fix2b/app` (wave 2b). Clarified again on 2026-11-15 after the code review
+and the wave-2 fixes (see "Session 2026-11-15" below).
 
 **Builds on**: [001 Real-Time Shot Guide](../001-realtime-shot-guide/spec.md) (complete). Every 001
 requirement still holds unless this spec says otherwise.
@@ -31,7 +32,8 @@ outstanding.
   *prescribes* the line, the strike point and the power. It does not measure the stroke.
 - Q: How are side and vertical tip offsets drawn on the cue ball? → A: From the shooter's view:
   `side > 0` is right english and `vert > 0` is follow (top). The strike dot sits on the face of the
-  cue ball that faces the player. One tip is 0.25 R (as in 001).
+  cue ball that faces the player. One tip is 0.25 R (as in 001): about 7 mm on a pool ball, so the
+  0.5 R miscue limit is 2 tips. The card details give the offset in mm as well.
 - Q: How is power communicated in Snap? → A: Exactly as in 001: 1–10, a speed word and a visual meter.
 - Q: Which table types get the 3D table? → A: Every 001 preset. Pool tables show numbered solids and
   stripes. The snooker table shows snooker colours, the baulk line, the D and the spots.
@@ -43,6 +45,27 @@ outstanding.
   in the iOS Simulator. Only the archive and upload steps are skipped, with a clear notice.
 - Q: Can the 3D renderer use a library such as three.js? → A: No. Runtime dependencies stay at zero
   (Principle VII). Research R-15 records the decision.
+
+### Session 2026-11-15 (post-review)
+
+These record what the reviewed implementation does.
+
+- Q: How long does a replay last? → A: The balls' motion takes at most 4 s (longer shots are sped up
+  evenly). A 0.5 s strike lead-in comes before it, and the end position is held 3.5 s for study (×1.8
+  with reduced motion). One tap on the table, Skip or Escape ends it at once. So "at most 4 s" is the
+  motion, not the whole replay (FR-108, US1-AS5).
+- Q: Is the tip unit still 0.25 R? → A: Yes, decided and kept (001 T082): 1 tip = ¼ R ≈ 7 mm on a pool
+  ball, 2 tips = the 0.5 R miscue limit, and the card details give mm.
+- Q: Which iOS version? → A: iOS 16 or later. The UI uses CSS container queries, which need Safari and
+  WKWebView 16; the Xcode project's deployment target is 16.0 (FR-132).
+- Q: When does CI upload to TestFlight? → A: Only for a push to `main` or a manual run with upload
+  ticked (off by default), and only after the web, Chromium e2e, WebKit e2e and Simulator jobs pass
+  (FR-136).
+- Q: What is the Snap fit's confidence about? → A: The target ball the fit was made for. Changing the
+  target fits the same photo again; after a two-tap fit the player taps again. Changing the pocket or
+  the stroke keeps the fit (FR-116).
+- Q: What size are Snap photos processed at? → A: 960 px on the long side (`snap/photo.ts`
+  `SNAP_MAX_DIM`). The 1280 px figures below are the test fixtures' size.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -88,9 +111,11 @@ still works.
    The cue stick is drawn behind the cue ball, its tip at the recommended side and vertical offset,
    pulled back further for more power.
 5. **Given** a plan, **When** the player taps Play shot, **Then** every ball the simulation moves
-   travels its path in real time, and the whole replay takes at most 4 s. A ball's numbers turn the
-   way a rolling ball turns, without skidding, once it rolls. A pocketed ball drops into the pocket.
-   The player can skip at any time. Afterwards the balls return to the planned layout.
+   travels its path in real time. The balls' motion takes at most 4 s (longer shots are sped up
+   evenly); a 0.5 s strike lead-in comes before it and the end position is held 3.5 s (×1.8 with
+   reduced motion). A ball's numbers turn the way a rolling ball turns, without skidding, once it
+   rolls. A pocketed ball drops into the pocket. One tap on the table, Skip or Escape ends the replay
+   at once and shows the planned layout, as does the end of the hold.
 6. **Given** the 3D table, **When** the player drags a ball and releases it, **Then** the ball stays
    where it was dropped, inside the cushions and not overlapping another ball, and the plan updates
    within 0.1 s.
@@ -116,7 +141,7 @@ The player's own idea. In **Snap** mode:
    - **where to aim**: the aim line on the cloth from the cue ball to the ghost ball, the ghost ball,
      and the object ball's path into the pocket;
    - **where to strike the cue ball**: a dot drawn on the visible face of the cue ball at the
-     recommended tip offset, with the miscue limit and words such as "½ tip low";
+     recommended tip offset, with the miscue limit and words such as "½ tip below centre";
    - **how hard**: power 1–10, a speed word and a meter.
 
 If the app can't work out the phone's position, it says why in plain words. It then asks the player
@@ -233,7 +258,8 @@ appear in TestFlight.
 1. **Given** the repository, **When** the iOS workflow runs on a macOS runner, **Then** it:
    - builds the web app and copies it into the iOS project;
    - builds the app for the iOS Simulator, installs it and launches it;
-   - fails if the app does not report that it is ready within 60 s;
+   - fails if the app does not report that it is ready within `READY_TIMEOUT` (90 s by default; the
+     first CI run reported ready after 22 s), checked after every launch (default, Practice, Snap);
    - saves screenshots of Practice (3D) and Snap as workflow artifacts.
 2. **Given** the same workflow, **When** the WebKit end-to-end job runs with an iPhone profile,
    **Then** the Practice, Snap and UI end-to-end tests pass.
@@ -266,13 +292,34 @@ appear in TestFlight.
   returns to its planned state.
 - Shots that last more than 4 s in the simulation → the replay is sped up evenly to finish in 4 s, so
   every ball still reaches its true rest position.
-- Player view preset when the cue ball is frozen to a rail → the eye is placed behind the cue ball as
-  far as the rail allows, above the rail height.
+- Player view preset when the cue ball is frozen to a rail → the eye stays 0.5 m behind the cue ball
+  down the aim line, at least 7 cm above the cue's rail-clearing line, so beyond the rail when the
+  ball is frozen to it.
+- Snooker, a ball touching the cue ball → the 3D label reads "Not makeable · touching ball" with "Play
+  away from it (a push is a foul)"; the card shows the planner's push-stroke reason (001).
 
 **Snap**
 
-- The table photo misses part of the table, or has glare → the 001 behaviour: no auto lock, and
-  *Tap corners* is offered. Balls hidden from view are not invented.
+- The table photo misses part of the table, or has glare → no table, or a table cut off by the
+  border that vision cannot complete, gives "The whole table must be in the photo — step back or turn
+  the phone and retake it. All four corners already in view? Tap them." Balls hidden from view are not
+  invented. A table with one end cropped off is completed and accepted (measured on 15–28 % side crops
+  of the sample: 9/9 balls, max error 6 mm, "9 balls · good"). A near rail touching the bottom border
+  gives the no-table message.
+- Tapped corners → four taps that cannot be a table outline (three on one rail, two on one spot, a
+  sliver) are refused before the photo is processed again: "Those four taps aren’t the cloth corners —
+  tap them again." (Live's words). Corners the still pipeline refuses get the same text (`bad-quad`),
+  or "Couldn’t tell the cloth from its surroundings — tap the four cloth corners again, or retake the
+  photo." (`cloth-unknown`). A loose quad opens the review with "Your four corners don’t quite match
+  the cloth — check the layout, or tap the corners again."
+- Table detection itself fails while a Snap photo is processed (the vision worker dies) → Snap says
+  so, and the next photo or tap starts a new worker:
+  - table photo, the worker never answered: "Table detection couldn’t start — it may not be
+    available offline yet. Reconnect, then retake the photo or choose it again.";
+  - table photo, the worker had answered: "Table detection stopped working on this photo. Retake it
+    or choose it again to try once more.";
+  - player photo: the two-tap step with "Table detection stopped working on this photo. Tap the cue
+    ball, then your target, to try again."
 - Player photo with the cue ball **partly cut off** at the frame edge → the ball is fitted from its
   visible arc. If the strike point falls outside the photo, the app says so ("The strike point is just
   below the photo — tilt up a little") and shows the strike point on the shaded spin ball instead.
@@ -291,10 +338,13 @@ appear in TestFlight.
   can still succeed. The app says "You're not behind the cue ball" and still draws the guide.
 - Balls moved between the two photos → the fit is poor or contradicts the layout. The app says "The
   balls seem to have moved — retake the table photo".
-- Photo orientation → the photo's own orientation tag is honoured, so portrait and landscape photos
-  are both upright.
-- Very large photos (12–48 MP) or HEIC → the photo is decoded by the platform and scaled down to the
-  processing size. Only the scaled copy is kept, in memory.
+- Photo orientation → the app reads the photo's EXIF orientation itself and neutralises the tag
+  before decoding, so no decoder turns the photo twice. Portrait and landscape photos are both
+  upright.
+- Very large photos (12–48 MP) or HEIC → the photo is decoded straight to the processing size (960 px
+  on the long side) with `createImageBitmap` `resizeWidth`/`resizeHeight` when the header gives its
+  size (JPEG, PNG) and the platform supports the options; otherwise the full-size bitmap is drawn once
+  and closed at once. Only the scaled copy is kept, in memory.
 - The device has no camera (desktop, iOS Simulator) → Snap uses the photo picker. Sample photos are
   offered so the flow can be tried without a table.
 
@@ -343,8 +393,10 @@ appear in TestFlight.
   recommended strike point (side and vertical offset), and the gap between its tip and the ball MUST
   grow with power.
 - **FR-108**: *Play shot* MUST replay the simulated trajectories of every ball in motion at real-time
-  speed, passing every simulation event at its time. Replays longer than 4 s MUST be sped up evenly
-  to last 4 s.
+  speed, passing every simulation event at its time. Motion longer than 4 s MUST be sped up evenly
+  to last 4 s. A 0.5 s strike lead-in comes first, and the end position is held 3.5 s (×1.8 with
+  reduced motion) so the player can study it; a tap, Skip or Escape ends the hold at once. A
+  half-speed replay (½×) MAY be offered.
   - Ball rotation MUST be consistent with rolling: no slip while a ball rolls. It SHOULD also show
     the sliding-to-rolling transition after the strike and after impact, so stun, draw and follow
     look different.
@@ -352,7 +404,9 @@ appear in TestFlight.
   - The replay MUST be skippable (button, tap, Escape) and MUST restore the planned layout when it
     ends.
 - **FR-109**: The 3D view MUST draw frames only when something changes (camera move, data change,
-  playback) and MUST be idle otherwise.
+  playback) and MUST be idle otherwise. The one exception is the Player view's three idle practice
+  strokes of the cue (5.4 s after the stroke, the cue ball or the view changes; none with reduced
+  motion), after which it is idle again.
 - **FR-110**: When WebGL2 is unavailable, or the 3D view cannot be created or restored, the system MUST
   fall back to the 001 2D table with every feature, and say so in one line. A setting and the URL
   parameter `?renderer=2d` MUST force the fallback.
@@ -360,11 +414,15 @@ appear in TestFlight.
 **Snap: two-photo guide (US2)**
 
 - **FR-111**: In Snap mode, the player MUST be able to provide the table photo from the camera or the
-  photo library. The photo's orientation tag MUST be honoured, and the photo MUST be scaled to the
-  processing size.
+  photo library. The photo's orientation tag MUST be honoured (the app reads the EXIF orientation and
+  neutralises the tag before decoding), and the photo MUST be scaled to the processing size (960 px
+  on the long side), decoded straight to it where the platform allows. Every failure MUST be said in
+  player words: no table or a table cut off by the border, refused corner taps, a loose quad, and a
+  failed detection worker (the Snap edge cases above).
 - **FR-112**: The system MUST detect the table and the balls in the table photo with the 001 pipeline.
   It MUST show the outline and the balls over the photo, mark the cue ball and show the detection
-  quality.
+  quality. The Snap 3D table takes its cloth colour from the table photo; a grey (neutral) cloth is
+  rendered grey.
 - **FR-113**: The player MUST be able to fix the detected layout (move, add or remove a ball, mark the
   cue ball), tap the four corners by hand when detection fails, and retake the photo.
 - **FR-114**: The player MUST be able to pick the target ball and optionally a pocket, on the photo or
@@ -374,7 +432,9 @@ appear in TestFlight.
   photo library.
 - **FR-116**: The system MUST estimate where the camera was for the player photo, using the confirmed
   layout and the table's known geometry. It MUST report a confidence from 0 to 1 and, on failure, a
-  player-facing reason.
+  player-facing reason. The confidence is for the target ball the fit was made for: changing the
+  target fits the same photo again (after a two-tap fit, the player taps again); changing the pocket
+  or the stroke keeps the fit.
 - **FR-117**: When the estimate succeeds, the system MUST draw on the player photo, in perspective:
   - the aim line on the cloth from the cue ball to the ghost ball, and the ghost-ball outline;
   - the contact point;
@@ -384,6 +444,16 @@ appear in TestFlight.
   - a magnified inset of the cue ball;
   - power as 1–10, a speed word and a meter;
   - the confidence.
+
+  A plan with no ghost ball (a frozen cue ball) labels its stroke end on the photo, or its cue ball
+  when that end is off the photo ("Frozen · stroke 12° left"; "Not makeable" goes on the cue ball), at
+  the canvas scale. Photo labels never overlap: the aim label keeps clear of the "Strike here" label.
+  The HUD under the photo words a frozen cue ball's aim as "Frozen: stroke N° to the left/right of the
+  line of centres" (or "straight through"), with the same degrees and side as the card tile, the 2D
+  and photo labels and the core warning, and the instruction reads "Frozen balls: aim the stroke, not
+  a ghost ball. Strike … (the blue dot on the ball's face)." The HUD meter words the plan as the
+  card's meter does, so it shows no power minimum while the frozen advice is pending or when no power
+  works.
 - **FR-118**: When the estimate fails or its confidence is below the threshold, the system MUST NOT draw
   the guide as if it were right. It MUST show the reason and offer the manual fallback: tap the cue
   ball and the target ball in the photo. After the two taps it MUST draw the guide and show its
@@ -396,7 +466,9 @@ appear in TestFlight.
 - **FR-121**: The system MUST warn when the player photo contradicts the layout ("the balls seem to
   have moved") and when the camera was not behind the cue ball.
 - **FR-122**: Snap photos MUST be processed on the device, kept in memory only for the Snap session,
-  never stored or sent, and discarded on *Start over* or on leaving Snap.
+  never stored or sent, and discarded on *Start over* or on leaving Snap. The photo canvas and its
+  thumbnail are cleared then too, and a photo still being decoded or loaded at that moment MUST be
+  discarded when it arrives. Of several photos picked in a row, only the latest is used.
 - **FR-123**: Snap SHOULD offer bundled sample photos (a table photo and a player photo of a synthetic
   table), so the flow can be tried without a table or a camera.
 
@@ -408,11 +480,34 @@ appear in TestFlight.
   expose the mode as `data-mode` (`camera`, `snap` or `practice`).
 - **FR-126**: On portrait phones, the shot card MUST be a draggable bottom sheet. Its peek height MUST
   show target → pocket, cut, power and spin. In landscape, or at 900 px wide or more, it MUST be a
-  static side panel. Safe-area insets MUST be respected.
+  static side panel. Safe-area insets MUST be respected. The card's wording, as implemented:
+  - **Headline warning**: on a makeable card it is the warning's only copy (no chip repeats it). It
+    wraps instead of ending in an ellipsis. At the peek it is clamped to 2 lines (the frozen power
+    advice runs to 3–4 lines at 375–393 px) and the CUT / POWER / SPIN captions step aside; medium and
+    expanded show all of it. `throw-uncompensable` is a headline warning, ranked with `ob-missed`.
+  - **Frozen cue ball**: the cut tile reads "Frozen · N° · stroke left/right" (or "straight"), never
+    "0° · full-ball hit". At the peek with a headline warning it shows "FROZEN" over "N° stroke
+    left/right" or "0° straight". Screen readers hear "Balls frozen together." with no angle. The
+    generic frozen hint is never shown or spoken next to a not-makeable reason.
+  - **Not makeable with no other pocket**: the tip reads "No other pocket is clear for this ball: pick
+    another ball or play a safety." When a warning on the card already says that, it reads "Pick
+    another ball, or tap Suggest a shot."
+  - A ball vision could not name is "Unnamed ball" in the card title, the ball picker and the
+    announcer.
+  - **Recommended-stroke notes** (one note line, only while the recommended stroke is shown):
+    "Speed-sensitive — small changes in pace may change the result." (`fragile`), "Search cut short —
+    the best stroke found in time." (`timedOut`), "Scratch risk from small errors not checked."
+    (`risks` absent).
 - **FR-127**: The shot card MUST show:
   - the cut and power as big numerals;
   - a fractional-aim overlap graphic;
-  - a 10-segment power gauge with the minimum-power mark;
+  - a 10-segment power gauge with the minimum-power mark. A dashed arc marks minPowerCapture …
+    minPower as "only just drops", and the text reads "Minimum X; from Y it only just drops". Past 10
+    it reads "Needs more than full power for pace"; for a frozen cue ball, or any plan with
+    `noWorkingPower`, "No power gets it in with pace", with no tick and Min power "none". No minimum
+    is shown while a frozen cue ball's power advice is still being worked out (`adviceSkipped`).
+    `ui/power-meter.ts` (`meterOptions`, `meterMinPower`) is the one reader for the card and the Snap
+    HUD;
   - a shaded 3D cue ball with the tip dot and the miscue ring.
 
   Each MUST have a text equivalent. Every 001 test id, accessible name and tested text MUST be kept.
@@ -433,18 +528,23 @@ appear in TestFlight.
 **iOS app and delivery (US4)**
 
 - **FR-132**: The iOS app MUST wrap the same web build with bundled assets. It MUST work offline, make
-  no network requests, support iOS 15 or later, run in portrait and landscape, and respect safe areas.
+  no network requests, support iOS 16 or later (CSS container queries need Safari and WKWebView 16),
+  run in portrait and landscape, and respect safe areas.
 - **FR-133**: The iOS app MUST explain camera and photo-library use in plain language when iOS asks for
   permission, and MUST handle a denial with the 001 fallback.
-- **FR-134**: CI on macOS MUST, on every push and pull request:
+- **FR-134**: CI on macOS MUST, on every push to `main` and `claude/**` and every pull request into
+  `main` (a pull request from a `claude/**` branch of this repository is covered by that branch's push
+  run):
   - run the web checks;
   - build the iOS app for the Simulator, install and launch it, and check that it reports ready;
   - save Simulator screenshots of Practice and Snap.
 - **FR-135**: CI MUST run the end-to-end tests on WebKit with an iPhone profile.
 - **FR-136**: When App Store Connect API key secrets are configured, CI MUST archive a signed Release
-  build with a strictly increasing build number and upload it to TestFlight. This happens on the main
-  branch, or by hand when upload is requested. Without secrets, it MUST skip these steps with a notice
-  and still pass. Secrets MUST never be printed or committed.
+  build with a strictly increasing build number and upload it to TestFlight. This happens only for a
+  push to `main`, or for a manual run with upload requested (the input is off by default), and only
+  after the web, Chromium e2e, WebKit e2e and Simulator jobs pass. An upload in progress is never
+  cancelled. Without secrets, it MUST skip these steps with a notice and still pass. Secrets MUST
+  never be printed or committed.
 - **FR-137**: The iOS app MUST declare that it uses no non-exempt encryption and MUST contain no
   analytics or tracking.
 
@@ -473,13 +573,13 @@ appear in TestFlight.
 
 - **SC-101**: On a mid-range phone, the 3D table is interactive within 2 s of opening Practice. It
   renders at ≥ 30 fps while orbiting and during playback, with up to 22 balls. With no interaction it
-  draws no frames.
+  draws no frames (after the Player view's idle practice strokes, FR-109).
 - **SC-102**: In every camera preset, tapping the on-screen centre of any visible ball selects that
   ball, and tapping a pocket mouth selects that pocket, in 100 % of test cases. A dragged ball comes to
   rest within 2 mm of the cloth point under the finger.
 - **SC-103**: In replays, every ball is within 1 mm of its simulated position at each simulation event
-  time. While rolling, the contact-point slip speed is below 1 % of the ball's speed. No replay lasts
-  more than 4 s.
+  time. While rolling, the contact-point slip speed is below 1 % of the ball's speed. No replay's
+  motion lasts more than 4 s (the lead-in and the end hold of FR-108 come on top).
 - **SC-104**: For the same layout and selection, the 3D and 2D tables show identical shot-card values.
 - **SC-105**: On synthetic table photos at the Snap processing resolution, detected ball positions meet
   001 SC-003: median error ≤ 10 mm, 95th percentile ≤ 25 mm. The layout appears within 3 s on a
@@ -500,8 +600,9 @@ appear in TestFlight.
   use and can then say where to strike the cue ball and how hard.
 - **SC-111**: All 001 end-to-end tests pass unchanged. Every interactive element is at least 44 × 44 px
   and text meets the contrast targets, checked by an automated end-to-end test.
-- **SC-112**: The app has zero runtime npm dependencies, and the initial gzip JS stays under 250 KB (the
-  3D renderer may load lazily).
+- **SC-112**: The app has zero runtime npm dependencies, and the initial gzip JS stays under 250 KB. The
+  3D renderer is part of the initial bundle (there is no lazy chunk): the main JS is about 112 kB gzip
+  on `fix2b/app`.
 - **SC-113**: The iOS workflow passes on a clean macOS runner with no secrets, in under 30 minutes, and
   produces at least two Simulator screenshots. With secrets, the build reaches TestFlight processing.
 - **SC-114**: During a full Snap session, on the web and in the iOS app, zero network requests leave the
@@ -518,7 +619,7 @@ appear in TestFlight.
 - Phone cameras deliver photos with lens distortion already corrected, so a pinhole model is enough.
   The image centre is assumed to be the principal point.
 - The same table preset applies to both photos.
-- Players have a device with WebGL2 for the 3D table (iOS 15+, current Android and desktop browsers).
+- Players have a device with WebGL2 for the 3D table (iOS 16+, current Android and desktop browsers).
   Others get the full 2D experience.
 - The iOS app is distributed through TestFlight for testing. App Store review, pricing and store
   listing are a later step.
