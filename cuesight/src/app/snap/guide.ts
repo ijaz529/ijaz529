@@ -111,8 +111,10 @@ export interface PlayerGuide {
    * The aim label of a plan with no ghost ball (a frozen cue ball), which the photo would otherwise
    * lose: the label anchors on the ghost outline (snap/draw.ts "Aim here" / "Not makeable"). The
    * 2D table's words (planLabel: "Frozen · stroke 12° left"), at the far end of the stroke line; a
-   * shot that cannot be played says "Not makeable" at the cue ball (`warn`: vermillion). `at`/`r`:
-   * the anchor circle in image px. Null when the ghost ball carries the label.
+   * shot that cannot be played says "Not makeable" at the cue ball (`warn`: vermillion). The stroke
+   * end off the photo: at the cue ball. `at`/`r`: the anchor circle in IMAGE px, always inside the
+   * photo — draw it through the canvas mapping with aimLabelAnchor(). Null when the ghost ball
+   * carries the label, or when neither anchor is in the photo.
    */
   aimLabel: { text: string; at: Vec2; r: number; warn: boolean } | null;
   inFrame: { cue: boolean; ghost: boolean; target: boolean; pocket: boolean };
@@ -401,13 +403,15 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   };
 
   const face = inFrame.cue && cueCenter && cueRadiusPx > 0 ? strikeFace(cueCenter, cueRadiusPx, side, vert) : null;
-  // No ghost ball to carry the aim label: the stroke line's end (a playable frozen shot), or the cue ball.
+  // No ghost ball to carry the aim label: the stroke line's end (a playable frozen shot), or the cue
+  // ball — whichever is in the photo, so a label never points at something off the picture.
   let aimLabel: PlayerGuide['aimLabel'] = null;
   if (!aimL.ghost) {
     const ok = playable(plan);
     const endCam = toCam(pose, on(aimL.to));
-    const end = ok && endCam.z > NEAR ? pix(pose, endCam) : null;
-    const at = end ?? cueCenter;
+    const endPx = ok && endCam.z > NEAR ? pix(pose, endCam) : null;
+    const end = endPx && inImage(pose, endPx) ? endPx : null;
+    const at = end ?? (cueCenter && inImage(pose, cueCenter) ? cueCenter : null);
     if (at) aimLabel = { text: ok ? planLabel(plan, i.cue) : 'Not makeable', at, r: end ? 3 : cueRadiusPx, warn: !ok };
   }
   const messages: string[] = [];
@@ -494,6 +498,20 @@ export function guideFocus(g: PlayerGuide, width: number, height: number): { x0:
   for (const run of g.pocket) for (const p of run) add(p);
   if (!Number.isFinite(x0) || x1 - x0 < 4 || y1 - y0 < 4) return null;
   return { x0, y0, x1, y1 };
+}
+
+/**
+ * PlayerGuide.aimLabel's anchor circle on the canvas. `at` and `r` are photo px, and the app draws
+ * the photo scaled and offset into its canvas (snap/draw.ts PhotoCanvas: contain, or zoomed onto
+ * guideFocus), so both go through the canvas mapping like every other piece of the guide: the
+ * centre by `toScreen`, the radius by the mapping's scale (uniform: the photo keeps its aspect).
+ * snap/draw.ts drawGuide hands this to placedLabel when there is no ghost ball.
+ */
+export function aimLabelAnchor(l: { at: Vec2; r: number }, m: { toScreen(p: Vec2): Vec2 }): { x: number; y: number; r: number } {
+  const q = m.toScreen(l.at);
+  const o = m.toScreen({ x: 0, y: 0 });
+  const e = m.toScreen({ x: 1, y: 0 });
+  return { x: q.x, y: q.y, r: l.r * Math.hypot(e.x - o.x, e.y - o.y) };
 }
 
 /** A plan the player can actually play: makeable, and the cue ball gets to the object ball. */

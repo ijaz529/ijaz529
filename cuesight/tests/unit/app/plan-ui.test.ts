@@ -17,8 +17,8 @@ import { aimLine, isFrozenPlan, planLabel, stickDir, stickLine } from '../../../
 import { TableView } from '../../../src/app/render/table-view';
 import { tableGeom } from '../../../src/app/render3d/geom';
 import { ballLook, cueAim, cuePose, frameGhost, parseColor, planRibbons, srgbToLinear } from '../../../src/app/render3d/scene-data';
-import { drawGuide } from '../../../src/app/snap/draw';
-import { buildPlayerGuide, projectPolyline, unplayableHeadline } from '../../../src/app/snap/guide';
+import { drawGuide, focusMapping } from '../../../src/app/snap/draw';
+import { aimLabelAnchor, buildPlayerGuide, guideFocus, inImage, playable, projectPolyline, unplayableHeadline, type PlayerGuide } from '../../../src/app/snap/guide';
 import type { AppState } from '../../../src/app/store';
 import { tagText } from '../../../src/app/ui/ball-tags';
 import { PER_FRAME_MAX_MS, perFrame, renderSuggestions } from '../../../src/app/ui/controls';
@@ -31,7 +31,7 @@ import { planShot } from '../../../src/core/shot/planner';
 import { makeTable } from '../../../src/core/table';
 import type { Ball, PocketId, ShotPlan, Stroke, TableLayout, TableSpec, Vec2 } from '../../../src/core/types';
 import { strikePoint, type CameraPose } from '../../../src/vision/player-view';
-import { polyLength, recordingCanvas, sameDash, stubDocument } from './helpers/rec-canvas';
+import { polyLength, recordingCanvas, sameDash, stubDocument, type TextRec } from './helpers/rec-canvas';
 
 const table = makeTable('pool9');
 const snooker = makeTable('snooker12');
@@ -726,17 +726,177 @@ describe('r1 Snap photo: a label on the photo even without a ghost ball', () => 
     // A shot with a ghost ball keeps its label there (draw.ts: "Aim here"): no aimLabel.
     expect(buildPlayerGuide({ pose: TOP, table, plan: sidePlan(0), cue: squirtLay.balls[0]!.pos, target: { x: 0.6, y: 0.3 }, stroke: sidePlan(0).stroke }).aimLabel).toBeNull();
   });
-  // snap/draw.ts (not this package's file) still anchors its only plan label to the ghost outline.
-  // This pins that gap: it is EXPECTED to fail today, and vitest reports it the day draw.ts places
-  // PlayerGuide.aimLabel when g.ghost is empty — then turn it into a plain `it` (see appChanges).
-  it.fails('drawGuide writes "Not makeable" on the photo for the snooker touching-ball plan (needs snap/draw.ts)', () => {
-    const { lay, cue, ob } = frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red');
-    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
-    expect(recGuide(p, snooker, cue, ob, false)).toContain('Not makeable');
-  });
-  it('drawGuide still labels a plain shot\'s ghost ball ("Aim here"), so the probe above can see labels', () => {
+  // (The drawGuide checks moved to 'r2 Snap photo' below: they now draw through real photo→canvas
+  // mappings, so a recipe that leaves the anchor in photo px cannot pass them.)
+  it('drawGuide (identity mapping) still labels a plain shot\'s ghost ball ("Aim here")', () => {
     const p = sidePlan(0);
     expect(recGuide(p, table, squirtLay.balls[0]!.pos, { x: 0.6, y: 0.3 }, true)).toContain('Aim here');
+  });
+});
+
+describe('r2 Snap photo: the label without a ghost ball sits at its anchor on the CANVAS, not in photo px', () => {
+  type Anchor = { x: number; y: number; r: number };
+  type Mapping = { toScreen: (p: Vec2) => Vec2; toFrame: (p: Vec2) => Vec2; scale: number };
+  /**
+   * The photo→canvas mappings the app draws a 1280×720 photo with (snap/draw.ts PhotoCanvas: the
+   * whole photo fitted, zoomed onto guideFocus, the strongest zoom onto the label's anchor `c`),
+   * and the identity.
+   */
+  const mappingsFor = (g: PlayerGuide, c: Vec2 = g.aimLabel!.at): { name: string; W: number; H: number; m: Mapping }[] => {
+    return [
+      { name: 'identity 1280×720', W: 1280, H: 720, m: { toScreen: (p) => p, toFrame: (p) => p, scale: 1 } },
+      { name: '1600×900, whole photo (×1.25)', W: 1600, H: 900, m: focusMapping(1280, 720, 1600, 900, null) },
+      { name: '393×600, zoomed onto the shot', W: 393, H: 600, m: focusMapping(1280, 720, 393, 600, guideFocus(g, 1280, 720)) },
+      { name: '1600×900, ×5 onto the anchor', W: 1600, H: 900, m: focusMapping(1280, 720, 1600, 900, { x0: c.x - 40, y0: c.y - 40, x1: c.x + 40, y1: c.y + 40 }) },
+    ];
+  };
+  /** drawGuide on a recording canvas; `strikeNote` as the app passes it ("1/10 soft": power next to where to hit). */
+  const drawOn = (g: PlayerGuide, W: number, H: number, m: Mapping, makeable: boolean, strikeNote?: string) => {
+    const rec = recordingCanvas(W, H);
+    rec.canvas.width = W;
+    rec.canvas.height = H;
+    drawGuide(rec.canvas.getContext('2d')!, m, g, { showCuePath: true, makeable, ...(strikeNote ? { strikeNote } : {}) });
+    return rec;
+  };
+  /** The pill snap/draw.ts label() draws around a text: fillText at (x0 + 9, y0 + 13), 25 px high; the stub measures 7 px a glyph. */
+  const pillOf = (t: TextRec) => ({ left: t.x - 9, top: t.y - 13, right: t.x - 9 + t.text.length * 7 + 18, bottom: t.y + 12 });
+  const boxDist = (b: { left: number; top: number; right: number; bottom: number }, p: Vec2) => Math.hypot(Math.max(b.left - p.x, 0, p.x - b.right), Math.max(b.top - p.y, 0, p.y - b.bottom));
+  /**
+   * `text` is drawn next to the circle `a` the way placedLabel draws a label: the pill no more than
+   * its 14 px gap (+6 px) outside the circle, and its one leader line ending on the circle's rim
+   * (r + 2 from the centre), so both the centre and the radius must be canvas px. With the anchor
+   * left in photo px the pill lands 100+ px away (verifier probe: 183–190 px off at ×1.25, pinned to
+   * the right edge at 393 px wide).
+   */
+  function expectLabelAt(rec: ReturnType<typeof recordingCanvas>, text: string, a: Anchor, where: string): void {
+    const t = rec.texts.find((x) => x.text === text);
+    expect(t, `${where}: "${text}" is drawn`).toBeTruthy();
+    const pill = pillOf(t!);
+    expect(boxDist(pill, a), `${where}: the pill sits next to its anchor`).toBeLessThanOrEqual(a.r + 14 + 6);
+    const leaders = rec.strokes.filter((s) => s.color === 'rgba(244,246,251,0.85)' && s.width === 1.25 && s.pts.length === 2 && boxDist(pill, s.pts[0]!) <= 3);
+    expect(leaders.length, `${where}: one leader line from the pill`).toBe(1);
+    const end = leaders[0]!.pts[1]!;
+    expect(Math.hypot(end.x - a.x, end.y - a.y), `${where}: the leader ends on the anchor circle's rim`).toBeCloseTo(a.r + 2, 1);
+  }
+  /** Where the label of a plan with no ghost ball belongs on the canvas: its photo-px circle, mapped. */
+  const wantAnchor = (g: PlayerGuide, m: Mapping): Anchor => ({ ...m.toScreen(g.aimLabel!.at), r: g.aimLabel!.r * m.scale });
+  const touching = () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red');
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    return { p, g: buildPlayerGuide({ pose: TOP, table: snooker, plan: p, cue, target: ob, stroke: p.stroke }) };
+  };
+  const frozen8 = () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.87, y: 0.48 }, 8);
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    return { p, g: buildPlayerGuide({ pose: TOP, table, plan: p, cue, target: ob, stroke: p.stroke }) };
+  };
+
+  it('aimLabelAnchor maps the photo-px circle through the canvas mapping: the centre by toScreen, the radius by its scale', () => {
+    for (const { g } of [touching(), frozen8()]) {
+      expect(g.ghost).toEqual([]);
+      expect(g.aimLabel).not.toBeNull();
+      for (const { name, m } of mappingsFor(g)) {
+        const a = aimLabelAnchor(g.aimLabel!, m);
+        const want = wantAnchor(g, m);
+        expect(a.x, name).toBeCloseTo(want.x, 9);
+        expect(a.y, name).toBeCloseTo(want.y, 9);
+        expect(a.r, name).toBeCloseTo(want.r, 9);
+        // Why it matters: off the identity, the photo-px point is nowhere near the canvas anchor.
+        if (m.scale !== 1) expect(Math.hypot(g.aimLabel!.at.x - want.x, g.aimLabel!.at.y - want.y), name).toBeGreaterThan(100);
+      }
+    }
+  });
+  it('control: drawGuide places "Aim here" next to the ghost ball on the canvas under every mapping (the check is calibrated)', () => {
+    const p = sidePlan(0);
+    const g = buildPlayerGuide({ pose: TOP, table, plan: p, cue: squirtLay.balls[0]!.pos, target: { x: 0.6, y: 0.3 }, stroke: p.stroke });
+    for (const { name, W, H, m } of mappingsFor(g, g.ghostCenter!)) {
+      const pts = g.ghost.map((q) => m.toScreen(q));
+      const c = { x: pts.reduce((s, q) => s + q.x, 0) / pts.length, y: pts.reduce((s, q) => s + q.y, 0) / pts.length };
+      const r = pts.reduce((s, q) => s + Math.hypot(q.x - c.x, q.y - c.y), 0) / pts.length;
+      expectLabelAt(drawOn(g, W, H, m, true), 'Aim here', { ...c, r }, name);
+    }
+  });
+  // snap/draw.ts (not this package's file) still anchors its only plan label to the ghost outline,
+  // so the three `it.fails` below are EXPECTED to fail today. vitest reports them the day draw.ts
+  // places PlayerGuide.aimLabel at aimLabelAnchor(g.aimLabel, m) and keeps it off the strike label
+  // (the appChanges recipe): then turn each into a plain `it`. A recipe that passes the photo-px
+  // `at`/`r` straight to placedLabel keeps all three failing; one that maps them but lets the label
+  // sit on the strike label keeps the third failing.
+  it.fails('drawGuide writes "Not makeable" at the cue ball on the canvas for the snooker touching-ball plan (needs snap/draw.ts)', () => {
+    const { p, g } = touching();
+    expect(g.aimLabel!.text).toBe('Not makeable');
+    for (const { name, W, H, m } of mappingsFor(g)) expectLabelAt(drawOn(g, W, H, m, playable(p)), 'Not makeable', wantAnchor(g, m), name);
+  });
+  it.fails("drawGuide writes the frozen stroke's words at the stroke line's end on the canvas (needs snap/draw.ts)", () => {
+    const { p, g } = frozen8();
+    expect(g.aimLabel!.text).toMatch(/^Frozen · stroke \d+° (left|right)$/);
+    for (const { name, W, H, m } of mappingsFor(g)) {
+      const rec = drawOn(g, W, H, m, playable(p));
+      expectLabelAt(rec, g.aimLabel!.text, wantAnchor(g, m), name);
+      // The stroke's end is near the cue ball: its label must not sit on the strike label there.
+      const aim = pillOf(rec.texts.find((x) => x.text === g.aimLabel!.text)!);
+      const others = rec.texts.filter((x) => x.text !== g.aimLabel!.text);
+      expect(others.some((x) => x.text.startsWith('Strike here')), `${name}: the strike label is drawn too`).toBe(true);
+      for (const o of others) {
+        const b = pillOf(o);
+        const overlap = Math.min(aim.right, b.right) > Math.max(aim.left, b.left) && Math.min(aim.bottom, b.bottom) > Math.max(aim.top, b.top);
+        expect(overlap, `${name}: "${g.aimLabel!.text}" is clear of "${o.text}"`).toBe(false);
+      }
+    }
+  });
+
+  // The committed Snap fixture's player photo (crouched 0.5 m behind the cue ball, 0.3 m up, aimed at
+  // ball 1), with the cue ball frozen straight behind ball 1 toward the top-right corner, drawn as the
+  // app draws it on a 412 × 523 phone canvas zoomed onto the shot: the stroke's end is right next to
+  // the cue ball, so its label and the strike label compete for the same space.
+  it.fails("from the player's own viewpoint the frozen stroke's label stays clear of the strike label (needs snap/draw.ts)", () => {
+    const fx = JSON.parse(readFileSync('tests/fixtures/snap-layout.json', 'utf8')) as { photos: { player: { pose: CameraPose } }; balls: { id: string; pos: Vec2 }[] };
+    const pose = fx.photos.player.pose;
+    const { lay, cue, ob } = frozenLayout('TR', fx.balls.find((b) => b.id === '1')!.pos);
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(playable(p)).toBe(true);
+    const g = buildPlayerGuide({ pose, table, plan: p, cue, target: ob, stroke: p.stroke });
+    expect(g.aimLabel!.text).toBe('Frozen · straight through');
+    for (const [name, m, W, H] of [
+      ['412×523 zoomed onto the shot', focusMapping(pose.width, pose.height, 412, 523, guideFocus(g, pose.width, pose.height)), 412, 523],
+      ['412×523 whole photo', focusMapping(pose.width, pose.height, 412, 523, null), 412, 523],
+      ['375×460 zoomed onto the shot', focusMapping(pose.width, pose.height, 375, 460, guideFocus(g, pose.width, pose.height)), 375, 460],
+    ] as const) {
+      const rec = drawOn(g, W, H, m, true, '1/10 soft');
+      expectLabelAt(rec, g.aimLabel!.text, wantAnchor(g, m), name);
+      const aim = pillOf(rec.texts.find((x) => x.text === g.aimLabel!.text)!);
+      const strike = rec.texts.find((x) => x.text.startsWith('Strike here'));
+      expect(strike, `${name}: the strike label is drawn`).toBeTruthy();
+      const b = pillOf(strike!);
+      const ov = { x: Math.min(aim.right, b.right) - Math.max(aim.left, b.left), y: Math.min(aim.bottom, b.bottom) - Math.max(aim.top, b.top) };
+      expect(ov.x > 0 && ov.y > 0, `${name}: "${g.aimLabel!.text}" overlaps "${strike!.text}" by ${ov.x.toFixed(1)} × ${ov.y.toFixed(1)} px`).toBe(false);
+    }
+  });
+
+  // A camera that sees only the middle 1.28 × 0.72 m of the table (f = 3000 px from 3 m).
+  const NARROW: CameraPose = { ...TOP, f: 3000 };
+  it('no label anchored off the photo: with the cue ball out of the photo a not-makeable plan has no aimLabel', () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red');
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    const g = buildPlayerGuide({ pose: NARROW, table: snooker, plan: p, cue, target: ob, stroke: p.stroke });
+    expect(g.inFrame.cue).toBe(false);
+    expect(g.aimLabel).toBeNull();
+  });
+  it("the stroke line's end off the photo: the frozen label anchors on the cue ball instead", () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.55, y: 0.2 });
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(playable(p)).toBe(true);
+    const g = buildPlayerGuide({ pose: NARROW, table, plan: p, cue, target: ob, stroke: p.stroke });
+    const end = aimLine(p, cue, R, { hx: table.length / 2, hy: table.width / 2 }).to;
+    const endPx = projectPolyline(NARROW, [
+      { ...end, z: 0 },
+      { x: end.x + 1e-4, y: end.y, z: 0 },
+    ])[0]?.[0];
+    expect(endPx === undefined || !inImage(NARROW, endPx)).toBe(true);
+    expect(inImage(NARROW, g.cueCenter!)).toBe(true);
+    expect(g.aimLabel).toMatchObject({ text: planLabel(p, cue), warn: false });
+    expect(Math.hypot(g.aimLabel!.at.x - g.cueCenter!.x, g.aimLabel!.at.y - g.cueCenter!.y)).toBeLessThan(1e-6);
+    expect(g.aimLabel!.r).toBeCloseTo(g.cueRadiusPx, 6);
   });
 });
 
