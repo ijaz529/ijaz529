@@ -38,7 +38,7 @@ the cue ball) and **Practice** (a 3D table you can orbit, drag balls on and repl
 | **Drills** | No camera needed: built-in practice layouts (straight-in, 30° cut, rail ball, blocked, scratch risk, 9-ball) |
 | **Physics-grounded plan** | Time-stepped rigid-ball simulator with sliding/rolling friction, frictional ball–ball impulse (throw), cushions that change top and back spin, and jaws |
 | **Your stroke** | Power slider and spin pad, plus presets (stun, draw, follow, left, right). Predictions update instantly |
-| **Position play** | Tap where the cue ball should finish. CueSight simulates a grid of strokes, rules out any stroke that misses or scratches when hit 6 % or 12 % too hard or too soft, tests the survivors against tip, aim and squirt errors, and recommends the most forgiving one (at most 324 simulations; a phone gets fewer, sized to its speed). If no stroke survives, it says the stroke is speed-sensitive. Without a target spot it picks the stroke that leaves the easiest next shot |
+| **Position play** | Tap where the cue ball should finish. CueSight simulates a grid of strokes, rules out any stroke that misses or scratches when hit 6 % or 12 % too hard or too soft, tests the survivors against tip, aim and squirt errors, and recommends the most forgiving one (at most 324 simulations; a phone gets fewer, sized to its speed). If no stroke survives, it says the stroke may need precise pace. Without a target spot it picks the stroke that leaves the easiest next shot |
 | **Suggest & zones** | Ranks every makeable shot. Heatmap of cue-ball zones that leave an easy next ball |
 | **Tables** | 9-, 8- and 7-ft pool, UK 7-ft and 12-ft snooker. Adjustable cloth speed, cushion bounce and shaft type (standard or low-deflection) |
 
@@ -107,7 +107,7 @@ WebGL2, or with `?renderer=2d`, the 2D table does everything the same way.
 
 1. **Photograph the whole table** (the in-app camera, your photo library, or the bundled sample). The 001
    vision pipeline finds the cloth and the balls. The layout appears on the 3D table, and **Photo** shows
-   what was detected over your picture. Drag a ball to fix it, use **Cue ball**, **Add** or **Remove**,
+   what was detected over your picture. Drag a ball to fix it, use **Cue ball**, **Add** (an unnamed ball on the free spot nearest the middle; drag it into place) or **Remove**,
    or tap the four corners when the table wasn't found. Then tap the ball you want to pocket and, if you
    like, a pocket.
 2. **Crouch behind the cue ball** at table level, facing the shot, and take a second photo. CueSight works

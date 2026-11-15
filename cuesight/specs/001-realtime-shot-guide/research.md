@@ -228,8 +228,15 @@ the correction is stated in the decision itself.
   We also report the tolerance as mm of contact-point error (2R·cosφ·w).
   - d is floored at 2R, and cos φ at 0. A not-makeable shot has tolerance 0, never a negative
     value (cuts past 90° are "wrong side").
-  - Frozen cue ball: the tolerance is the margin of the line of centres, plus the available throw,
-    inside the window (see R-09).
+  - Frozen cue ball: the plan's tolerance is the stroke-angle tolerance its search has at the played
+    speed and tip — how far the stroke can turn either way and the object ball still leave inside the
+    window (nearer edge; probes 0.25° doubling to 2°, then every 2° to 16°, 5 bisections; at most
+    16°). It is the cue-ball direction tolerance, so the same thresholds apply; its mm figure is the
+    departure margin × 2R. The line-of-centres-plus-throw margin (R-09) only ranks pockets and
+    suggestions.
+  - A plan that misses as played (`ob-missed`, `throw-uncompensable`) or that no power works for
+    (`noWorkingPower`, or `minPowerCapture` > 10) has tolerance 0 and is "very hard", never easy or
+    medium; the card shows "±0 mm" / "±0°".
 - **Rationale**: one physically meaningful number that combines distance, cut and pocket. Thresholds
   are calibrated so a 1 m + 1 m, 30° corner shot is "medium", and are configurable.
 

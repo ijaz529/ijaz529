@@ -162,9 +162,9 @@ miscue limit is **2 tips**, and the words run from ¼ to 2 tips in quarter steps
 | `obPocketed` | boolean | as simulated, in the chosen pocket |
 | `scratch` | boolean | |
 | `windowHalfDeg` | number | OB angular margin |
-| `toleranceDeg` | number | CB aim tolerance (R-10). 0 when not makeable, never negative |
-| `toleranceMm` | number | contact-point tolerance. 0 when not makeable |
-| `difficulty` | `'easy' \| 'medium' \| 'hard' \| 'very hard'` | from `toleranceDeg` |
+| `toleranceDeg` | number | CB aim tolerance (R-10); frozen: the stroke-angle tolerance (≤ 16°). 0 when not makeable, when the stroke misses as played or when no power works; never negative |
+| `toleranceMm` | number | contact-point tolerance; frozen: the departure margin × 2R. 0 whenever `toleranceDeg` is |
+| `difficulty` | `'easy' \| 'medium' \| 'hard' \| 'very hard'` | from `toleranceDeg`; no margin ⇒ 'very hard' |
 | `warnings` | Warning[] | |
 | `tip` | string | up to three coaching sentences |
 | `strokeName` | string \| null | the stroke as coaches name it ("Draw", "Stun", "Stop shot", "Follow, right english"). null whenever the CB never reaches the OB, makeable or not. A frozen shot names it from the stroke angle |
@@ -198,7 +198,9 @@ miscue limit is **2 tips**, and the words run from ¼ to 2 tips in quarter steps
 - There is no ghost ball. `ghost` = `ghostUncorrected` = the CB position, `cutAngleDeg` = 0,
   `fractionLabel` = "full", `cutSide` = 0, `throwAim` is null and `throwShiftDir` is absent.
 - `aimDir` is the chosen stroke direction (the line of centres turned by the stroke-angle search).
-  The `frozen` warning gives that angle; `strokeName` is named from it.
+  The `frozen` warning gives that angle; `strokeName` is named from it. The margin is the stroke
+  angle's (shown in degrees). When no angle throws the OB in at this speed, the `frozen` message says
+  the angle shown is "the closest it gets to the pocket at this speed".
 - `contactPoint` lies on the line of centres. `throwDeg` is the OB departure minus the line of
   centres.
 - Draw the cue line from the CB along `aimDir` (the app draws 3R + 0.1 m of it, 10 cm past the
@@ -241,7 +243,7 @@ ball itself. A drawing of the OB → mouth segment should fall back to `objectPa
 | `ob-missed` | OB not pocketed in the simulation, for a reason other than speed or throw |
 | `throw-uncompensable` | OB misses because no aim with the ghost clear of the rail cancels the throw, or (frozen) because no stroke angle throws the OB into the window at this speed |
 | `thin-cut` | cut > 80° |
-| `frozen` | CB touching the OB. The message gives the stroke angle off the line of centres |
+| `frozen` | CB touching the OB. The message gives the stroke angle off the line of centres; when no angle throws it in, it says that angle is the closest it gets to the pocket at this speed |
 | `miscue-risk` | spin offset > 0.45 R |
 
 ## Recommendation (planner worker output)
@@ -255,13 +257,15 @@ ball itself. A drawing of the OB → mouth segment should fall back to `objectPa
 | `restError` | number?, m | distance from the chosen stroke's rest to the landing spot |
 | `rest` | Vec2 \| null, *optional* | the chosen stroke's CB rest |
 | `evaluated` | number | simulations run (grid plans plus speed variants). Deterministic for a given layout, request and `maxEvaluations` |
-| `fragile` | boolean, *optional* | no candidate survived the ±6/±12 % speed check (or the budget ran out first): treat the stroke as speed-sensitive and say so |
+| `fragile` | boolean, *optional* | no candidate survived the ±6/±12 % speed check (or the budget ran out first). Shown, in the toast and the card, as the one sentence "This stroke may need precise pace: a little harder or softer could miss or scratch." |
 | `nextQuality` | number 0..1, *optional* | next-shot quality of the chosen stroke on the post-shot table (default objective only) |
 | `timedOut` | boolean, *optional* | the optional wall-clock safety cap cut the search short (the result then depends on device speed) |
 
 ## ShotSuggestion
 
-`{ targetId, pocketId, toleranceDeg, difficulty, score }`, sorted by descending `score`.
+`{ targetId, pocketId, toleranceDeg, toleranceMm, difficulty, score, frozen? }`, sorted by descending
+`score`. Tolerance and difficulty are the verified default-stroke plan's; `score` still ranks by the
+geometric tolerance; `frozen: true` when the CB touches the OB.
 - `score` = log₁₀(tolerance°) + 0.5 × next-shot quality of the default stroke's leave (ASSUMPTION
   weight, `POSITION_WEIGHT`).
 - It loses 2 for a simulated kiss, miss, uncompensable throw or blocked path, and 0.5 for a

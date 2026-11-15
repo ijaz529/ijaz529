@@ -59,22 +59,26 @@ frames.
 **Recommendation semantics**:
 - `score` is the robust score (research.md R-11). `Number.isFinite(score)` is false only when no
   stroke pots the ball.
-- `fragile: true` means no stroke was verified against ±6/±12 % speed errors: show a
-  "speed-sensitive" note.
+- `fragile: true` means no stroke was verified against ±6/±12 % speed errors: show
+  "This stroke may need precise pace: a little harder or softer could miss or scratch."
 - `risks`: absent means "not known", never "safe" (it may be absent for a stroke that is not
   fragile when the budget ran out before the tip/aim probes).
 - `timedOut: true` means the search is partial.
 
 **Evaluation budget (per device)**: the worker keeps `recommendStroke` deterministic by giving it an
 evaluation count, not a deadline (`src/workers/eval-budget.ts`).
-- Once per number of balls, it times one `planShot` with the search's own options
-  (`record: false, advice: false`), best of 3 after a warm-up. It then passes `maxEvaluations` =
-  ⌊1200 ms ÷ that cost⌋, clamped to 60…324 (`FULL_EVALUATIONS`). A budget below the grid, the half
+- Once per device and ball count it calibrates with the search's own options (`record: false,
+  advice: false`): untimed `planShot` calls warm the JIT (≤ 24, stopping after 120 ms), then the
+  fastest of 3 timed calls is the figure. The first search on that ball count with ≥ 30 evaluations
+  refines it once from its own wall time ÷ `evaluated` (within ×4 either way); the figure is then
+  final. It then passes `maxEvaluations` = ⌊1200 ms ÷ figure⌋, clamped to 60…324
+  (`FULL_EVALUATIONS`). A budget below the grid, the half
   steps and the robustness walk's 108 evaluations skips the half steps (whole-number powers).
 - It also sets `timeCapMs: 1500` as a safety net (the < 1.5 s budget of Constitution IV). A search
   cut short by the cap is reported as `timedOut`.
-- v2: the measured figures travel as `perEvalMs`, so a restarted worker keeps the same budget (see
-  the v2 contract).
+- v2: the figures return as `perEvalMs` (by ball count) with every recommendation and go back with
+  the next request; adopted figures are final, so a restarted worker keeps the same budget (see the
+  v2 contract).
 
 **Heatmap semantics**: `values` is all zeros when `nextBallId` is the cue ball, the current target
 (in `excludeIds`) or unknown. Cells where the cue ball would overlap an object ball are 0.

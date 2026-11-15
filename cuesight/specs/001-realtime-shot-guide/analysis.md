@@ -158,7 +158,7 @@ fixed findings still need the app work listed under "Open for wave 2".
     fall back to `objectPath` (data-model.md).
   - **Minimum power.** `minPower` is "drops with pace" again. The optional `minPowerCapture` lets
     the UI mark the "only just drops" band.
-  - **Recommendation flags.** Show `fragile` as "speed-sensitive". Treat `timedOut` as a partial
+  - **Recommendation flags.** Show `fragile` as "This stroke may need precise pace: a little harder or softer could miss or scratch." Treat `timedOut` as a partial
     search. `Number.isFinite(score)` is false only when no stroke pots.
   - **New labels and codes.**
     - The new warning `throw-uncompensable`.

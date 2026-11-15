@@ -387,7 +387,9 @@ appear in TestFlight.
 - **FR-106**: The system MUST draw the shot plan in 3D with the 001 colour and line-style encoding:
   aim line, ghost ball, contact point, object-ball path, cue-ball path and other balls' paths, the
   pocket highlight, the rest and landing markers and the position heatmap. Labels MUST be readable
-  text.
+  text. The in-scene label keeps clear of every ball's disc (a ball weighs as much as ten line
+  points; the label may slide up to 24 px) and of the floating Play / slow-motion buttons; in a
+  cramped view (medium sheet, side spin) it can still cover a ball's edge.
 - **FR-107**: When a plan exists, the system MUST draw a cue stick behind the cue ball along the aim
   line, near level and raised only as needed to clear the rail. Its axis MUST pass through the
   recommended strike point (side and vertical offset), and the gap between its tip and the ball MUST
@@ -424,7 +426,10 @@ appear in TestFlight.
   quality. The Snap 3D table takes its cloth colour from the table photo; a grey (neutral) cloth is
   rendered grey.
 - **FR-113**: The player MUST be able to fix the detected layout (move, add or remove a ball, mark the
-  cue ball), tap the four corners by hand when detection fails, and retake the photo.
+  cue ball), tap the four corners by hand when detection fails, and retake the photo. Add puts the
+  ball on the free spot nearest the middle of the table (on the cloth, clear of every other ball),
+  and the toast says "Ball added in the middle of the table." / "…near the middle…". In Snap it is
+  unnamed (the neutral 'ball'), never a tag vision gave another ball.
 - **FR-114**: The player MUST be able to pick the target ball and optionally a pocket, on the photo or
   on the table map. The system MUST plan the shot with the 001 planner and show the full shot card.
 - **FR-115**: The system MUST then guide the player to take the player photo ("crouch behind the cue
@@ -495,7 +500,7 @@ appear in TestFlight.
   - A ball vision could not name is "Unnamed ball" in the card title, the ball picker and the
     announcer.
   - **Recommended-stroke notes** (one note line, only while the recommended stroke is shown):
-    "Speed-sensitive — small changes in pace may change the result." (`fragile`), "Search cut short —
+    "This stroke may need precise pace: a little harder or softer could miss or scratch." (`fragile`, the same sentence as the toast), "Search cut short —
     the best stroke found in time." (`timedOut`), "Scratch risk from small errors not checked."
     (`risks` absent).
 - **FR-127**: The shot card MUST show:
@@ -508,7 +513,9 @@ appear in TestFlight.
     is shown while a frozen cue ball's power advice is still being worked out (`adviceSkipped`).
     `ui/power-meter.ts` (`meterOptions`, `meterMinPower`) is the one reader for the card and the Snap
     HUD;
-  - a shaded 3D cue ball with the tip dot and the miscue ring.
+  - a shaded 3D cue ball with the tip dot and the miscue ring;
+  - the stroke name in the spin tile in full: a name with side takes two lines, the ball shrinking so
+    the hero keeps its height.
 
   Each MUST have a text equivalent. Every 001 test id, accessible name and tested text MUST be kept.
 - **FR-128**: On first launch, the system MUST show a short, dismissible hint that explains the three

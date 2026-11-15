@@ -68,8 +68,7 @@ These answers record what the reviewed implementation does, and they flag the op
   over the nominal speed and ±6 % / ±12 % speed errors. Any scratch or miss at those speeds rules a
   stroke out. The survivors are also mis-hit with the tip, the aim and the shaft a little off, and
   half of the worst of those counts. When no stroke survives, the best one is still offered, marked
-  speed-sensitive (the `fragile` flag; the card says "Speed-sensitive — small changes in pace may
-  change the result.") (research.md R-11).
+  with "This stroke may need precise pace: a little harder or softer could miss or scratch." (the `fragile` flag; the toast and the card use this one sentence) (research.md R-11).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -236,7 +235,8 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   (FR-007).
 - The cue ball touching the object ball → the plan warns that the balls are frozen. It aims the
   stroke along the line of centres plus throw, not at a ghost ball (on snooker: not makeable, a push
-  stroke).
+  stroke). When no stroke angle throws it in at this speed, the card says the angle shown is the
+  closest it gets.
 - Object ball already in the pocket jaws → handled like any short shot; the margin reflects the jaws.
 - Very thin cuts (> 80°) → allowed but flagged "very thin". Cuts ≥ 88° are not makeable.
 - The phone moves while frozen → the locked layout stays; the overlay is hidden until re-acquired.
@@ -314,9 +314,12 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   and words, within the safe miscue limit.
 - **FR-014**: The system MUST predict the cue ball's path for the chosen power and spin, including
   sliding-to-rolling transition, spin effects after contact, cushion rebounds, collisions with other
-  balls and pocketing, and MUST show its rest position.
+  balls and pocketing, and MUST show its rest position. The "Cue stops" label is drawn only for a
+  makeable plan.
 - **FR-015**: The system MUST compute a margin of error (allowed aim error in degrees) and a difficulty
-  label (easy / medium / hard / very hard) for every planned shot.
+  label (easy / medium / hard / very hard) for every planned shot. A frozen cue ball is rated by its
+  stroke-angle tolerance (shown in degrees); a plan that misses as played or that no power works for
+  has no margin and is never easy or medium.
 - **FR-016**: The system MUST detect and flag:
   - a blocked cue-ball path or object-ball path (naming the blocking ball),
   - a cue-ball scratch,

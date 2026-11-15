@@ -87,7 +87,7 @@ The common rules are unchanged:
   - `score` is the robust score (001 research.md R-11); `Number.isFinite(score)` is false only when
     no stroke pots the ball.
   - `fragile: true`: no stroke was verified against ±6/±12 % speed errors. The app says
-    "speed-sensitive".
+    "This stroke may need precise pace: a little harder or softer could miss or scratch."
   - `risks`: absent means "not known", never "safe". It may be absent for a stroke that is not
     fragile when the budget ran out before the tip/aim probes.
   - `timedOut: true`: the safety cap cut the search short.
@@ -104,16 +104,20 @@ The common rules are unchanged:
 
 The worker keeps `recommendStroke` deterministic by giving it an evaluation count, not a deadline
 (`src/workers/eval-budget.ts`).
-- Once per number of balls, it times one `planShot` with the options the search evaluates with
-  (`record: false, advice: false`), best of 3 after a warm-up. It then passes
-  `maxEvaluations` = ⌊1200 ms ÷ that cost⌋, clamped to 60…324 (`FULL_EVALUATIONS`).
+- Once per device and ball count it calibrates with the options the search evaluates with
+  (`record: false, advice: false`): untimed `planShot` calls warm the JIT (≤ 24, stopping after
+  120 ms), then the fastest of 3 timed calls is the figure. The first search on that ball count with
+  ≥ 30 evaluations refines it once from its own wall time ÷ `evaluated` (within ×4 either way); the
+  figure is then final. It then passes `maxEvaluations` = ⌊1200 ms ÷ figure⌋, clamped to 60…324
+  (`FULL_EVALUATIONS`).
 - A budget below the grid + the half steps + the robustness walk's 108 evaluations skips the half
   steps, so the recommended power is a whole number.
 - It also sets `timeCapMs: 1500` as a safety net (the < 1.5 s budget of Constitution IV). A search
   cut short by the cap is reported as `timedOut`.
 - `perEvalMs` (optional, `PlannerPerEvalMs` = ms per evaluation keyed by ball count) comes back with
   every recommendation. The app keeps it, even from superseded replies, and sends it with each
-  `recommend`. A worker adopts any ball count it has not measured itself, so the budget, and with it
+  `recommend`. A worker adopts any ball count it has not measured itself, and adopted figures are
+  final, so the budget, and with it
   the recommended stroke, stays the same for the page's life across worker restarts.
 
 ## How the app uses the workers
