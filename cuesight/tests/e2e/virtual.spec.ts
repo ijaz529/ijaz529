@@ -160,3 +160,85 @@ test.describe('selection modes (Position, Zones)', () => {
     expect(await pick('b2')).toEqual({ heatmap: 'b2', interaction: 'select' });
   });
 });
+
+/**
+ * Final verify (wave 2b): the recommendation's toast talks about the stroke the card shows. A player who
+ * sets their own stroke while the search is still running saw "None of the strokes tried pots this ball
+ * without a scratch — showing the basic stroke." (or "This stroke may need precise pace…") next to a
+ * card showing "your stroke".
+ */
+test.describe('recommendation toasts follow the stroke on show', () => {
+  type RecHook = {
+    state: {
+      practice: { balls: unknown[] };
+      recommended: { pending: boolean; stroke: unknown; evaluated: number } | null;
+      plan: { strokeSource: string } | null;
+      strokeMode: string;
+    };
+    selectBall(id: string): void;
+    selectPocket(id: string): void;
+  };
+  /** A frozen cue ball no stroke pots with pace (the core's "no power" layout): the search finds nothing. */
+  const frozenSoft = (page: Page, ownStroke: boolean) =>
+    page.evaluate((own) => {
+      const h = (window as unknown as { __cuesight: RecHook }).__cuesight;
+      h.state.practice.balls = [
+        { id: 'cue', kind: 'cue', pos: { x: -0.2960660046526003, y: -0.4506717941723339 }, label: 'cue' },
+        { id: 'b1', kind: 'object', pos: { x: -0.25, y: -0.485 }, label: '1', color: '#e8b90f' },
+      ];
+      h.selectBall('b1');
+      h.selectPocket('BM');
+      // The player's own stroke, in the same turn: the recommendation asked for above is still on its way.
+      if (own) document.querySelector<HTMLButtonElement>('[data-p="follow"]')!.click();
+    }, ownStroke);
+  const toastsSeen = (page: Page) =>
+    page.evaluate(() => {
+      const w = window as unknown as { __toasts?: string[] };
+      if (!w.__toasts) {
+        w.__toasts = [];
+        const el = document.querySelector('#toast')!;
+        new MutationObserver(() => w.__toasts!.push(el.textContent ?? '')).observe(el, { childList: true, characterData: true, subtree: true });
+      }
+      return w.__toasts;
+    });
+  const replied = (page: Page) =>
+    page.waitForFunction(
+      () => {
+        const r = (window as unknown as { __cuesight: RecHook }).__cuesight.state.recommended;
+        return !!r && !r.pending;
+      },
+      undefined,
+      { timeout: 45_000 },
+    );
+  const ABOUT_THE_RECOMMENDATION = /showing the basic stroke|This stroke may need precise pace|showing the best stroke found/;
+
+  test('with the player’s own stroke on show, a late recommendation says nothing about a stroke not shown', async ({ page }) => {
+    test.setTimeout(90_000);
+    await page.goto('/?mode=practice&renderer=2d');
+    await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+    await toastsSeen(page);
+    await frozenSoft(page, true);
+    await replied(page);
+    const s = await page.evaluate(() => {
+      const st = (window as unknown as { __cuesight: RecHook }).__cuesight.state;
+      return { mode: st.strokeMode, source: st.plan?.strokeSource, found: st.recommended!.stroke !== null, evaluated: st.recommended!.evaluated };
+    });
+    // Not vacuous: the search ran and found nothing (the reply that toasts "showing the basic stroke").
+    expect(s).toEqual({ mode: 'mine', source: 'player', found: false, evaluated: expect.any(Number) });
+    expect(s.evaluated).toBeGreaterThan(0);
+    await page.waitForTimeout(400);
+    expect((await toastsSeen(page)).filter((t) => ABOUT_THE_RECOMMENDATION.test(t))).toEqual([]);
+    await expect(page.locator('#shot-card')).toContainText('your stroke');
+  });
+
+  test('with the recommendation on show, the same reply still says so', async ({ page }) => {
+    test.setTimeout(90_000);
+    await page.goto('/?mode=practice&renderer=2d');
+    await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+    await toastsSeen(page);
+    await frozenSoft(page, false);
+    await replied(page);
+    await expect.poll(async () => (await toastsSeen(page)).some((t) => /None of the strokes tried pots this ball without a scratch — showing the basic stroke\./.test(t)), { timeout: 10_000 }).toBe(true);
+    await expect(page.locator('#shot-card')).toContainText('basic stroke');
+  });
+});

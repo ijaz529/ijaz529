@@ -403,7 +403,8 @@ const planner = createPlannerClient({
       // fragile / timedOut / nextQuality / risks as the reply has them: risks absent = not known (never []).
       const { key: k } = s.recommended;
       s.recommended = { key: k, ...recommendedFromReply(m, out) };
-      msg = out.toast;
+      // The toast is about the stroke shown: not when the player has set their own meanwhile.
+      if (s.strokeMode === 'recommended') msg = out.toast;
     });
     if (msg) toast(msg, 3600);
     replan();

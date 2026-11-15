@@ -268,8 +268,9 @@ export function cameraHint(o: CameraHintInput): string | null {
     if (!o.status || o.status === 'searching') return 'Point the camera at the table so the whole cloth is in view.';
     if (!o.live) return 'Hold steady — the table isn’t locked yet.';
   }
+  // "Cue ball" on: the next tap marks the cue ball, also when vision found one (the toast says the same).
+  if (o.interaction === 'mark-cue') return 'Tap the cue ball.';
   if (o.balls > 0 && !o.hasCue) {
-    if (o.interaction === 'mark-cue') return 'Tap the cue ball.';
     // Two whites too close to call (ball-detect: no cue unless clearly whiter than the runner-up).
     return (o.unsureWhites ?? 0) >= 2 ? 'Two white balls — tap “Cue ball”, then tap the one you play with.' : 'No cue ball found — tap “Cue ball”, then tap the cue ball.';
   }

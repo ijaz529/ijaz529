@@ -301,6 +301,20 @@ describe('status pill and hints', () => {
     expect(cameraHint({ ...base, unsureWhites: 2, interaction: 'mark-cue' })).toBe('Tap the cue ball.');
     expect(cameraHint({ ...base, unsureWhites: 2, hasCue: true })).toBeNull();
   });
+  // Final verify (wave 2b): with "Cue ball" on, the next tap marks the cue ball. When vision found a cue
+  // ball (the usual reason to correct it: the wrong white was taken) the card said "Tap the ball you
+  // want to pocket, then a pocket…" next to the toast "Tap the cue ball." — and kept saying it after the
+  // toast faded, while a tap on the ball to pocket made it the cue ball. Also after a table-frame change
+  // cleared the selection with "Cue ball" still on.
+  it('cameraHint: with "Cue ball" on it says to tap the cue ball, also when vision found one (card and toast agree)', () => {
+    const base = { error: false, status: 'locked' as const, live: true, frozen: false, balls: 9, hasCue: true, interaction: 'mark-cue' as const };
+    expect(cameraHint(base)).toBe('Tap the cue ball.');
+    expect(cameraHint({ ...base, frozen: true, status: 'searching', live: false })).toBe('Tap the cue ball.');
+    expect(cameraHint({ ...base, unsureWhites: 1 })).toBe('Tap the cue ball.');
+    // The lock comes first (nothing can be tapped on an unlocked table), and "Cue ball" off is unchanged.
+    expect(cameraHint({ ...base, status: 'unstable', live: false })).toBe('Hold steady — the table isn’t locked yet.');
+    expect(cameraHint({ ...base, interaction: 'select' })).toBeNull();
+  });
   it('the pill says when the locked table has corner pockets out of view, without a number', () => {
     expect(pillText('locked', false, 1)).toBe('Table locked — a corner pocket is out of view');
     expect(pillText('locked', false, 2)).toBe('Table locked — corner pockets are out of view');
