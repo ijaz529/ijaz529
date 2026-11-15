@@ -249,4 +249,23 @@ describe('sensor noise', () => {
       expect(est, `σ ${sigma}`).toBeLessThan(1.2 * sigma + 0.8);
     }
   });
+
+  it('clothNoise does not read cloth texture or shading as sensor noise (they scale R, G and B alike)', () => {
+    // A cloth whose reflectance varies ±12 % and ±20 % from pixel to pixel (the felt's texture, the
+    // renderer's cloth noise) over a shading gradient, on a clean sensor: the green channel alone
+    // differs by 4–8 levels between neighbours, the chromaticity not at all.
+    for (const amp of [0.12, 0.2]) {
+      const f = createFrame(W, H);
+      let s = 99;
+      for (let i = 0; i < W * H; i++) {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+        const k = (1 + amp * ((s / 4294967296) * 2 - 1)) * (0.75 + (0.35 * (i % W)) / W);
+        for (let c = 0; c < 3; c++) f.data[i * 4 + c] = GREEN[c]! * k;
+        f.data[i * 4 + 3] = 255;
+      }
+      const sc = getScratch(W, H);
+      buildEvidence(f, GREEN_MODEL, sc);
+      expect(clothNoise(f, sc), `texture ±${amp}`).toBeLessThan(1);
+    }
+  });
 });

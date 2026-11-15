@@ -24,9 +24,10 @@
  *     between them: the level member in closed form, and the rolled member that the remaining circles
  *     vote for (a phone held at an angle). Each hypothesis is scored by the known balls that land, one
  *     per circle, on circles of the right size and colour, the balls predicted on bare cloth, and the
- *     circles left unexplained. The whitest circles are tried as the cue ball in turn until one gives a
- *     convincing fit; when none fits, a ball of unique colour anchors the hypotheses instead (a moved
- *     cue ball would otherwise pull every pose off).
+ *     circles left unexplained. Each cloth candidate is tried with its whitest circle as the cue ball
+ *     first (the next one when that fit is ok but not convincing); when none fits, the candidate that
+ *     explained the most is tried with the next white circle, then with a ball of unique colour as the
+ *     anchor (a moved cue ball would otherwise pull every pose off), within a counted work budget.
  *  4. Refinement: Levenberg–Marquardt over (rotation, camera centre, log f) on exact residuals — for a
  *     ball, the angle between a crack point's ray and the silhouette cone axis minus the cone half-angle
  *     (so there is no off-axis ellipse bias); for a cushion edge (outer and nose), the angle between the
@@ -34,12 +35,15 @@
  *     shrinking gate, Cauchy weights, a focal prior (heavy-tailed around the overview's focal length:
  *     the lens may differ) and a level-phone prior.
  *  5. Honesty (Principle II): confidence from the matched balls, the share of the cloth boundary the
- *     model explains, the residuals and the propagated covariance of the target's image position; `ok`
- *     only when all of them agree, and near-minimal fits only with sure identities. Failures carry the
- *     canonical player-facing reason of their true cause: too dark, too grainy, no cloth, too few balls
- *     (fewer than three ball circles), no cue ball, balls moved (a ball on bare cloth with a circle of
- *     its colour resting elsewhere on the bed, from a pose the static table supports — this also turns an
- *     otherwise good fit whose target or cue ball moved into a failure, FR-121), or no fit.
+ *     model explains, the residuals and the propagated covariance of the target's image position (with
+ *     the layout's own uncertainty unless crossing cushion lines pin the pose); `ok` only when all of
+ *     them agree, near-minimal fits only with sure identities (a colour no unmatched ball of the layout
+ *     shares), and a camera away from the cue ball only on a convincing fit. Failures carry the
+ *     canonical player-facing reason of their true cause: too dark, too grainy (noise that broke every
+ *     cloth candidate into specks), no cloth, too few balls (fewer than three ball circles), no cue ball,
+ *     balls moved (a ball on bare cloth with a circle of its colour resting elsewhere on the bed, from a
+ *     pose the static table pins down — this also turns an otherwise good fit into a failure, FR-121),
+ *     or no fit.
  *
  * Conventions: world = table frame (m, z up, ball centres at z = R). Camera X_c = R·X_w + t with rows
  * right, down, forward; pixel (u, v) covers [u, u+1) × [v, v+1), principal point at the image centre.
@@ -339,6 +343,24 @@ function seenFromOutside(sg: Seg, C: Vec3): boolean {
 const BEHIND_EDGE_BAND = 15;
 /** Within that band: the occlusion line's own width, and the gate for a ball silhouette crack (px). */
 const BAND_BALL_GATE = 2;
+
+/** Does circle c lie on the image of a cushion edge line (centre within its radius + 2 px, within the segment)? */
+function onEdgeLine(pr: Problem, fit: Fit, planes: (ReturnType<typeof segPlane> | null)[], c: { u: number; v: number; r: number }): boolean {
+  const mx = (c.u - pr.cx) / fit.f;
+  const my = (c.v - pr.cy) / fit.f;
+  const mn = hyp3(mx, my, 1);
+  for (const sp of planes) {
+    if (!sp) continue;
+    const e = fit.f * Math.asin(Math.max(-1, Math.min(1, (mx * sp.nx + my * sp.ny + sp.nz) / mn)));
+    if (Math.abs(e) >= c.r + 2) continue;
+    const du = sp.u1 - sp.u0;
+    const dv = sp.v1 - sp.v0;
+    const L2 = du * du + dv * dv;
+    const t = L2 > 1e-9 ? ((c.u - sp.u0) * du + (c.v - sp.v0) * dv) / L2 : -1;
+    if (t >= 0 && t <= 1) return true;
+  }
+  return false;
+}
 
 /** Is crack i within `band` px of one of the edge planes `planes` (and within its image extent)? */
 function nearSeg(pr: Problem, fit: Fit, planes: (ReturnType<typeof segPlane> | null)[], i: number, band: number): boolean {
@@ -939,9 +961,13 @@ function refine(pr: Problem, fit0: Fit, gates: number[]): Refined {
   const asg: Assignment = { elem: new Int32Array(pr.nPts), res: new Float32Array(pr.nPts) };
   let fit = fit0;
   let lm: LmOut = { fit, cost: Infinity, A: null, s2: 1 };
-  for (const gate of gates) {
-    assign(pr, fit, gate, asg);
-    const sel = selectPoints(pr, asg, 90, 160);
+  for (let g = 0; g < gates.length; g++) {
+    assign(pr, fit, gates[g]!, asg);
+    // Coarse to fine: the wide gates only bring the seed into the basin of the right association, so they
+    // run on a third of the points; the last two (the fit and its covariance) on all of them. (Fewer
+    // iterations there too left a two-tap fit of a near cue ball short of its basin.)
+    const coarse = g < gates.length - 2;
+    const sel = coarse ? selectPoints(pr, asg, 30, 55) : selectPoints(pr, asg, 90, 160);
     // Nothing (or almost nothing) within the gate: the seed is wrong; the priors alone would only drift.
     if (sel.length < MIN_REFINE_POINTS) break;
     lm = levenberg(pr, fit, sel, asg.elem, 8);
@@ -1087,7 +1113,19 @@ function scorePose(pr: Problem, fit: Fit, known: KnownBall[], cands: Candidate[]
       if (candOwner[j] === k) score += 1.5 - 0.12 * ballCost[k]!;
     } else if (proj.vis[k] === 1 && !pr.camo[k] && clothAt(pr, proj.u[k]!, proj.v[k]!, proj.r[k]!)) score -= 0.6;
   }
-  for (const c of cands) if (c.r >= 3 && !explained(pr, fit, c, proj)) score -= 0.4;
+  for (let j = 0; j < cands.length; j++) {
+    const c = cands[j]!;
+    if (c.r < 3) continue;
+    // A circle its owning ball's projection already explains needs no search over every ball.
+    const k = candOwner[j]!;
+    if (k >= 0) {
+      const t = proj.r[k]! + 0.5 * c.r + 2;
+      const du = c.u - proj.u[k]!;
+      const dv = c.v - proj.v[k]!;
+      if (du * du + dv * dv < t * t) continue;
+    }
+    if (!explained(pr, fit, c, proj)) score -= 0.4;
+  }
   return score;
 }
 
@@ -1101,6 +1139,9 @@ function explained(pr: Problem, fit: Fit, c: Candidate, proj: Projected): boolea
   }
   return onPocket(pr, fit, c.u, c.v, c.r);
 }
+
+/** Largest depth ratio between a pair hypothesis's root and its circle's apparent-size depth (poseFromPair). */
+const PAIR_DEPTH_RATIO = 2;
 
 /** Closed-form level-camera pose from the cue ball (camera frame P_c) and one more ball seen along a_j. */
 function poseFromPair(cueW: Vec3, Pc: [number, number, number], aj: [number, number, number], Dj: number, ballW: Vec3, out: Fit[], f: number): void {
@@ -1119,8 +1160,13 @@ function poseFromPair(cueW: Vec3, Pc: [number, number, number], aj: [number, num
   const roots = sq > 1e-9 ? [ap + sq, ap - sq] : [ap];
   for (const D of roots) {
     if (!(D > 0.05)) continue;
-    // Prefer roots consistent with the apparent size, but keep both unless clearly wrong.
-    if (Number.isFinite(Dj) && (D > 3 * Dj || D < Dj / 3)) continue;
+    // A root must agree with the circle's apparent size within PAIR_DEPTH_RATIO: the layout distance to
+    // the cue ball puts the ball at depth D along the ray, its circle at depth Dj (a circle fitted to a
+    // ≥ 120° arc has its radius within ≈ 25 %, so a factor of 2 is generous). A wider window let every
+    // red circle pair with every red ball at almost any depth: twice the hypotheses on a snooker photo,
+    // and the ones it added never seeded a fit (same results over 100 envelope photos and 36 with an
+    // occluded cue ball; failing photos 25 % faster at the 95th percentile).
+    if (Number.isFinite(Dj) && (D > PAIR_DEPTH_RATIO * Dj || D < Dj / PAIR_DEPTH_RATIO)) continue;
     const vx = D * aj[0] - Pc[0];
     const vy = D * aj[1] - Pc[1];
     const vz = D * aj[2] - Pc[2];
@@ -1182,8 +1228,11 @@ function toPose(fit: Fit, w: number, h: number): CameraPose {
 }
 
 interface Evaluation {
-  /** Matched balls, with the colour cost of the photo's pixels against the ball's known colour. */
-  matched: { k: number; u: number; v: number; r: number; cov: number; colour: number }[];
+  /**
+   * Matched balls, with the colour cost of the photo's pixels against the ball's known colour, and what
+   * that colour was read from: the ball's own pixels (`desc`), or else the circle fitted to its arc (`cand`).
+   */
+  matched: { k: number; u: number; v: number; r: number; cov: number; colour: number; desc: ColourDesc | null; cand: number }[];
   visible: number;
   /** Visible balls predicted where the photo shows plain cloth. */
   missing: number;
@@ -1254,9 +1303,11 @@ function evaluate(pr: Problem, r: Refined, cands: Candidate[]): Evaluation {
     const cov = bitsCount * 10;
     const expected = 1.27 * proj.r[k]! * ((cov * Math.PI) / 180);
     let colour = Infinity;
+    let desc: ColourDesc | null = null;
+    let cand = -1;
     if (proj.vis[k] === 1 || proj.vis[k] === 3) {
-      const c = colourAt(pr, proj, k);
-      if (c) colour = colourCost(pr.cls[k]!, c);
+      desc = colourAt(pr, proj, k);
+      if (desc) colour = colourCost(pr.cls[k]!, desc);
       else {
         // Too few non-cloth pixels inside the ball to read its colour here (on an untinted grey cloth a
         // white ball's side-lit face has the cloth's own grey): the circle fitted to this ball's own
@@ -1265,22 +1316,30 @@ function evaluate(pr: Problem, r: Refined, cands: Candidate[]): Evaluation {
           const cj = cands[j]!;
           const ratio = cj.r / proj.r[k]!;
           if (ratio < 0.7 || ratio > 1.4 || hyp2(cj.u - proj.u[k]!, cj.v - proj.v[k]!) > 0.35 * proj.r[k]! + 2) continue;
-          colour = Math.min(colour, pr.cc[k * pr.nCands + j]!);
+          if (pr.cc[k * pr.nCands + j]! < colour) {
+            colour = pr.cc[k * pr.nCands + j]!;
+            cand = j;
+          }
         }
       }
     }
-    if ((proj.vis[k] === 1 || proj.vis[k] === 3) && colour < 3 && cov >= 120 && cnt[k]! >= Math.max(6, 0.35 * expected)) matched.push({ k, u: proj.u[k]!, v: proj.v[k]!, r: proj.r[k]!, cov, colour });
+    if ((proj.vis[k] === 1 || proj.vis[k] === 3) && colour < 3 && cov >= 120 && cnt[k]! >= Math.max(6, 0.35 * expected)) matched.push({ k, u: proj.u[k]!, v: proj.v[k]!, r: proj.r[k]!, cov, colour, desc, cand });
     else if (proj.vis[k] === 1 && !pr.camo[k] && clothAt(pr, proj.u[k]!, proj.v[k]!, proj.r[k]!)) {
       missing++;
       missingIdx.push(k);
     }
   }
-  // Candidates that no visible ball explains (a moved or unknown ball).
+  // Candidates that no visible ball explains (a moved or unknown ball). An arc proposed on the rail band
+  // along a cushion line of this pose is the rail's own edge (its lip, its shading), not a ball: from a
+  // few cm up, the far rail of an untinted grey cloth gave dozens of such 4 px arcs, which sank the
+  // confidence of a pose 0.5 cm from the truth with ten balls matched.
+  const allPlanes = pr.segs.map((sg) => segPlane(pr, r.fit, sg));
   let unexplained = 0;
   const unexplainedIdx: number[] = [];
   for (let j = 0; j < cands.length; j++) {
     const c = cands[j]!;
     if (c.r < 3 || explained(pr, r.fit, c, proj)) continue;
+    if (c.large && onEdgeLine(pr, r.fit, allPlanes, c)) continue;
     unexplained++;
     unexplainedIdx.push(j);
   }
@@ -1607,59 +1666,139 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
   if (!photo.models.length) return fail(dark ? PLAYER_VIEW_REASONS.dark : PLAYER_VIEW_REASONS.noCloth, t0);
   let best: Attempt | null = null;
   let circles = 0;
-  // Sensor noise, read off the largest main cloth region any candidate gave.
-  const seen: Seen = { mainArea: 0, noise: NaN };
-  let noise = NaN;
-  let noiseArea = 0;
-  for (let k = 0; k < photo.models.length; k++) {
+  // What each cloth candidate's evidence showed (its main region and the noise specks in it).
+  const seen: Seen = { mainArea: 0, grain: 0 };
+  // The least noise damage of any candidate surface that kept a cloth region (see NOISY_SPECKS).
+  let anyCloth = false;
+  let minGrain = Infinity;
+  const budget: Budget = { refines: REFINE_BUDGET };
+  const better = (a: Attempt, b: Attempt | null) => !b || (a.res.ok && !b.res.ok) || (a.res.ok === b.res.ok && a.quality > b.quality);
+  // Pass 1: each cloth candidate with its whitest circle as the cue ball, then the next white circle
+  // (one seed), until one fits. A failure with balls matched on this cloth does not prove the cloth
+  // right: under sensor noise the next candidate (a neighbouring hue or value mode) often holds the cue
+  // ball or a cleaner crack set and fits, and the grey of the room can outrank a grey cloth seen as a
+  // thin band from 10 cm up. The candidate whose failed fit matched the most balls is kept for pass 2.
+  let kept: Prepared | null = null;
+  let keptAt: Attempt | null = null;
+  for (let k = 0; k < photo.models.length && !best?.res.ok; k++) {
     // A further candidate is tried only when it is a plausible cloth next to the first (≥ ¼ of its
-    // structure score) or the first is no convincing cloth (fewer than two ball holes).
+    // structure score) or the first is no convincing cloth (fewer than two ball holes), and while the
+    // photo's work budget lasts.
     if (k > 0 && photo.scores[k]! < 0.25 * photo.scores[0]! && photo.scores[0]! >= 2) break;
-    const at = fitWithCloth(input, photo.models[k]!, sc, t0, k === 0, seen);
-    circles = Math.max(circles, at.circles);
-    if (seen.mainArea > noiseArea) {
-      noiseArea = seen.mainArea;
-      noise = seen.noise;
+    if (k > 0 && budget.refines <= 0) break;
+    // The kept candidate's mask is about to be overwritten by this one's evidence: keep a copy.
+    if (kept && kept.ctx.pr.mask === sc.mask) {
+      sc.maskKept.set(sc.mask);
+      kept.ctx.pr.mask = sc.maskKept;
     }
-    if (!best || (at.res.ok && !best.res.ok) || (at.res.ok === best.res.ok && at.quality > best.quality)) best = at;
-    // Done when it fits. A failure with balls matched on this cloth does not prove the cloth right: under
-    // sensor noise the next candidate (a neighbouring hue or value mode) often holds the cue ball or a
-    // cleaner crack set and fits (noise σ 4: 63 → 68 of 76 envelope scenes when it is tried).
-    if (at.res.ok) break;
+    const prep = prepareCloth(input, photo.models[k]!, sc, t0, seen, budget);
+    let at: Attempt;
+    if ('res' in prep) at = prep;
+    else {
+      at = solveFrom(prep.ctx, prep.groups[0]!);
+      // A stripe ball whose coloured band is lost in the cloth (green on green, maroon on blue-grey) shows
+      // only its white band and can rank as the whitest circle: its wrong pose can pass as ok (3 balls,
+      // half the cloth boundary explained) while the true cue ball explains the photo cleanly, or fail —
+      // even as "moved" — where the true cue ball fits within 0.1 cm. So the next cue-ball candidate is
+      // tried unless the fit is ok and convincing; its best seed decides (an ok fit needs one).
+      if (!(at.res.ok && at.clean) && prep.groups.length > 1 && budget.refines > 0) {
+        const at2 = solveFrom(prep.ctx, prep.groups[1]!, prep.ctx.cueIdx, 1);
+        if (at2.res.ok ? better(at2, at) : !at.res.ok && at.res.reason !== PLAYER_VIEW_REASONS.moved && (at2.res.reason === PLAYER_VIEW_REASONS.moved || better(at2, at))) at = at2;
+      }
+      const nm = at.res.matched.length;
+      if (!at.res.ok && at.quality > -Infinity && (!keptAt || nm > keptAt.res.matched.length || (nm === keptAt.res.matched.length && at.quality > keptAt.quality))) {
+        kept = prep;
+        keptAt = at;
+      }
+    }
+    circles = Math.max(circles, at.circles);
+    if (seen.mainArea >= MIN_CLOTH_AREA * w * h) {
+      anyCloth = true;
+      minGrain = Math.min(minGrain, seen.grain);
+    }
+    if (better(at, best)) best = at;
+  }
+  // Pass 2, on the candidate kept: is it a moved cue ball? The cue-ball circle then pulls every
+  // hypothesis off (the layout's cue ball is put on the photo's, 12 cm away), so the pose is sought from
+  // another ball instead, one whose colour identifies it uniquely (up to ALT_ANCHORS of the largest).
+  // Such a pose is used when it also finds the cue ball, or when it shows the balls moved. It runs after
+  // a "moved" from pass 1 too, where only a fit can overturn that verdict: a cue-anchored pose that
+  // missed the true one (two blue stripes showing only white on a blue cloth) can show the moved-ball
+  // signature, and a ball of unique colour then anchors the pose that explains the photo.
+  if (!best!.res.ok && kept && !manualTaps) {
+    const movedAlready = best!.res.reason === PLAYER_VIEW_REASONS.moved;
+    const at = anchorOnOthers(kept);
+    if (at && (at.res.ok || (!movedAlready && at.res.reason === PLAYER_VIEW_REASONS.moved))) best = at;
   }
   const res = best!.res;
-  // Honest reasons (Principle II): a failure on a dark photo, or on a dim cloth, is about the light;
-  // a lit photo whose surfaces enclose nothing at all (no ball, no pocket) and hold no ball circle
-  // shows no table.
-  // A cloth whose region encloses holes (balls, pockets) is a table even when a candidate's own region
-  // came out too small to fit: then too few balls, or no fit, not "no cloth". A grainy photo (sensor
-  // noise ≥ NOISY_SIGMA on the cloth) that fails is about the light (spec 002: "low light or a noisy
-  // photo … suggests more light or a steadier phone"), whatever else the fit hit, unless the balls moved.
-  if (!res.ok && (dark || photo.models[0]!.val < DIM_CLOTH_V)) res.reason = PLAYER_VIEW_REASONS.dark;
+  // Honest reasons (Principle II): a failure on a dark photo is about the light. A grainy photo — one
+  // whose noise broke every candidate cloth surface into specks, at the level where fits fail, or left
+  // no cloth region at all — is about the grain (spec 002: "low light or a noisy photo … suggests more
+  // light or a steadier phone"), whatever else the damaged detection then hit, unless the balls moved.
+  // When some candidate surface is still intact the noise is not the cause and the reason is the fit's
+  // own: the cue ball out of frame stays "can't find the cue ball" at σ 5–7 (the green cloth keeps ≈ 1–5
+  // specks per 1000 px; only the dark room behind it breaks up), and cloth texture is never grain. Then
+  // a dim cloth is about the light; a lit photo whose surfaces enclose nothing at all (no ball, no
+  // pocket) and hold no ball circle shows no table; and a cloth whose region encloses holes is a table
+  // even when a candidate's own region came out too small to fit: then too few balls, or no fit.
+  const grainy = anyCloth ? minGrain >= NOISY_SPECKS : clothNoise(frame, sc, true) >= NOISY_SIGMA;
+  if (!res.ok && dark) res.reason = PLAYER_VIEW_REASONS.dark;
+  else if (!res.ok && grainy && res.reason !== PLAYER_VIEW_REASONS.moved) res.reason = PLAYER_VIEW_REASONS.noisy;
+  else if (!res.ok && photo.models[0]!.val < DIM_CLOTH_V) res.reason = PLAYER_VIEW_REASONS.dark;
   else if (!res.ok && circles < 2 && photo.enclosed.every((n) => n === 0)) res.reason = PLAYER_VIEW_REASONS.noCloth;
-  else if (!res.ok) {
-    if (res.reason === PLAYER_VIEW_REASONS.noCloth) res.reason = circles < MIN_BALL_CIRCLES ? PLAYER_VIEW_REASONS.tooFewBalls : PLAYER_VIEW_REASONS.noFit;
-    if (noise >= NOISY_SIGMA && res.reason !== PLAYER_VIEW_REASONS.moved) res.reason = PLAYER_VIEW_REASONS.noisy;
-  }
+  else if (!res.ok && res.reason === PLAYER_VIEW_REASONS.noCloth) res.reason = circles < MIN_BALL_CIRCLES ? PLAYER_VIEW_REASONS.tooFewBalls : PLAYER_VIEW_REASONS.noFit;
   res.ms = performance.now() - t0;
   return res;
 }
 
-/** What fitWithCloth saw of its cloth: main region area (px) and sensor noise σ on it (clothNoise). */
+/** What prepareCloth saw of its cloth: main region area (px) and noise specks per 1000 px of it. */
 interface Seen {
   mainArea: number;
-  noise: number;
+  grain: number;
 }
 
 /**
- * Sensor noise (σ, 0–255) above which a failed fit is reported as a grainy photo. ASSUMPTION (envelope
- * sweeps): fits hold at σ 3 (95 %) and mostly at σ 6–8 once speckle is removed; a smooth render reads
- * σ ≈ 0–1, so 4.5 is clearly noise, not cloth texture.
+ * Mask damage at which sensor noise defeats the fit: noise specks (non-cloth specks under SPECK_AREA
+ * inside the cloth, joined back to it) per 1000 px of the main cloth region. It measures the noise
+ * against the cloth's own colour band, so it holds for every cloth: in a sweep of 4 cloths × 7 noise
+ * levels (σ 0–20), fits succeeded on 40/40 green and 48/48 light-blue photos below 60 and on none above
+ * (0/11, 0/8); a blue-grey cloth, whose band is narrow, reaches 100 already at σ 3, where its fits fail
+ * (1/8). Cloth texture and shading leave none (≤ 2.5).
+ */
+const NOISY_SPECKS = 60;
+/**
+ * When no candidate kept a cloth region at all, chroma noise (σ, 0–255, clothNoise over the frame) at
+ * or above this is the cause: a smooth render reads σ ≈ 0.3, cloth texture 0.3, and σ ≥ 10 dissolves
+ * even a tinted grey cloth's region.
  */
 const NOISY_SIGMA = 4.5;
 
-/** Steps 2–6 with one cloth model. */
-function fitWithCloth(input: PlayerViewInput, cloth: ClothModel, sc: Scratch, t0: number, allowAlt = false, seen?: Seen): Attempt {
+/**
+ * The work one photo may take, counted (so the result stays deterministic), not timed: refined pose
+ * seeds over all cloth candidates, cue-ball candidates and anchors. A photo that fits needs 1 (95 % of
+ * the fits in a random envelope sweep of 154 runs, at most 8); a photo that fails refined up to 24,
+ * which took it to 450–630 ms CPU (the budget is 250 ms at 960 × 720). The attempts are tried most
+ * likely first, so the budget cuts the least likely ones: pass 1 tries each cloth candidate with its
+ * whitest circle as the cue ball (SEEDS_FIRST seeds for the photo's first solve, SEEDS_LATER after) —
+ * every ok fit of that sweep but two came from such an attempt — then with the next white circle (one
+ * seed); pass 2 tries the anchors that tell a moved cue ball (one seed each), on the one candidate
+ * whose failed fit matched the most balls.
+ */
+interface Budget {
+  refines: number;
+}
+const REFINE_BUDGET = 10;
+const SEEDS_FIRST = 4;
+const SEEDS_LATER = 2;
+
+/** A cloth candidate ready to fit: its evidence (in the solve context) and the cue-ball observation groups to try in turn. */
+interface Prepared {
+  ctx: SolveCtx;
+  groups: Obs[][];
+}
+
+/** Steps 2–3 with one cloth model: evidence, circles and cue-ball candidates (or the failure that ends it early). */
+function prepareCloth(input: PlayerViewInput, cloth: ClothModel, sc: Scratch, t0: number, seen: Seen, budget: Budget): Prepared | Attempt {
   const { frame, table, balls, targetId, manualTaps } = input;
   const w = frame.width;
   const h = frame.height;
@@ -1675,10 +1814,8 @@ function fitWithCloth(input: PlayerViewInput, cloth: ClothModel, sc: Scratch, t0
 
   // 2. Evidence: the main cloth region, its boundary cracks and the ball circles on it.
   const ev = buildEvidence(frame, cloth, sc);
-  if (seen) {
-    seen.mainArea = ev.mainArea;
-    seen.noise = clothNoise(frame, sc);
-  }
+  seen.mainArea = ev.mainArea;
+  seen.grain = ev.mainArea > 0 ? (1000 * ev.specks) / ev.mainArea : 0;
   if (ev.mainArea < MIN_CLOTH_AREA * w * h) return noFit(PLAYER_VIEW_REASONS.noCloth);
   const info = { exposure: 1 };
   const cands = findCandidates(frame, sc, ev.comps, ev.nCracks, { info });
@@ -1770,45 +1907,43 @@ function fitWithCloth(input: PlayerViewInput, cloth: ClothModel, sc: Scratch, t0
     for (const { c } of whites.slice(0, 2)) cueObs.push(c);
   }
 
-  // 4–6. Each cue-ball candidate in turn (whitest first); the next is tried unless the fit from this one
-  //      is ok and convincing: a stripe ball whose coloured band is lost in the cloth (green on green)
-  //      shows only its white band and can rank as the whitest circle, and its wrong pose can pass as ok
-  //      (3 balls, half the cloth boundary explained) while the true cue ball explains the photo cleanly.
-  const ctx: SolveCtx = { input, pr, cands, known, cueIdx, cueW, targetIdx, gates, fMuls, f0, w, h, cx, cy, Rb, diag, pairList, noFit, t0 };
-  let out: Attempt | null = null;
-  for (const group of manualTaps ? [cueObs] : cueObs.map((c) => [c])) {
-    const at = solveFrom(ctx, group);
-    if (!out || (at.res.ok && !out.res.ok) || (at.res.ok === out.res.ok && at.quality > out.quality)) out = at;
-    if (at.res.ok && at.clean) break;
-  }
-  // A failed fit from the cue ball: is it a moved cue ball? The cue-ball circle then pulls every
-  // hypothesis off (the layout's cue ball is put on the photo's, 12 cm away), so the pose is sought from
-  // another ball instead — one whose colour identifies it uniquely (up to ALT_ANCHORS of the largest).
-  // Such a pose is used when it also finds the cue ball, or when it shows the balls moved.
-  if (!out!.res.ok && !manualTaps && allowAlt) {
-    const anchors: { j: number; k: number }[] = [];
-    for (let j = 0; j < cands.length; j++) {
-      if (cands[j]!.r < 4) continue;
-      let kk = -1;
-      let n = 0;
-      for (let k = 0; k < known.length; k++)
-        if (k !== cueIdx && !pr.camo[k] && pr.cc[k * cands.length + j]! <= MINIMAL_COLOUR_COST) {
-          kk = k;
-          n++;
-        }
-      if (n === 1 && pr.cc[cueIdx * cands.length + j]! >= 3) anchors.push({ j, k: kk });
-    }
-    anchors.sort((a, b) => cands[b.j]!.r - cands[a.j]!.r);
-    for (const { j, k } of anchors.slice(0, ALT_ANCHORS)) {
-      const at = solveFrom(ctx, [cands[j]!], k);
-      if (at.res.ok || at.res.reason === PLAYER_VIEW_REASONS.moved) return at;
-    }
-  }
-  return out!;
+  // 4–6 run per cue-ball candidate (whitest first) in solveFrom.
+  const ctx: SolveCtx = { input, pr, cands, known, cueIdx, cueW, targetIdx, gates, fMuls, f0, w, h, cx, cy, Rb, diag, pairList, noFit, t0, budget };
+  return { ctx, groups: manualTaps ? [cueObs] : cueObs.map((c) => [c]) };
 }
 
-/** Other-ball anchors tried when the cue-ball fit fails (fitWithCloth). */
+/**
+ * Pass 2 on a cloth candidate whose cue-ball fits failed: the anchors on balls of unique colour (a moved
+ * cue ball), one seed each, within the budget. The first that fits or shows the balls moved, else null.
+ */
+function anchorOnOthers(prep: Prepared): Attempt | null {
+  const { ctx } = prep;
+  const { pr, cands, known, cueIdx, budget } = ctx;
+  const anchors: { j: number; k: number }[] = [];
+  for (let j = 0; j < cands.length; j++) {
+    if (cands[j]!.r < 4) continue;
+    let kk = -1;
+    let n = 0;
+    for (let k = 0; k < known.length; k++)
+      if (k !== cueIdx && !pr.camo[k] && pr.cc[k * cands.length + j]! <= MINIMAL_COLOUR_COST) {
+        kk = k;
+        n++;
+      }
+    if (n === 1 && pr.cc[cueIdx * cands.length + j]! >= 3) anchors.push({ j, k: kk });
+  }
+  anchors.sort((a, b) => cands[b.j]!.r - cands[a.j]!.r);
+  for (const { j, k } of anchors.slice(0, ALT_ANCHORS)) {
+    if (budget.refines <= 0) break;
+    const at = solveFrom(ctx, [cands[j]!], k, 1);
+    if (at.res.ok || at.res.reason === PLAYER_VIEW_REASONS.moved) return at;
+  }
+  return null;
+}
+
+/** Other-ball anchors tried when the cue-ball fit fails (anchorOnOthers). */
 const ALT_ANCHORS = 2;
+/** Hypotheses kept for seeding a solve (solveFrom): far more than the ≤ 4 diverse seeds it takes. */
+const TOP_HYPS = 64;
 
 type Obs = { u: number; v: number; r: number };
 
@@ -1832,10 +1967,12 @@ interface SolveCtx {
   pairList: { obs: Obs; k: number }[];
   noFit: (reason: string) => Attempt;
   t0: number;
+  /** The photo's work budget (shared by every attempt). */
+  budget: Budget;
 }
 
 /** Steps 4–6 from one set of cue-ball observations: hypotheses, refinement, confidence and reason. */
-function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
+function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx, maxSeeds = SEEDS_FIRST): Attempt {
   const { input, pr, cands, known, cueIdx, cueW, targetIdx, gates, fMuls, f0, w, h, cx, cy, Rb, diag, pairList, noFit, t0 } = ctx;
   const { manualTaps } = input;
   // The anchor ball whose circle fixes the first ball in camera coordinates: the cue ball, or (to tell a
@@ -1847,7 +1984,17 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
   const nb = known.length;
   const proj: Projected = { u: new Float64Array(nb), v: new Float64Array(nb), r: new Float64Array(nb), d: new Float64Array(nb), vis: new Uint8Array(nb) };
   const ss = scoreScratch(nb, cands.length);
+  // The best TOP_HYPS hypotheses, by score (descending; ties keep the order found, as a stable sort of all
+  // of them would): seeds only ever come from the top, and keeping thousands alive until a sort cost a
+  // photo with many reds more in garbage collection than in scoring.
   const hyps: Hyp[] = [];
+  const offer = (fit: Fit, score: number) => {
+    if (hyps.length === TOP_HYPS && !(score > hyps[TOP_HYPS - 1]!.score)) return;
+    let at = hyps.length;
+    while (at > 0 && hyps[at - 1]!.score < score) at--;
+    hyps.splice(at, 0, { fit, score });
+    if (hyps.length > TOP_HYPS) hyps.pop();
+  };
   const tmp: Fit[] = [];
   // The 16 largest circles, each paired with every colour-compatible known ball.
   const bigCands = [...cands].sort((a, b) => b.r - a.r).slice(0, 16);
@@ -1878,23 +2025,26 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
         for (const fit of tmp) {
           let score = scorePose(pr, fit, known, cands, proj, ss);
           if (manualTaps) score -= 0.5 * ((fit.C.z - 0.2) / 0.15) ** 2;
-          hyps.push({ fit, score });
+          offer(fit, score);
         }
       }
     }
   }
   // No pose at all from the cue-ball candidates: in automatic mode the white circles were not the cue ball.
   if (!hyps.length) return noFit(cands.length < MIN_BALL_CIRCLES ? PLAYER_VIEW_REASONS.tooFewBalls : manualTaps ? PLAYER_VIEW_REASONS.noFit : PLAYER_VIEW_REASONS.noCue);
-  hyps.sort((a, b) => b.score - a.score);
   const seeds: Hyp[] = [];
+  // The photo's first solve may refine SEEDS_FIRST seeds, later ones SEEDS_LATER (or `maxSeeds`, fewer),
+  // within the budget (each solve refines at least its best seed).
+  const nSeeds = Math.max(1, Math.min(manualTaps ? 3 : ctx.budget.refines >= REFINE_BUDGET ? SEEDS_FIRST : SEEDS_LATER, maxSeeds, ctx.budget.refines));
   for (const hy of hyps) {
-    if (seeds.length >= (manualTaps ? 3 : 4)) break;
+    if (seeds.length >= nSeeds) break;
     if (seeds.every((sd) => poseDistance(sd.fit, hy.fit) > 1.5)) seeds.push(hy);
   }
 
   // 5. Refine the best seeds; keep the one that explains the photo best.
   let best: { r: Refined; ev: Evaluation } | null = null;
   for (const sd of seeds) {
+    ctx.budget.refines--;
     const r = refine(pr, sd.fit, gates);
     const e = evaluate(pr, r, cands);
     if (!best || e.quality > best.ev.quality + 1e-9) best = { r, ev: e };
@@ -1947,8 +2097,13 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
   // image position is propagated from LAYOUT_SIGMA per coordinate of each matched ball, by refitting
   // with that ball moved by a small step (the response is linear there; a full 5 mm step would push the
   // near cue ball's silhouette 20 px off, past the Cauchy scale, and measure its rejection instead).
-  // Many balls or the cushions make the pose insensitive to one ball; three close balls do not.
-  if (Number.isFinite(sigmaPx) && fe.matched.length <= 4 && fe.edgeInliers < 20) {
+  // Many balls or crossing cushion lines (a side and an end cushion) make the pose insensitive to one
+  // ball; three close balls do not, nor does a single cushion line: from 7 cm up with a 96° lens, three
+  // balls and the far cushion fitted a camera 35 cm off at twice the focal length within 1 px (ghost 7 %),
+  // and only this propagation shows how little pins it (σ 9 px of the target, against 0.3 px from the
+  // residuals alone). With the two taps the player names the balls and the fallback must draw (FR-118,
+  // confidence capped): there a cushion line is enough, as before.
+  if (Number.isFinite(sigmaPx) && fe.matched.length <= 4 && (manualTaps ? fe.edgeInliers < 20 : !fe.edgeCrossed)) {
     const sel = selectPoints(pr, fitR.assign, 90, 160);
     const focusAt = (f: Fit) => {
       const [X, Y, Z] = cameraToWorldC(f.R, f.C, pr.balls[focus]!);
@@ -1989,31 +2144,70 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
   const tappedBoth = manualTaps !== undefined && cueMatched && targetMatched;
   // A near-minimal fit (three balls, no cushion edge) has almost no redundancy: a wrong identity (an
   // orange ball read as the yellow one) can fit as exactly as the right one. It counts only when every
-  // identity is clearly confirmed by colour and no ball is predicted on bare cloth (Principle II).
+  // identity is sure and no ball is predicted on bare cloth (Principle II). An identity is sure when the
+  // ball's colour in the photo confirms it (within MINIMAL_COLOUR_COST) and no other layout ball that
+  // the fit leaves unmatched could show that colour: a snooker red (up to 15), or a pool colour's solid
+  // and stripe, is never a sure identity on its own — the same circles fit a permutation of the reds,
+  // and a camera 95 cm off fitted two orange balls swapped with a third out of view (ghost 6 %).
   // Two balls and the cushions are enough only when the cushion lines cross (side and end) and the
   // identities are sure, with nothing unexplained: a grazing view of parallel cushion lines let a wrong
-  // pose (camera 0.5 m off) explain 70 % of the cloth boundary in the envelope sweep.
+  // pose (camera 0.5 m off) explain 70 % of the cloth boundary in the envelope sweep, and "the cue ball
+  // and a red" with crossing lines fitted one of six reds out of view (ghost 49 %).
   const minimal = nMatched === 3 && fe.edgeInliers < 20;
-  const identitiesSure = fe.missing === 0 && fe.matched.every((m) => m.colour <= MINIMAL_COLOUR_COST);
+  const matchedSet = new Set(fe.matched.map((m) => m.k));
+  const uniqueIdentity = (m: Evaluation['matched'][number]): boolean => {
+    if (!pr.cls[m.k]) return false;
+    for (let j = 0; j < nb; j++) {
+      if (j === m.k || matchedSet.has(j) || pr.camo[j]) continue;
+      const cost = m.desc ? colourCost(pr.cls[j]!, m.desc) : m.cand >= 0 ? pr.cc[j * pr.nCands + m.cand]! : 0;
+      if (cost <= MINIMAL_COLOUR_COST) return false;
+    }
+    return true;
+  };
+  const identitiesSure = fe.missing === 0 && fe.matched.every((m) => m.colour <= MINIMAL_COLOUR_COST && uniqueIdentity(m));
   const twoAndCushions = fe.edgeCrossed && fe.explainedFrac >= 0.55 && identitiesSure && fe.unexplained === 0;
   const enoughBalls = (nMatched >= 3 && (!minimal || identitiesSure || tappedBoth)) || (nMatched >= 2 && (twoAndCushions || tappedBoth));
+  // Where the camera stood: far from the shooting position behind the cue ball is a warning when ok.
+  const camDx = cueW.x - fit.C.x;
+  const camDy = cueW.y - fit.C.y;
+  const camDh = hyp2(camDx, camDy);
+  let offLine = false;
+  if (targetIdx >= 0) {
+    const tx = known[targetIdx]!.pos.x - cueW.x;
+    const ty = known[targetIdx]!.pos.y - cueW.y;
+    offLine = (camDx * tx + camDy * ty) / Math.max(1e-9, camDh * hyp2(tx, ty)) < Math.cos((40 * Math.PI) / 180);
+  }
+  const notBehind = camDh > 2.0 || offLine;
   // A pose anchored on another ball is used only when it finds the cue ball too (its own cue-ball circle
   // may have been missed); otherwise it serves to tell a moved layout from a failed fit.
   let ok = confidence >= 0.5 && fe.residualPx <= residualLimit && enoughBalls && (alt ? cueMatched : cueMatched || targetMatched);
+  // The photo is taken from behind the cue ball (spec 002): a pose that says otherwise is the less likely
+  // reading of the photo, so it is used only on a convincing fit (nothing on bare cloth, sub-pixel
+  // residual, most of the cloth boundary explained, no stray circle). On a grey cloth whose floor-grey
+  // candidate swallowed the shaded cloth, a mostly white stripe taken for the cue ball and two orange
+  // balls swapped with a third out of view put the camera 95 cm off, 1.6 m from the cue ball, with 54 %
+  // of the boundary explained (ghost 6 %); the cue ball is uncertain there (a stripe showing only its
+  // white band, any neutral blob on a grey cloth), and so is every identity a repeated colour allows.
+  if (ok && notBehind && !manualTaps && !convincing(fe)) ok = false;
   // FR-121: an otherwise good fit whose target or cue ball is not where the layout puts it — predicted in
   // full view on plain cloth — would draw the guide from a stale layout: the balls moved. Unless a circle
   // of its colour nearby is that ball after all, the pose being slightly off (stillFits). Plain cloth is
   // evidence of absence only where the cloth mask tells balls from the cloth: not on an untinted grey
   // cloth, whose own grey a ball's shaded side shares (there it takes a circle of the ball's colour
   // resting elsewhere: 4 of 117 static grey photos said "moved" otherwise).
+  // Any other ball with the moved-ball signature contradicts the layout too (FR-121): after a shot, a
+  // pose that put the layout's moved cue ball and moved object balls on their new circles passed as ok
+  // (guide 2.3–3.7 % off) while a ball it predicted on bare cloth had a circle of its colour resting
+  // elsewhere. The pose cannot be trusted, and the layout is stale either way.
   const keyMoved =
     ok &&
-    [targetIdx, cueIdx].some((k) => {
+    ([targetIdx, cueIdx].some((k) => {
       if (k < 0 || !fe.missingIdx.includes(k)) return false;
       const near = displacedCircles(pr, fit, cands, fe, k);
       if (!near.length) return !pr.untinted;
       return near.some((j) => !stillFits(pr, fitR, k, cands[j]!));
-    });
+    }) ||
+      fe.missingIdx.some((k) => k !== targetIdx && k !== cueIdx && displaced(pr, fitR, cands, fe, k)));
   if (keyMoved) ok = false;
   // A fit that is not good enough to use never reports a usable confidence.
   if (!ok) confidence = Math.min(confidence, 0.49);
@@ -2033,11 +2227,19 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
     // parallel and a camera metres away can line them up as well.
     const camDist = hyp2(fit.C.x - cueW.x, fit.C.y - cueW.y);
     const plausible = camDist <= PLAUSIBLE_CAMERA_DIST && fit.C.z >= 0.02 && fit.C.z <= PLAUSIBLE_CAMERA_HEIGHT;
-    // And the pose must be pinned by balls that did not move: at least three. Two balls and the cushions
-    // pass only with nothing unexplained (twoAndCushions); from a few cm up, a pose 40 cm off lined two
-    // balls and crossing cushion lines up with stray circles left over (charcoal cloth, grey grid).
-    const pinned = nMatched >= 3;
-    const solid = plausible && pinned && (fe.explainedFrac >= SOLID_EXPLAINED || fe.edgeInliers >= SOLID_EDGES * pr.nPts) && fe.residualPx <= residualLimit;
+    // And the pose must be pinned by balls that did not move: at least three of sure identity (or five in
+    // all, a configuration no permutation of repeated colours fits as well), with most of the cloth
+    // boundary explained or on the cushions; or three balls of any identity with crossing cushion lines
+    // and most of the boundary explained (the cushions pin the pose then, as when the whole layout moved
+    // around a cue ball that stayed and three reds happen to sit on the layout's red spots). Two balls
+    // and the cushions pass only with nothing unexplained (twoAndCushions); from a few cm up, a pose 40
+    // cm off lined two balls and crossing cushion lines up with stray circles left over (charcoal cloth,
+    // grey grid); and under blur and 4:2:0, a pose at half the focal length that explained 46 % of the
+    // boundary put two of three maroon balls on the wrong circles and called the third "moved".
+    const sure = fe.matched.filter((m) => m.colour <= MINIMAL_COLOUR_COST && uniqueIdentity(m)).length;
+    const explainedMost = fe.explainedFrac >= SOLID_EXPLAINED;
+    const pinned = ((sure >= 3 || nMatched >= 5) && (explainedMost || fe.edgeInliers >= SOLID_EDGES * pr.nPts)) || (nMatched >= 3 && fe.edgeCrossed && explainedMost);
+    const solid = plausible && pinned && fe.residualPx <= residualLimit;
     // A ball the static table pins down shows the moved-ball signature (missing, and a circle of its colour
     // resting elsewhere on the bed): e.g. a moved cue ball, seen from a pose anchored on another ball.
     const someDisplaced = solid && (known.some((_, k) => displaced(pr, fitR, cands, fe, k)) || severalDisplaced(pr, fit, cands, fe));
@@ -2046,20 +2248,7 @@ function solveFrom(ctx: SolveCtx, cueObs: Obs[], anchor = ctx.cueIdx): Attempt {
     else if (keyMoved || someDisplaced) reason = PLAYER_VIEW_REASONS.moved;
     else if (!cueMatched && !manualTaps) reason = PLAYER_VIEW_REASONS.noCue;
     else reason = PLAYER_VIEW_REASONS.noFit;
-  } else {
-    // Warn (only) when the camera is far from the shooting position behind the cue ball.
-    const dx = cueW.x - fit.C.x;
-    const dy = cueW.y - fit.C.y;
-    const dh = hyp2(dx, dy);
-    let offLine = false;
-    if (targetIdx >= 0) {
-      const tx = known[targetIdx]!.pos.x - cueW.x;
-      const ty = known[targetIdx]!.pos.y - cueW.y;
-      const cosA = (dx * tx + dy * ty) / Math.max(1e-9, dh * hyp2(tx, ty));
-      offLine = cosA < Math.cos((40 * Math.PI) / 180);
-    }
-    if (dh > 2.0 || offLine) reason = PLAYER_VIEW_REASONS.notBehind;
-  }
+  } else if (notBehind) reason = PLAYER_VIEW_REASONS.notBehind;
   return {
     res: { ok, pose, confidence, residualPx: fe.residualPx, matched, ...(reason ? { reason } : {}), ms: performance.now() - t0 },
     quality: fe.quality,

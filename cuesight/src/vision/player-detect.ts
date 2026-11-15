@@ -29,6 +29,8 @@ export interface Scratch {
   h: number;
   /** 0 = not cloth, 1 = cloth (stray), 2 = main cloth region. */
   mask: Uint8Array;
+  /** A copy of `mask` kept for a cloth candidate the fit comes back to after building another one's. */
+  maskKept: Uint8Array;
   /** Cloth components (negative ids) during the first pass, then non-cloth components (1-based). */
   label: Int32Array;
   queue: Int32Array;
@@ -47,6 +49,7 @@ export function getScratch(w: number, h: number): Scratch {
       w,
       h,
       mask: new Uint8Array(n),
+      maskKept: new Uint8Array(n),
       label: new Int32Array(n),
       queue: new Int32Array(n),
       crackX: new Float32Array(MAX_CRACKS),
@@ -74,7 +77,13 @@ const GREY_V1 = 0.85;
  * margin. A ball's own colour can pass this share up close; structureScore ranks it last (no holes).
  */
 const MIN_CANDIDATE_SHARE = 0.015;
-const MAX_CANDIDATES = 4;
+/**
+ * Hue modes taken as cloth candidates (by sample count, ≥ 30° apart). Sensor noise gives the dark,
+ * slightly blue room above the far rail hue modes of its own (S just over SAT_S at V ≈ 0.14), which
+ * outnumber a cloth seen as a 2.6 % sliver: with 4 slots, σ 6 noise pushed the green cloth off the list
+ * of a photo aimed past the cue ball, and the reason became "too grainy" instead of "no cue ball".
+ */
+const MAX_CANDIDATES = 6;
 
 /** Histograms of learnPlayerCloth (module-level, reused: no allocation per call or per pixel). */
 const hueBins = new Float64Array(36);
@@ -498,8 +507,11 @@ export function solveN(A: Float64Array, b: Float64Array, n: number): Float64Arra
 /** Non-cloth specks inside the cloth below this area (px) are noise (findCandidates needs ≥ 12 px). */
 const SPECK_AREA = 10;
 
-/** Mask (0/1), main cloth region (2), non-cloth components and cloth-boundary cracks. */
-export function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { nCracks: number; comps: Comp[]; mainArea: number } {
+/**
+ * Mask (0/1), main cloth region (2), non-cloth components and cloth-boundary cracks; `specks` counts the
+ * non-cloth specks inside the cloth that were noise (joined to the cloth).
+ */
+export function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { nCracks: number; comps: Comp[]; mainArea: number; specks: number } {
   const { w, h, mask, label, queue } = sc;
   const n = w * h;
   const data = frame.data;
@@ -686,28 +698,55 @@ export function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { n
       if (nc >= MAX_CRACKS - 4) break;
     }
   }
-  return { nCracks: nc, comps, mainArea };
+  return { nCracks: nc, comps, mainArea, specks };
 }
 
-/** |ΔG| histogram of clothNoise (module-level scratch). */
+/** Histogram of clothNoise's chroma differences, in NOISE_BIN-level bins (module-level scratch). */
 const dHist = new Uint32Array(256);
+const NOISE_BIN = 0.25;
+/** Median of |e| for e a 2-D Gaussian of σ² = 2 per axis (the chroma difference of two pixels of unit noise). */
+const RAYLEIGH_MEDIAN = Math.SQRT2 * Math.sqrt(2 * Math.LN2);
 
 /**
- * Sensor noise of the photo (σ, 0–255 levels), read off the main cloth region after buildEvidence: the
- * median absolute difference of the green channel between horizontally adjacent cloth pixels, over
- * 0.954 (the median of |N(0, σ)·√2|). A lit cloth is smooth (its shading changes by < 1 level per
- * pixel), so this is the noise, not the scene. NaN when too little cloth is in view.
+ * Sensor noise of the photo (σ per channel, 0–255 levels), read off the main cloth region after
+ * buildEvidence, from what sensor noise changes and the scene does not: the chromaticity. For two cloth
+ * pixels two apart on a row, c₁ and c₂, the part of c₂ − c₁ orthogonal to their mean colour is zero for
+ * any change of brightness — the cloth's shading, a ball's shadow, and the cloth's own texture (a
+ * reflectance pattern scales R, G and B alike) — while independent noise of σ per channel gives it a
+ * 2-D Gaussian of 2σ² per axis, whose length has median σ·√2·√(2 ln 2). So the median length over that
+ * constant is σ. (The cloth mask, which is what noise breaks, is a hue / saturation test: brightness
+ * texture leaves it intact, chroma noise does not.) Pixels two apart are compared so that 4:2:0 chroma,
+ * shared by a 2 × 2 block, is read across blocks: what is left of the chroma noise there is what the
+ * mask sees. NaN when too little cloth is in view. With `wholeFrame`, every pair of the photo counts (for
+ * a photo whose noise left no cloth region: its flat surfaces dominate the median, edges are few).
  */
-export function clothNoise(frame: Frame, sc: Scratch): number {
+export function clothNoise(frame: Frame, sc: Scratch, wholeFrame = false): number {
   const { w, h, mask } = sc;
   const d = frame.data;
   dHist.fill(0);
   let n = 0;
   for (let y = 0; y < h; y += 2)
-    for (let x = 0; x + 1 < w; x++) {
+    for (let x = 0; x + 2 < w; x++) {
       const i = y * w + x;
-      if (mask[i] !== 2 || mask[i + 1] !== 2) continue;
-      dHist[Math.abs(d[i * 4 + 1]! - d[i * 4 + 5]!)]! += 1;
+      if (!wholeFrame && (mask[i] !== 2 || mask[i + 2] !== 2)) continue;
+      const r1 = d[i * 4]!;
+      const g1 = d[i * 4 + 1]!;
+      const b1 = d[i * 4 + 2]!;
+      const r2 = d[i * 4 + 8]!;
+      const g2 = d[i * 4 + 9]!;
+      const b2 = d[i * 4 + 10]!;
+      const sx = r1 + r2;
+      const sy = g1 + g2;
+      const sz = b1 + b2;
+      const s2 = sx * sx + sy * sy + sz * sz;
+      if (s2 < 4) continue;
+      const dx = r2 - r1;
+      const dy = g2 - g1;
+      const dz = b2 - b1;
+      const ds = dx * sx + dy * sy + dz * sz;
+      const e2 = dx * dx + dy * dy + dz * dz - (ds * ds) / s2;
+      const b = Math.floor(Math.sqrt(Math.max(0, e2)) / NOISE_BIN);
+      dHist[b < 255 ? b : 255]! += 1;
       n++;
     }
   if (n < 200) return NaN;
@@ -715,9 +754,9 @@ export function clothNoise(frame: Frame, sc: Scratch): number {
   for (let k = 0; k < 256; k++) {
     acc += dHist[k]!;
     if (acc >= 0.5 * n) {
-      // Interpolate within the bin (|Δ| is an integer: bin k holds [k, k + 1)).
+      // Interpolate within the bin.
       const below = acc - dHist[k]!;
-      return (k + (0.5 * n - below) / Math.max(1, dHist[k]!)) / 0.954;
+      return ((k + (0.5 * n - below) / Math.max(1, dHist[k]!)) * NOISE_BIN) / RAYLEIGH_MEDIAN;
     }
   }
   return NaN;
@@ -743,6 +782,8 @@ export interface Candidate {
   col: ColourDesc;
   /** Cue-ball likelihood (higher = whiter, less coloured). */
   white: number;
+  /** Proposed on the boundary of a large blob (the rail band, the floor, the room): an arc, maybe of a ball. */
+  large: boolean;
 }
 
 /**
@@ -1170,7 +1211,7 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
   const pts = new Int32Array(Math.max(16, nCracks));
   const inl = new Int32Array(Math.max(16, nCracks));
   const hsv = [0, 0, 0];
-  const raw: { c: Circle; cov: number; k: number }[] = [];
+  const raw: { c: Circle; cov: number; k: number; large: boolean }[] = [];
   if (crackCls.length < nCracks) crackCls = new Int8Array(nCracks);
   for (let k = 1; k < nComp; k++) {
     const cp = comps[k]!;
@@ -1306,7 +1347,8 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
             if (circles.every((o) => hyp2(o.c.x - cc.c.x, o.c.y - cc.c.y) > 0.3 * Math.max(o.c.r, cc.c.r) || Math.abs(o.c.r - cc.c.r) > 0.25 * Math.max(o.c.r, cc.c.r))) circles.push(cc);
         }
     }
-    for (const { c, cov } of circles) raw.push({ c, cov, k });
+    const large = isLargeBlob(cp, w, h);
+    for (const { c, cov } of circles) raw.push({ c, cov, k, large });
   }
   // Sectors (10°) of each circle where it borders the cloth (its inlier cracks, ± one sector). Where it
   // does not, something else is in front of it or beside it — a nearer ball whose circle was not found,
@@ -1405,7 +1447,7 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
   // 2. Colour descriptors with the exposure-scaled thresholds.
   const acc = new ColourAcc(vScale);
   for (let q = 0; q < raw.length; q++) {
-    const { c, cov, k } = raw[q]!;
+    const { c, cov, k, large } = raw[q]!;
     {
       // Mean colour and colour descriptor of this blob's pixels inside 0.8 r that no nearer circle covers.
       let cnt = 0;
@@ -1454,6 +1496,7 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
         rgb: [mr, mg, mb],
         col: acc.desc(),
         white: white / cnt - 2.5 * (colored / cnt) - 2 * meanSat - 0.25 * (sSum / cnt),
+        large,
       });
     }
   }
