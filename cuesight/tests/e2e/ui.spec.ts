@@ -1,4 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
+import { fractionOf } from '../../src/core/shot/geometry';
+import { planLabel } from '../../src/app/render/plan-draw';
 
 /**
  * SC-111 / T149 (feature 002 US3): automated accessibility checks of the Midnight Felt UI.
@@ -517,3 +519,146 @@ test.describe('accessibility (SC-111)', () => {
     }
   });
 });
+
+/**
+ * Package plan-ui (wave 2b): the plan's words fit where they are drawn at 375 and 393 px — the
+ * eighth-fraction labels ("⅜+ ball"), the frozen cue ball's tile ("Frozen · stroke left"), the long
+ * frozen power advice in the headline (two lines at the peek, all of it in the medium sheet), and
+ * every table label the 2D table and the camera overlay can draw.
+ */
+type V2 = { x: number; y: number };
+type PlanHook = {
+  state: { practice: { balls: { id: string; kind: string; pos: V2; label?: string; color?: string }[] }; table: { ballRadius: number; pockets: { id: string; mouthCenter: V2 }[] } };
+  selectBall(id: string): void;
+  selectPocket(id: string): void;
+};
+/** Puts the practice table into a layout and plans b1: a 35.5° cut ("thick ⅜") or a frozen cue ball. */
+async function practiceShot(page: Page, kind: 'thick' | 'frozen' | 'frozen-soft') {
+  await page.evaluate((kind) => {
+    const h = (window as unknown as { __cuesight: PlanHook }).__cuesight;
+    const R = h.state.table.ballRadius;
+    let cue: V2;
+    let ob: V2;
+    let pocket = 'TR';
+    if (kind === 'frozen-soft') {
+      // A frozen cue ball whose follow stroke no power pots with pace (the core's "no power" advice).
+      ob = { x: -0.25, y: -0.485 };
+      cue = { x: -0.2960660046526003, y: -0.4506717941723339 };
+      pocket = 'BM';
+    } else {
+      ob = { x: 0.55, y: 0.18 };
+      const m = h.state.table.pockets.find((p) => p.id === 'TR')!.mouthCenter;
+      const L = Math.hypot(m.x - ob.x, m.y - ob.y);
+      const u = { x: (m.x - ob.x) / L, y: (m.y - ob.y) / L };
+      if (kind === 'frozen') cue = { x: ob.x - u.x * (2 * R + 0.0003), y: ob.y - u.y * (2 * R + 0.0003) };
+      else {
+        const a = Math.atan2(u.y, u.x) + (35.5 * Math.PI) / 180;
+        cue = { x: ob.x - 2 * R * u.x - Math.cos(a) * 0.9, y: ob.y - 2 * R * u.y - Math.sin(a) * 0.9 };
+      }
+    }
+    h.state.practice.balls = [
+      { id: 'cue', kind: 'cue', pos: cue, label: 'cue' },
+      { id: 'b1', kind: 'object', pos: ob, label: '1', color: '#e8b90f' },
+    ];
+    h.selectBall('b1');
+    h.selectPocket(pocket);
+  }, kind);
+}
+/** The hero cut tile: its caption, value and line, and whether the line is cut off (ellipsis). */
+const cutTile = (page: Page) =>
+  page.evaluate(() => {
+    const t = document.querySelector('#shot-card .hero-stat.cut')!;
+    const line = t.querySelector<HTMLElement>('.s .t')!;
+    const v = t.querySelector('[data-testid="cut"]')!.getBoundingClientRect();
+    return { k: t.querySelector('.k')!.textContent, t: line.textContent, clipped: line.scrollWidth - line.clientWidth, vOnScreen: v.bottom <= innerHeight && v.top >= 0 };
+  });
+
+for (const viewport of [
+  { width: 393, height: 852 },
+  { width: 375, height: 667 },
+]) {
+  test.describe(`plan words fit at ${viewport.width}×${viewport.height} (eighths, frozen cue ball)`, () => {
+    test.use({ viewport });
+
+    test('every table label fits beside the ghost ball; the card tile reads "⅜+ ball" in full', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice&renderer=2d');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      // Every label the 2D table and the overlay can draw, in their two fonts (12 px, 600 and 700).
+      const cue = { x: 0, y: 0 };
+      const base = { makeable: true, warnings: [], aimDir: { x: 1, y: 0 }, contactPoint: { x: 1, y: 0 }, cutAngleDeg: 0, fractionLabel: 'full', fractionPhrase: 'full-ball' };
+      const labels = new Set<string>(['Not makeable', 'Cue stops', 'Cue stick', 'Frozen · straight through']);
+      for (let c = 0; c < 90; c += 0.25) {
+        const f = fractionOf((c * Math.PI) / 180);
+        labels.add(planLabel({ ...base, cutAngleDeg: c, fractionLabel: f.label, fractionPhrase: f.phrase }, cue));
+      }
+      for (let d = 1; d <= 60; d++)
+        for (const side of [1, -1]) {
+          const a = (d * Math.PI) / 180;
+          labels.add(planLabel({ ...base, warnings: [{ code: 'frozen', message: '' }], aimDir: { x: Math.cos(a), y: side * Math.sin(a) } }, cue));
+        }
+      expect([...labels].some((l) => l.includes('⅜+ ball'))).toBe(true);
+      expect([...labels].some((l) => /thick|thin ⅛/.test(l))).toBe(false);
+      const widest = await page.evaluate((list) => {
+        const c = document.createElement('canvas').getContext('2d')!;
+        let w = 0;
+        for (const font of [`700 12px -apple-system, 'SF Pro Text', system-ui, sans-serif`, `600 12px -apple-system, 'SF Pro Text', system-ui, sans-serif`]) {
+          c.font = font;
+          for (const t of list) w = Math.max(w, c.measureText(t).width);
+        }
+        return w;
+      }, [...labels]);
+      // With the overlay's pill padding (8 px a side), a label takes under half the screen width.
+      expect(widest + 16).toBeLessThan(viewport.width / 2);
+
+      await practiceShot(page, 'thick');
+      await expect(page.locator('#shot-card .hero-stat.cut .s .t')).toHaveText('⅜+ ball');
+      const t = await cutTile(page);
+      expect(t).toMatchObject({ k: 'Cut', t: '⅜+ ball', clipped: 0 });
+    });
+
+    test('frozen cue ball: the tile says "Frozen", the long power advice fits two lines at the peek and shows in full above it', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      await practiceShot(page, 'frozen');
+      await expect(page.locator('#shot-card .hero-stat.cut .k')).toHaveText('Frozen');
+      const t = await cutTile(page);
+      expect(t).toMatchObject({ k: 'Frozen', t: 'straight', clipped: 0 });
+      await expect(page.locator('#shot-card .hero-stat.cut')).not.toContainText(/full/);
+      await expect(page.locator('#shot-card .head-warn')).toContainText('Frozen:');
+
+      // The longest headline the planner now writes: the frozen "no power" advice (≈170 characters).
+      await practiceShot(page, 'frozen-soft');
+      await page.locator('#power').evaluate((r: HTMLInputElement) => {
+        r.value = '1';
+        r.dispatchEvent(new Event('input', { bubbles: true }));
+        r.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector<HTMLButtonElement>('[data-p="follow"]')!.click());
+      const head = page.locator('#shot-card .head-warn span');
+      await expect(head).toContainText('no power with this follow gets it in with pace', { timeout: 10_000 });
+      await expect(page.locator('#shot-card .power-meter')).toHaveAttribute('aria-label', /No power gets it in with pace/);
+      await expect(page.locator('#shot-card .power-meter')).not.toHaveAttribute('aria-label', /more than full power/);
+      await sheetSettled(page);
+      const at = () =>
+        page.evaluate(() => {
+          const span = document.querySelector<HTMLElement>('#shot-card .head-warn span')!;
+          const lh = parseFloat(getComputedStyle(span).lineHeight);
+          const v = document.querySelector('#shot-card [data-testid="cut"]')!.getBoundingClientRect();
+          return { sheet: document.querySelector<HTMLElement>('.panel')!.dataset.sheet, lines: Math.round(span.clientHeight / lh), clippedX: span.scrollWidth - span.clientWidth, clippedY: span.scrollHeight - span.clientHeight, cutOnScreen: v.bottom <= innerHeight };
+        });
+      const peek = await at();
+      expect(peek.sheet).toBe('peek');
+      expect(peek.clippedX).toBeLessThanOrEqual(0);
+      expect(peek.lines, 'two lines at the peek').toBeLessThanOrEqual(2);
+      expect(peek.cutOnScreen, 'peek: the hero stays in view').toBe(true);
+      await page.locator('.sheet-handle').click();
+      await expect.poll(() => page.evaluate(() => document.querySelector<HTMLElement>('.panel')!.dataset.sheet)).toBe('medium');
+      await sheetSettled(page);
+      const medium = await at();
+      expect(medium.clippedY, 'medium: the whole advice').toBeLessThanOrEqual(0);
+      expect(medium.clippedX).toBeLessThanOrEqual(0);
+    });
+  });
+}

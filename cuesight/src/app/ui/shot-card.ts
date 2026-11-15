@@ -6,11 +6,16 @@
 import { describeSpin, powerToSpeed, speedWord } from '../../core/shot/power';
 import { squirtOffsetText, throwSentence } from '../../core/shot/coach';
 import type { ShotPlan, WarningCode } from '../../core/types';
+import type { AppState } from '../store';
+import { fractionShort, fractionTile, frozenStroke, hasStroke, isFrozenPlan } from '../render/plan-draw';
+import { BALL_NAMED } from '../render/palette';
 import { fractionGlyphSvg, type CutSide } from './fraction-glyph';
 import { iconMarkup } from './icons';
 import { writeHtml } from './patch';
 import { powerMeterSvg, powerText } from './power-meter';
 import { spinBallSvg, spinText } from './spin-ball';
+
+export { fractionShort, fractionTile } from '../render/plan-draw';
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 
@@ -42,7 +47,33 @@ export interface CardContext {
   ballRadius?: number;
   /** Scratch risks of the recommended stroke under small errors (from the robustness probes). */
   risks?: { scratchIf: 'harder' | 'softer' | 'aim' | 'tip'; pocketName: string }[];
+  /**
+   * The recommendation behind a 'recommended' stroke (recommendationContext): no stroke was verified
+   * against small speed errors (Recommendation.fragile), the search was cut short (timedOut), or its
+   * scratch checks under small errors did not run (risks absent: "not known", never "safe").
+   */
+  fragile?: boolean;
+  searchCutShort?: boolean;
+  risksUnknown?: boolean;
 }
+
+/** The card's notes on a recommendation, from store.recommended (empty unless the plan plays it). */
+export function recommendationContext(rec: AppState['recommended'], plan: Pick<ShotPlan, 'strokeSource' | 'stroke'> | null): Pick<CardContext, 'fragile' | 'searchCutShort' | 'risksUnknown'> {
+  if (!rec || rec.pending || !rec.stroke || !plan || plan.strokeSource !== 'recommended') return {};
+  const same = rec.stroke.power === plan.stroke.power && rec.stroke.side === plan.stroke.side && rec.stroke.vert === plan.stroke.vert;
+  if (!same) return {};
+  return { fragile: rec.fragile === true, searchCutShort: rec.timedOut === true, risksUnknown: rec.risks === undefined };
+}
+
+/** Honesty notes on a recommended stroke (Principle II), in player words. */
+export const REC_NOTES = {
+  fragile: 'Speed-sensitive — small changes in pace may change the result.',
+  searchCutShort: 'Search cut short — the best stroke found in time.',
+  risksUnknown: 'Scratch risk from small errors not checked.',
+} as const;
+
+/** The tip for a pocket that cannot be made and has no other pocket to offer (never "Try another pocket"). */
+export const NO_OTHER_POCKET = 'No other pocket is clear for this ball: pick another ball or play a safety.';
 
 /** A row of ball buttons (the same flow as tapping a ball on the table). */
 function ballPicker(balls: NonNullable<CardContext['balls']>): string {
@@ -72,7 +103,7 @@ function pocketPicker(pockets: NonNullable<CardContext['pockets']>): string {
 }
 
 /** Warnings serious enough to show at the sheet's resting height, most serious first. */
-const HEADLINE_WARN: WarningCode[] = ['not-makeable', 'blocked-cue', 'blocked-object', 'cb-short', 'scratch', 'too-soft', 'kiss', 'ob-missed', 'miscue-risk', 'frozen', 'thin-cut'];
+const HEADLINE_WARN: WarningCode[] = ['not-makeable', 'blocked-cue', 'blocked-object', 'cb-short', 'scratch', 'too-soft', 'kiss', 'throw-uncompensable', 'ob-missed', 'miscue-risk', 'frozen', 'thin-cut'];
 
 /** The warning to headline (shown in the peek), or null. */
 export function headlineWarning(plan: ShotPlan): ShotPlan['warnings'][number] | null {
@@ -83,36 +114,29 @@ export function headlineWarning(plan: ShotPlan): ShotPlan['warnings'][number] | 
   return null;
 }
 
-/** Short hero line for the fractional aim: "½-ball hit", or "thicker than ⅜-ball" when qualified. */
-export function fractionShort(plan: Pick<ShotPlan, 'fractionLabel' | 'fractionPhrase'>): string {
-  const phrase = plan.fractionPhrase ?? `${plan.fractionLabel}-ball`;
-  // A non-breaking hyphen keeps "⅜-ball" together in the narrow hero column.
-  if (phrase.startsWith('a touch ')) return phrase.slice('a touch '.length).replace('-ball', '\u2011ball');
-  return phrase === 'a thin hit' ? 'thin hit' : `${phrase} hit`;
-}
-
-/**
- * The fractional aim in a hero tile (one short line): "½-ball hit" on the label, "⅜+ ball" when a
- * touch thicker, "⅝− ball" when a touch thinner, "thin hit". The full phrase is in the title/details.
- */
-export function fractionTile(plan: Pick<ShotPlan, 'fractionLabel' | 'fractionPhrase'>): string {
-  const phrase = plan.fractionPhrase ?? `${plan.fractionLabel}-ball`;
-  const m = /^a touch (thicker|thinner) than (.+)-ball$/.exec(phrase);
-  if (m) return `${m[2]}${m[1] === 'thicker' ? '+' : '\u2212'} ball`;
-  return phrase === 'a thin hit' ? 'thin hit' : `${phrase} hit`;
-}
-
 /** Margin of error as the player feels it: millimetres of contact on the object ball. */
 export function marginText(plan: Pick<ShotPlan, 'toleranceMm'>): string {
   const mm = plan.toleranceMm;
   return `±${mm >= 10 ? mm.toFixed(0) : mm.toFixed(1)} mm`;
 }
 
+/** Two letters where colour names share an initial (blue, black, brown), as the ball tags write them. */
+const CHIP_TWO: Record<string, string> = { blue: 'Bl', black: 'Bk', brown: 'Br' };
+
+/** The chip's letter: the number, a colour's initial (Bl/Bk/Br), nothing for a ball vision could not name ('ball'). */
+export function chipLetter(label: string): string {
+  if (/^\d+$/.test(label)) return label;
+  const word = label.trim().toLowerCase().split(/\s+/)[0] ?? '';
+  if (!word || word === 'ball') return '';
+  return CHIP_TWO[word] ?? word.charAt(0).toUpperCase();
+}
+
 /** A tiny pool-ball chip: the ball colour, a white number disc, a band for stripes. */
 export function ballChip(label: string, color?: string, stripe?: boolean): string {
   const isCue = label === 'cue' || label === 'white' || label === 'white?';
-  const short = /^\d+$/.test(label) ? label : isCue ? '' : label.charAt(0).toUpperCase();
-  const bg = isCue ? '#F4F1E8' : (color ?? '#E9E6DC');
+  const short = isCue ? '' : chipLetter(label);
+  const word = label.trim().toLowerCase().split(/\s+/)[0] ?? '';
+  const bg = isCue ? '#F4F1E8' : (color ?? BALL_NAMED[word] ?? '#E9E6DC');
   const style = stripe ? `--ball:${esc(bg)};background:#F4F1E8` : `--ball:${esc(bg)};background:${esc(bg)}`;
   return `<span class="ball-chip${stripe ? ' stripe' : ''}${isCue ? ' cue' : ''}" style="${style}" aria-hidden="true">${short ? `<i>${esc(short)}</i>` : ''}</span>`;
 }
@@ -170,12 +194,16 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     const rb = HEADLINE_WARN.indexOf(b.code);
     return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb);
   });
-  const shown = ordered.filter((w, i) => (w.code !== 'thin-cut' || !plan.warnings.some((x) => x.code === 'not-makeable')) && ordered.findIndex((x) => x.message === w.message) === i);
+  // The reason already says it: no thin-cut note, and no generic "frozen … plus a little throw" hint
+  // next to a not-makeable reason (frozen-line geometry, or snooker's touching-ball rule).
+  const notMakeable = plan.warnings.some((x) => x.code === 'not-makeable');
+  const shown = ordered.filter((w, i) => !(notMakeable && (w.code === 'thin-cut' || w.code === 'frozen')) && ordered.findIndex((x) => x.message === w.message) === i);
   const chips = (list: typeof shown) => list.map((w) => `<li class="warn-chip warn-${w.code}">${iconMarkup('alert', 18)}<span>${esc(w.message)}</span></li>`).join('');
   const RISK_HOW = { harder: 'A little harder', softer: 'A little softer', tip: 'With the tip a little off', aim: 'With a small aim error' } as const;
   const riskChips = (ctx.risks ?? []).map((r) => `<li class="warn-chip warn-risk">${iconMarkup('alert', 18)}<span>Scratch risk: ${esc(RISK_HOW[r.scratchIf].toLowerCase())} and the cue ball goes in the ${esc(r.pocketName)}.</span></li>`).join('');
   // A shot that cannot happen as planned gets no stroke instructions (no power, no spin, no aim fixes).
-  const noStroke = !plan.makeable || plan.warnings.some((w) => w.code === 'cb-short');
+  const noStroke = !hasStroke(plan);
+  const frozen = isFrozenPlan(plan);
   // Makeable: the headline warning is already shown above the hero (.head-warn); the list below has
   // the others, so no warning appears twice.
   const warn = plan.makeable ? chips(shown.filter((w) => !head || w.message !== head.message)) + riskChips : '';
@@ -188,6 +216,8 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
       : plan.strokeSource === 'recommended'
         ? `<span class="badge good">${iconMarkup('check', 14)}recommended for position</span>`
         : `<span class="badge">${ctx.recommendedPending ? '<span class="spinner" aria-hidden="true"></span> optimising position…' : 'basic stroke'}</span>`;
+  // What the search could not vouch for (only for the recommended stroke being shown).
+  const notes = plan.strokeSource === 'recommended' && !noStroke ? (['fragile', 'searchCutShort', 'risksUnknown'] as const).filter((k) => ctx[k]).map((k) => REC_NOTES[k]) : [];
   // Aim corrections the coaching tip does not already spell out.
   const corrections: string[] = [];
   const tipSquirt = plan.tip.includes('blue line');
@@ -197,22 +227,38 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     corrections.push(off ? `Squirt: aim the cue ${off} (${Math.abs(plan.squirtDeg).toFixed(1)}°)` : `Aim the cue ${Math.abs(plan.squirtDeg).toFixed(1)}° ${plan.squirtDeg > 0 ? 'right' : 'left'} of the blue line (squirt)`);
   }
   // The stroke's side names the cause: outside english for a thicker shift, no "side-spin" on a centre-ball hit.
-  if (!noStroke && Math.abs(plan.throwDeg) >= 0.1 && plan.throwAim && !tipThrow) corrections.push(throwSentence({ ...plan, side: p.side }));
+  const throwAim = plan.throwAim ?? plan.throwShiftDir ?? null;
+  if (!noStroke && Math.abs(plan.throwDeg) >= 0.1 && throwAim && !tipThrow) corrections.push(throwSentence({ ...plan, throwAim, side: p.side }));
   const minPower = Number.isFinite(plan.minPower) ? plan.minPower : null;
+  // The meter's "only just drops" band (minPowerCapture..minPower); a frozen cue ball's minimum moves
+  // with the power (its warning names the powers that work), so it gets no band.
+  const meterOpts = { frozen, ...(!frozen && plan.minPowerCapture !== undefined ? { capture: plan.minPowerCapture } : {}) };
+  // Frozen, the stroke angle off the line of centres plays the cut's part (no ghost ball, cut 0).
+  const fz = frozen ? frozenStroke(plan, plan.ghost) : null;
+  const frozenMsg = plan.warnings.find((w) => w.code === 'frozen')?.message ?? 'Frozen: the object ball goes along the line of centres.';
+  const tip = !plan.makeable && plan.alternatives.length === 0 ? NO_OTHER_POCKET : plan.tip;
   const powerStr = power.toFixed(power % 1 ? 1 : 0);
   const phrase = plan.fractionPhrase ?? `${plan.fractionLabel}-ball`;
   const spinWords = describeSpin(p);
   const hero = plan.makeable
     ? `<div class="hero">
-      <div class="hero-stat cut">
+      ${
+        fz
+          ? `<div class="hero-stat cut frozen">
+        <div class="k">Frozen</div>
+        <div class="hero-main"><div class="v num" data-testid="cut">${fz.deg}°</div></div>
+        <div class="s" title="${esc(frozenMsg)}"><span class="t">${fz.side === 'straight' ? 'straight' : `stroke ${fz.side}`}</span><span class="sr-only"> (${fz.side === 'straight' ? 'stroke straight through the line of centres' : `stroke ${fz.deg}° ${fz.side} of the line of centres`}; no ghost ball)</span></div>
+      </div>`
+          : `<div class="hero-stat cut">
         <div class="k">Cut</div>
         <div class="hero-main"><div class="v num" data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</div></div>
         <div class="s" title="${esc(phrase)}">${fractionGlyphSvg(plan.fraction, cutSideOf(plan.cutSide))}<span class="t">${esc(fractionTile(plan))}</span>${fractionTile(plan) !== fractionShort(plan) ? `<span class="sr-only"> (${esc(phrase)})</span>` : ''}</div>
-      </div>
+      </div>`
+      }
       <div class="hero-stat power">
         <div class="k">Power</div>
         <div class="hero-main gauge-wrap">
-          <div class="power-meter" role="img" aria-label="${esc(powerText(power, minPower))}">${powerMeterSvg(power, minPower)}</div>
+          <div class="power-meter" role="img" aria-label="${esc(powerText(power, minPower, meterOpts))}">${powerMeterSvg(power, minPower, meterOpts)}</div>
           <div class="v num" data-testid="power">${powerStr}<small>/10</small></div>
         </div>
         <div class="s"><span class="t">${esc(speedWord(power))}</span></div>
@@ -227,7 +273,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     : `<div class="hero blocked">
       <ul class="warnings" aria-label="Why it is not makeable">${chips(shown)}</ul>
       <div class="blocked-acts">${ctx.altPocket ? `<button type="button" class="btn primary" data-card-act="alt" data-pocket="${esc(ctx.altPocket.id)}">${iconMarkup('target', 18)}<span>Try the ${esc(ctx.altPocket.name)}</span></button>` : ''}<button type="button" class="btn secondary" data-card-act="suggest">${iconMarkup('sparkles', 18)}<span>Suggest a shot</span></button></div>
-      <span class="sr-only">Cut <span data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>, ${esc(phrase)}. No stroke: this shot is not makeable.<span hidden data-testid="power">${powerStr}<small>/10</small></span><span hidden data-testid="spin">${esc(spinWords)}</span></span>
+      <span class="sr-only">${frozen ? 'Balls frozen together' : 'Cut'} <span data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>${frozen ? '' : `, ${esc(phrase)}`}. No stroke: this shot is not makeable.<span hidden data-testid="power">${powerStr}<small>/10</small></span><span hidden data-testid="spin">${esc(spinWords)}</span></span>
     </div>`;
   const html = `
   <article class="card shot${plan.makeable ? '' : ' not-makeable'}${head && plan.makeable ? ' has-warn' : ''}" data-testid="shot-card" aria-label="Shot plan">
@@ -237,11 +283,11 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     </header>
     ${head && plan.makeable ? `<p class="head-warn warn-${head.code}">${iconMarkup('alert', 16)}<span>${esc(head.message)}</span></p>` : ''}
     ${hero}
-    <div class="meta">${noStroke ? '' : src}${ctx.speedRef && !noStroke ? `<span class="pace">${iconMarkup('gauge', 14)}<span>Pace: ${esc(ctx.speedRef)}</span></span>` : ''}${corrections.length ? `<p class="corr">${iconMarkup('info', 14)}<span>${corrections.map(esc).join(' · ')}</span></p>` : ''}</div>
+    <div class="meta">${noStroke ? '' : src}${ctx.speedRef && !noStroke ? `<span class="pace">${iconMarkup('gauge', 14)}<span>Pace: ${esc(ctx.speedRef)}</span></span>` : ''}${corrections.length ? `<p class="corr">${iconMarkup('info', 14)}<span>${corrections.map(esc).join(' · ')}</span></p>` : ''}${notes.length ? `<p class="rec-note">${iconMarkup('info', 14)}<span>${notes.map(esc).join(' ')}</span></p>` : ''}</div>
     ${warn ? `<ul class="warnings" aria-label="Warnings">${warn}</ul>` : ''}
     <figure class="coach">
       <span class="coach-icon">${iconMarkup('lightbulb', 18)}</span>
-      <blockquote class="tip" data-testid="tip">${esc(plan.tip)}</blockquote>
+      <blockquote class="tip" data-testid="tip">${esc(tip)}</blockquote>
     </figure>
     ${pocketPicker(ctx.pockets ?? [])}
     ${
@@ -254,7 +300,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
       <div><dt>CB speed</dt><dd>${powerToSpeed(power).toFixed(1)} m/s</dd></div>
       <div><dt>CB speed at contact</dt><dd>${plan.cbSpeedAtContact.toFixed(2)} m/s</dd></div>
       <div><dt>OB speed</dt><dd>${plan.obSpeed.toFixed(2)} m/s</dd></div>
-      <div><dt>Min power</dt><dd>${plan.minPower > 10 ? '>10' : plan.minPower.toFixed(1)}</dd></div>
+      <div><dt>Min power</dt><dd>${plan.minPower > 10 ? (frozen ? 'none' : '>10') : plan.minPower.toFixed(1)}</dd></div>
     </dl>`
         : ''
     }

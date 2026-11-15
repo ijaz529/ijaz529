@@ -19,13 +19,15 @@ const SNOOKER_TAG: Record<string, string> = { red: 'R', yellow: 'Y', green: 'G',
 /**
  * Text of a tag: the number for numbered balls; on a pool table a detected colour maps to its number
  * in the standard set ("yellow stripe" → 9, "black" → 8); snooker colours get a short name; nothing
- * for the cue ball.
+ * for the cue ball or a ball vision could not name ("ball").
  */
 export function tagText(b: Pick<Ball, 'kind' | 'label' | 'id'>, snooker = false): string {
   if (b.kind === 'cue') return '';
   const l = (b.label ?? b.id).trim().toLowerCase();
   if (/^\d+$/.test(l)) return l;
   const [word = '', mod] = l.split(/\s+/);
+  // A ball vision could not name ('ball'): no letter (a "B" would read as blue, black or brown).
+  if (word === 'ball') return '';
   if (snooker) return SNOOKER_TAG[word] ?? (word ? word.charAt(0).toUpperCase() : '');
   const n = POOL_NUMBER[word];
   if (n) return String(mod === 'stripe' && n !== 8 ? n + 8 : n);

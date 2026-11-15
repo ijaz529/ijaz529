@@ -16,11 +16,38 @@ const RAMP = Array.from({ length: 10 }, (_, i) => {
 
 const fmt = (n: number) => (Math.round(n * 10) / 10).toString();
 
+export interface MeterOptions {
+  /**
+   * ShotPlan.minPowerCapture: below it the object ball stops short; from it up to minPower it only
+   * just drops (a dashed band on the arc, and said in words).
+   */
+  capture?: number | null;
+  /**
+   * A frozen cue ball: the minimum moves with the power (harder throws less), and minPower > 10 means
+   * no power pots it with pace — never "more than full power" (the warning says harder won't help).
+   */
+  frozen?: boolean;
+}
+
+/** The "only just drops" band [from, to] in power units, or null when there is none to show. */
+export function justDropsBand(minPower: number | null, opts: MeterOptions = {}): { from: number; to: number } | null {
+  const cap = opts.capture;
+  if (opts.frozen || minPower == null || cap == null || !Number.isFinite(minPower) || !Number.isFinite(cap)) return null;
+  const from = Math.max(1, cap);
+  const to = Math.min(10, minPower);
+  return to - from >= 0.05 ? { from, to } : null;
+}
+
 /** Player-facing text equivalent of the gauge. */
-export function powerText(power: number, minPower: number | null): string {
+export function powerText(power: number, minPower: number | null, opts: MeterOptions = {}): string {
   const p = Math.max(0, Math.min(10, power));
   let s = `Power ${fmt(p)} of 10, ${speedWord(p)}`;
-  if (minPower != null && Number.isFinite(minPower)) s += minPower > 10 ? '. Needs more than full power' : `. Minimum ${fmt(Math.max(1, minPower))}`;
+  if (minPower != null && Number.isFinite(minPower)) {
+    if (minPower > 10) s += opts.frozen ? '. No power gets it in with pace' : '. Needs more than full power for pace';
+    else s += `. Minimum ${fmt(Math.max(1, minPower))}`;
+    const band = justDropsBand(minPower, opts);
+    if (band) s += `; from ${fmt(band.from)} it only just drops`;
+  }
   return s;
 }
 
@@ -31,7 +58,7 @@ export function segmentFill(i: number, power: number): number {
 }
 
 /** SVG markup of the gauge (viewBox 0 0 100 58, a 180° arc). */
-export function powerMeterSvg(power: number, minPower: number | null): string {
+export function powerMeterSvg(power: number, minPower: number | null, opts: MeterOptions = {}): string {
   const cx = 50;
   const cy = 52;
   const r = 40;
@@ -51,7 +78,16 @@ export function powerMeterSvg(power: number, minPower: number | null): string {
     out += `<path d="${arc(d0, d1)}" stroke="rgba(255,255,255,0.1)" stroke-width="${sw}" fill="none"/>`;
     if (f > 0) out += `<path class="seg on" data-seg="${i + 1}" d="${arc(d0, f === 1 ? d1 : d0 + (d1 - d0) / 2)}" stroke="${RAMP[i]}" stroke-width="${sw}" fill="none"/>`;
   }
-  if (minPower != null && Number.isFinite(minPower)) {
+  // "Only just drops": a thin dashed arc just outside the segments (pattern, not colour, carries it).
+  const band = justDropsBand(minPower, opts);
+  if (band) {
+    const rb = r + sw / 2 + 2.2;
+    const bArc = `M${pt(band.from * seg, rb)}A${rb} ${rb} 0 0 1 ${pt(band.to * seg, rb)}`;
+    out += `<path d="${bArc}" stroke="#070B14" stroke-width="3.6" fill="none"/>`;
+    out += `<path class="just-drops" d="${bArc}" stroke="#F4F6FB" stroke-width="1.6" stroke-dasharray="2.2 1.8" fill="none"/>`;
+  }
+  // A frozen cue ball that no power pots: no minimum to mark (the warning names what works instead).
+  if (minPower != null && Number.isFinite(minPower) && !(opts.frozen && minPower > 10)) {
     const m = Math.max(0, Math.min(10, minPower));
     const deg = m * seg;
     const over = minPower > 10;
@@ -62,15 +98,15 @@ export function powerMeterSvg(power: number, minPower: number | null): string {
 }
 
 /** Inner markup of the gauge element (SVG + screen-reader text). */
-export function powerMeterMarkup(power: number, minPower: number | null): string {
-  return `${powerMeterSvg(power, minPower)}<span class="sr-only">${powerText(power, minPower)}</span>`;
+export function powerMeterMarkup(power: number, minPower: number | null, opts: MeterOptions = {}): string {
+  return `${powerMeterSvg(power, minPower, opts)}<span class="sr-only">${powerText(power, minPower, opts)}</span>`;
 }
 
-export function renderPowerMeter(power: number, minPower: number | null): HTMLElement {
+export function renderPowerMeter(power: number, minPower: number | null, opts: MeterOptions = {}): HTMLElement {
   const el = document.createElement('div');
   el.className = 'power-meter';
   el.setAttribute('role', 'img');
-  el.setAttribute('aria-label', powerText(power, minPower));
-  el.innerHTML = powerMeterSvg(power, minPower);
+  el.setAttribute('aria-label', powerText(power, minPower, opts));
+  el.innerHTML = powerMeterSvg(power, minPower, opts);
   return el;
 }

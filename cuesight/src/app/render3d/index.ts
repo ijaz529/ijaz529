@@ -28,7 +28,8 @@ import { easeInOutCubic, easeOutCubic, mat4, mat4FromBasis, project, quatMultipl
 import { pickRay, type Pick3D } from './picking';
 import { buildTrack, playbackTimeline, sampleTrack, type BallPose, type PlaybackTrack, type Timeline } from './playback';
 import { Renderer, type BallDraw, type DotDraw, type FrameState } from './scene';
-import { ADDRESS_GAP, ballLook, contactPoint3, cuePose, hexRGBA, planRibbons, practiceStroke, restOrientation, type BallLook } from './scene-data';
+import { aimLine, stickDir } from '../render/plan-draw';
+import { ADDRESS_GAP, ballLook, contactPoint3, cueAim, cuePose, hexRGBA, planRibbons, practiceStroke, restOrientation, type BallLook } from './scene-data';
 
 export type { Pick3D } from './picking';
 
@@ -219,20 +220,9 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   // -------------------------------------------------------------------------------------------
   // Camera
   // -------------------------------------------------------------------------------------------
-  /** Cue ball, the cue-ball path direction (aim), the cue's own direction (squirt-corrected) and the ghost ball. */
-  function cueAndAim(): { cue: Vec2; aim: Vec2; cueDir: Vec2; ghost: Vec2 | null } | null {
-    const d0 = data;
-    if (!d0) return null;
-    const cue = d0.balls.find((b) => b.kind === 'cue');
-    if (!cue) return null;
-    if (d0.plan) return { cue: cue.pos, aim: d0.plan.aimDir, cueDir: d0.plan.cueDir ?? d0.plan.aimDir, ghost: d0.plan.ghost };
-    const t = d0.targetId ? d0.balls.find((b) => b.id === d0.targetId) : undefined;
-    if (t) {
-      const d = { x: t.pos.x - cue.pos.x, y: t.pos.y - cue.pos.y };
-      if (Math.hypot(d.x, d.y) > 1e-6) return { cue: cue.pos, aim: d, cueDir: d, ghost: t.pos };
-    }
-    const d = Math.hypot(cue.pos.x, cue.pos.y) > 0.05 ? { x: -cue.pos.x, y: -cue.pos.y } : { x: 1, y: 0 };
-    return { cue: cue.pos, aim: d, cueDir: d, ghost: null };
+  /** Cue ball, aim (ball path), the cue's own direction (stickDir) and the ghost ball (scene-data cueAim). */
+  function cueAndAim(): ReturnType<typeof cueAim> {
+    return data ? cueAim(data) : null;
   }
 
   /** What the Player view must keep in frame: the pocket, where the object ball goes, the ghost ball. */
@@ -245,7 +235,9 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     const hole = pocketId ? g.holes.find((h) => h.id === pocketId) : undefined;
     if (hole) keep.push([hole.x, hole.y, 0]);
     if (plan) {
-      keep.push([plan.ghost.x, plan.ghost.y, g.R]);
+      const cue = d0.balls.find((b) => b.kind === 'cue');
+      const aim = cue ? aimLine(plan, cue.pos, g.R, g) : null;
+      if (aim) keep.push(aim.ghost ? [aim.ghost.x, aim.ghost.y, g.R] : [aim.to.x, aim.to.y, g.R]);
       const pts = plan.objectPath.points;
       if (pts.length) {
         const e = pts[pts.length - 1]!;
@@ -493,7 +485,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       // During playback the stick strikes from where the replayed shot starts.
       const pp = playing && play ? play.plan : null;
       const cpos = pp && pp.cuePath.points.length ? pp.cuePath.points[0]! : drag && drag.id === cueBall.id ? drag.pos : ca.cue;
-      const cp = cuePose(geo, cpos, pp ? (pp.cueDir ?? pp.aimDir) : ca.cueDir, pp ? (d.stroke ?? pp.stroke) : st);
+      const cp = cuePose(geo, cpos, pp ? stickDir(pp) : ca.cueDir, pp ? (d.stroke ?? pp.stroke) : st);
       // At rest the cue addresses the ball (tip ADDRESS_GAP behind the strike point); power shows as
       // the length of a few idle practice strokes, and of the back-swing (cp.gap) before a replay.
       let gap = ADDRESS_GAP;
@@ -522,7 +514,8 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       height: canvas.height,
       dpr: canvas.width / Math.max(1, cssW),
       balls,
-      ghost: showPlan && plan ? plan.ghost : null,
+      // No ghost ball for a frozen cue ball (the core puts it on the cue ball).
+      ghost: showPlan && plan && cueBall ? aimLine(plan, cueBall.pos, R).ghost : null,
       dots,
       cue: cueModel,
       glow: hole ? { x: hole.x, y: hole.y, r: hole.r * 1.6, color: [0.91, 0.77, 0.42, 0.2] } : null,
@@ -598,8 +591,9 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     const plan = d.plan;
     if (plan && cueB) {
       // Aim line (sampled), ghost, object-ball and cue-ball paths (decimated).
-      for (let k = 0; k <= 8; k++) push(cueB.pos.x + (plan.ghost.x - cueB.pos.x) * (k / 8), cueB.pos.y + (plan.ghost.y - cueB.pos.y) * (k / 8));
-      push(plan.ghost.x, plan.ghost.y, geo.R);
+      const aim = aimLine(plan, cueB.pos, geo.R, geo);
+      for (let k = 0; k <= 8; k++) push(aim.from.x + (aim.to.x - aim.from.x) * (k / 8), aim.from.y + (aim.to.y - aim.from.y) * (k / 8));
+      if (aim.ghost) push(aim.ghost.x, aim.ghost.y, geo.R);
       for (const tr of [plan.objectPath, plan.cuePath]) {
         const pts = tr.points;
         const step = Math.max(1, Math.floor(pts.length / 16));

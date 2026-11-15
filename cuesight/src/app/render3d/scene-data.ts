@@ -3,7 +3,8 @@
  * and the plan overlays (ribbons/markers) in table coordinates. No GL, no DOM.
  */
 import type { Ball, PocketId, ShotPlan, Stroke, TableSpec, Vec2 } from '../../core/types';
-import { PALETTE } from '../render/palette';
+import { BALL_NAMED, BALL_NEUTRAL, BALL_SNOOKER, PALETTE } from '../render/palette';
+import { aimLine, stickDir } from '../render/plan-draw';
 import type { TableGeom } from './geom';
 import { circlePoints, simplifyPath } from './meshes';
 import { quatFromAxes, quatFromAxisAngle, quatMultiply, type Quat, type V3 } from './math3d';
@@ -14,29 +15,8 @@ export type RGBA = [number, number, number, number];
 // ---------------------------------------------------------------------------------------------
 // Colours
 // ---------------------------------------------------------------------------------------------
-const NAMED: Record<string, string> = {
-  white: '#f2eee4',
-  yellow: '#f2b705',
-  blue: '#1e4fb5',
-  red: '#c81e1e',
-  purple: '#4b2a83',
-  orange: '#f06a12',
-  green: '#0f7a3d',
-  maroon: '#7a1e2b',
-  brown: '#6b3a1e',
-  pink: '#f08fb0',
-  black: '#121212',
-};
-/** Snooker uses slightly different (deeper) tones than pool sets. */
-const SNOOKER: Record<string, string> = {
-  red: '#b3141b',
-  yellow: '#f2c230',
-  green: '#0e7a43',
-  brown: '#6b3a1e',
-  blue: '#1f4fb5',
-  pink: '#f08fb0',
-  black: '#111111',
-};
+const NAMED = BALL_NAMED;
+const SNOOKER = BALL_SNOOKER;
 const POOL_NUMBERS = ['#f2b705', '#1e4fb5', '#c81e1e', '#4b2a83', '#f06a12', '#0f7a3d', '#7a1e2b', '#121212'];
 
 /** Parse '#rgb', '#rrggbb', 'rgb(r,g,b)' or a colour name → sRGB 0..1. */
@@ -81,7 +61,8 @@ export function ballLook(b: Ball, table: TableSpec): BallLook {
   let c: [number, number, number] | null = null;
   if (snooker) c = parseColor(SNOOKER[word]) ?? parseColor(b.color);
   else if (slot >= 0) c = parseColor(b.color) ?? parseColor(POOL_NUMBERS[slot % 8]);
-  c ??= parseColor(b.color) ?? parseColor(NAMED[word]) ?? [0.75, 0.2, 0.2];
+  // A ball vision could not name ('ball') and that has no measured colour is drawn neutral grey.
+  c ??= parseColor(b.color) ?? parseColor(NAMED[word]) ?? parseColor(BALL_NEUTRAL)!;
   const stripe = !snooker && (b.stripe === true || slot >= 8 || /stripe/.test(label));
   return { color: lin(c), stripe, slot, cueDots: false };
 }
@@ -271,11 +252,13 @@ export function planRibbons(inp: OverlayInput, g: TableGeom, opts: RibbonOpts = 
       const after = plan.cuePath.points.slice(k);
       if (after.length > 1) out.push({ key: 'cb', pts: simplifyPath(after), z, color: hexRGBA(PALETTE.cue), halo: DARK_HALO, dash: [0.045, 0.028, 0, 0], width: 0.006, minPx: 2.6, haloPx: 1.2 });
     }
-    // Aim line: cue-ball centre → ghost-ball centre. Not makeable: vermillion AND dashed (never by
-    // colour alone), with an ✕ on each ball in the way.
+    // Aim line: cue-ball centre → ghost-ball centre (a frozen cue ball: the stroke along aimDir from
+    // the cue ball, and no ghost ball). Not makeable: vermillion AND dashed (never by colour alone),
+    // with an ✕ on each ball in the way.
+    const aim = aimLine(plan, cue.pos, R, { hx: g.hx, hy: g.hy });
     out.push({
       key: 'aim',
-      pts: [cue.pos, plan.ghost],
+      pts: [aim.from, aim.to],
       z,
       color: hexRGBA(plan.makeable ? PALETTE.aim : PALETTE.warn),
       halo: LIGHT_HALO,
@@ -289,8 +272,9 @@ export function planRibbons(inp: OverlayInput, g: TableGeom, opts: RibbonOpts = 
       const b = inp.balls.find((x) => x.id === id);
       if (b) out.push(...crossMark(`block:${id}`, b.pos, R * 1.25, z, hexRGBA(PALETTE.warn)));
     }
-    if (opts.ghostSolid) out.push({ key: 'ghost', pts: circlePoints(plan.ghost.x, plan.ghost.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.cue, 0.95), halo: [0, 0, 0, 0.4], width: 0.0025, minPx: 1.5, haloPx: 0.8 });
-    else out.push({ key: 'ghost', pts: circlePoints(plan.ghost.x, plan.ghost.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.ghost, 0.95), halo: [0, 0, 0, 0.35], dash: [0.0055, 0.0075, 0, 0], width: 0.003, minPx: 2, haloPx: 0.8 });
+    const gh = aim.ghost;
+    if (gh && opts.ghostSolid) out.push({ key: 'ghost', pts: circlePoints(gh.x, gh.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.cue, 0.95), halo: [0, 0, 0, 0.4], width: 0.0025, minPx: 1.5, haloPx: 0.8 });
+    else if (gh) out.push({ key: 'ghost', pts: circlePoints(gh.x, gh.y, R, 40), z, closed: true, color: hexRGBA(PALETTE.ghost, 0.95), halo: [0, 0, 0, 0.35], dash: [0.0055, 0.0075, 0, 0], width: 0.003, minPx: 2, haloPx: 0.8 });
     if (plan.cueRest) {
       const q = plan.cueRest;
       const s = Math.max(0.018, R * 0.7);
@@ -351,6 +335,24 @@ export function mouthArc(p: { jawA: Vec2; jawB: Vec2; inward: Vec2 }, hole: { x:
     out.push({ x: hole.x + r * Math.cos(a), y: hole.y + r * Math.sin(a) });
   }
   return out;
+}
+
+/**
+ * Cue ball, the cue-ball path direction (aim), the cue's own direction (stickDir: squirt-corrected)
+ * and the ghost ball (null for a frozen cue ball, which has none). Without a plan: toward the target,
+ * else toward the table centre. Null without a cue ball.
+ */
+export function cueAim(d: { balls: readonly Ball[]; plan: ShotPlan | null; targetId: string | null }): { cue: Vec2; aim: Vec2; cueDir: Vec2; ghost: Vec2 | null } | null {
+  const cue = d.balls.find((b) => b.kind === 'cue');
+  if (!cue) return null;
+  if (d.plan) return { cue: cue.pos, aim: d.plan.aimDir, cueDir: stickDir(d.plan), ghost: aimLine(d.plan, cue.pos, 0).ghost };
+  const t = d.targetId ? d.balls.find((b) => b.id === d.targetId) : undefined;
+  if (t) {
+    const v = { x: t.pos.x - cue.pos.x, y: t.pos.y - cue.pos.y };
+    if (Math.hypot(v.x, v.y) > 1e-6) return { cue: cue.pos, aim: v, cueDir: v, ghost: t.pos };
+  }
+  const v = Math.hypot(cue.pos.x, cue.pos.y) > 0.05 ? { x: -cue.pos.x, y: -cue.pos.y } : { x: 1, y: 0 };
+  return { cue: cue.pos, aim: v, cueDir: v, ghost: null };
 }
 
 /** Contact point on the object ball (3D, on its equator facing the ghost ball). */

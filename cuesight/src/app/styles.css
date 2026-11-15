@@ -2988,13 +2988,14 @@ body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
   min-width: 0;
   overflow-wrap: break-word;
 }
-/* At the peek a (hypothetical) very long warning stops at three lines — every warning the planner
-   writes fits in two at 375 px; medium and expanded always show it all. */
+/* At the peek a long warning stops at two lines, so the cut, power and spin tiles stay in view: the
+   frozen cue ball's checked power advice runs to three or four lines at 375–393 px. Medium and
+   expanded always show it all. */
 .panel[data-sheet='peek'] .head-warn span {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
 }
 .head-warn .icon {
@@ -3833,4 +3834,23 @@ body[data-mode='snap'][data-snap='guide'] #snap-hud {
   max-height: none;
   overflow: visible;
   inset: auto;
+}
+
+/* =============================================================================================
+   Plan-ui (wave 2b): the recommendation's honesty notes (speed-sensitive, search cut short, scratch
+   risk not checked) on their own line under the badge, like the aim corrections; text and icon,
+   never colour alone.
+   ============================================================================================= */
+.rec-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.3;
+  color: var(--text-2);
+}
+.rec-note svg {
+  flex: none;
 }

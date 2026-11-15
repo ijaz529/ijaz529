@@ -8,7 +8,9 @@
  * static table is cached in an offscreen canvas and only redrawn when the size or table changes.
  */
 import type { Ball, PocketId, ShotPlan, TableSpec, Trajectory, Vec2 } from '../../core/types';
-import { DASH, HIT_RADIUS_PX, PALETTE, UI } from './palette';
+import { tagText } from '../ui/ball-tags';
+import { DASH, HIT_RADIUS_PX, PALETTE, STICK_ALPHA, UI, ballCss } from './palette';
+import { aimLine, planLabel, stickLine } from './plan-draw';
 
 export interface TableViewData {
   table: TableSpec;
@@ -488,7 +490,8 @@ export class TableView {
     const c = this.ctx;
     const q = this.toCanvas(b.pos);
     const r = Math.max(3, R * this.s);
-    const base = b.kind === 'cue' ? UI.ivory : (b.color ?? '#c33');
+    const snooker = this.table?.id === 'snooker12';
+    const base = ballCss(b, snooker);
     // Contact shadow (light from the top-left lamp).
     const sh = c.createRadialGradient(q.x + r * 0.28, q.y + r * 0.38, r * 0.2, q.x + r * 0.28, q.y + r * 0.38, r * 1.3);
     sh.addColorStop(0, 'rgba(0,0,0,0.5)');
@@ -507,8 +510,9 @@ export class TableView {
       c.fillStyle = base;
       c.fillRect(q.x - r, q.y - r * 0.55, 2 * r, r * 1.1);
     }
-    // Number disc.
-    const label = b.label && b.kind !== 'cue' ? (/^\d+$/.test(b.label) ? b.label : b.label.charAt(0).toUpperCase()) : '';
+    // Number disc: the number, or the colour's short name (Br/Bl/Bk on snooker); none for the cue ball
+    // or a ball vision could not name ('ball'), the same text as the 3D table's ball tags.
+    const label = b.label ? tagText(b, snooker) : '';
     if (label && r >= 5.5) {
       c.fillStyle = '#FBFAF5';
       c.beginPath();
@@ -592,6 +596,34 @@ export class TableView {
     c.restore();
   }
 
+  /** The cue-stick line (table metres) for side spin, kept on the table and its rails. */
+  private stickOf(plan: ShotPlan, cue: Vec2): { from: Vec2; to: Vec2 } | null {
+    const t = this.table!;
+    return stickLine(plan, cue, t.ballRadius, { hx: t.length / 2 + t.cushionWidth + RAIL * 0.8, hy: t.width / 2 + t.cushionWidth + RAIL * 0.8 });
+  }
+
+  /** A translucent shaded ghost ball with the dotted ring, centred at g (canvas px), radius gr. */
+  private ghostBall(g: Vec2, gr: number): void {
+    const c = this.ctx;
+    c.save();
+    const fill = c.createRadialGradient(g.x - gr * 0.35, g.y - gr * 0.4, gr * 0.05, g.x, g.y, gr);
+    fill.addColorStop(0, 'rgba(255,255,255,0.55)');
+    fill.addColorStop(0.7, 'rgba(255,255,255,0.16)');
+    fill.addColorStop(1, 'rgba(255,255,255,0.06)');
+    c.fillStyle = fill;
+    c.beginPath();
+    c.arc(g.x, g.y, gr, 0, Math.PI * 2);
+    c.fill();
+    c.strokeStyle = UI.halo;
+    c.lineWidth = 3.5;
+    c.stroke();
+    c.strokeStyle = PALETTE.ghost;
+    c.setLineDash(DASH.ghost);
+    c.lineWidth = 1.8;
+    c.stroke();
+    c.restore();
+  }
+
   /** `top` = false draws the lines under the balls; true draws the ghost ball, contact and labels above. */
   private drawPlan(plan: ShotPlan, balls: Ball[], top: boolean): void {
     const c = this.ctx;
@@ -608,8 +640,18 @@ export class TableView {
       const hitIdx = hit ? pts.findIndex((p) => Math.hypot(p.x - hit.pos.x, p.y - hit.pos.y) < 1e-6) : -1;
       const after = hit ? pts.slice(Math.max(0, hitIdx)) : [];
       if (after.length > 1) this.path({ ...plan.cuePath, points: after }, PALETTE.cue, DASH.cue, 2.5);
-      // Aim line: cue ball → ghost ball.
-      this.poly([cue.pos, plan.ghost], plan.makeable ? PALETTE.aim : PALETTE.warn, [], 3);
+      // Aim line: cue ball → ghost ball (a frozen cue ball: the stroke from the cue ball, no ghost ball).
+      const t = this.table!;
+      const aim = aimLine(plan, cue.pos, R, { hx: t.length / 2, hy: t.width / 2 });
+      this.poly([aim.from, aim.to], plan.makeable ? PALETTE.aim : PALETTE.warn, [], 3);
+      // Side spin: the cue stick behind the cue ball (faint, long-dashed, labelled on the top layer).
+      const stick = big ? this.stickOf(plan, cue.pos) : null;
+      if (stick) {
+        c.save();
+        c.globalAlpha = STICK_ALPHA;
+        this.poly([stick.from, stick.to], PALETTE.stick, DASH.stick, 2);
+        c.restore();
+      }
       // Cue-ball rest (X in a dotted ring).
       if (plan.cueRest) {
         const q = this.toCanvas(plan.cueRest);
@@ -637,26 +679,12 @@ export class TableView {
       }
       return;
     }
-    // Ghost ball: a translucent shaded sphere with a dotted ring.
-    const g = this.toCanvas(plan.ghost);
+    const aim = aimLine(plan, cue.pos, R, { hx: this.table!.length / 2, hy: this.table!.width / 2 });
     const gr = R * this.s;
-    c.save();
-    const fill = c.createRadialGradient(g.x - gr * 0.35, g.y - gr * 0.4, gr * 0.05, g.x, g.y, gr);
-    fill.addColorStop(0, 'rgba(255,255,255,0.55)');
-    fill.addColorStop(0.7, 'rgba(255,255,255,0.16)');
-    fill.addColorStop(1, 'rgba(255,255,255,0.06)');
-    c.fillStyle = fill;
-    c.beginPath();
-    c.arc(g.x, g.y, gr, 0, Math.PI * 2);
-    c.fill();
-    c.strokeStyle = UI.halo;
-    c.lineWidth = 3.5;
-    c.stroke();
-    c.strokeStyle = PALETTE.ghost;
-    c.setLineDash(DASH.ghost);
-    c.lineWidth = 1.8;
-    c.stroke();
-    c.restore();
+    // The label sits by the ghost ball, or by the end of a frozen cue ball's stroke line.
+    const g = this.toCanvas(aim.ghost ?? aim.to);
+    // Ghost ball: a translucent shaded sphere with a dotted ring (none for a frozen cue ball).
+    if (aim.ghost) this.ghostBall(g, gr);
     // Contact point.
     const cp = this.toCanvas(plan.contactPoint);
     c.save();
@@ -677,9 +705,16 @@ export class TableView {
       const nx = -dy / L;
       const ny = dx / L;
       const side = nx >= 0 ? 1 : -1;
-      const text = plan.makeable ? `${plan.cutAngleDeg.toFixed(0)}° · ${plan.fractionLabel} ball` : 'Not makeable';
+      const text = planLabel(plan, cue.pos);
       const off = gr + 10;
       this.label(text, { x: g.x + nx * side * off, y: g.y + ny * side * off }, plan.makeable ? UI.text : '#FFAB7A', side < 0 ? 'right' : 'left');
+      // The stick line's own label at its far end, so it is never read as a ball path.
+      const stick = this.stickOf(plan, cue.pos);
+      if (stick) {
+        const e = this.toCanvas(stick.to);
+        const sx = this.toCanvas(stick.from);
+        this.label('Cue stick', { x: e.x + 6, y: e.y + (e.y >= sx.y ? 10 : -10) }, 'rgba(244,246,251,0.85)', e.x < sx.x ? 'right' : 'left');
+      }
       if (plan.cueRest) {
         const q = this.toCanvas(plan.cueRest);
         this.label('Cue stops', { x: q.x + gr + 8, y: q.y });

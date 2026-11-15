@@ -12,8 +12,9 @@
  * plan lines and balls and never the cue stick, never takes taps (pointer-events: none) and is hidden
  * from assistive tech (the shot card and the live region say the same thing).
  */
-import { describeSpin, speedWord } from '../../core/shot/power';
-import type { Stroke } from '../../core/types';
+import { advisePower, describeSpin, powerFigure, speedWord } from '../../core/shot/power';
+import type { PocketId, ShotPlan, Stroke } from '../../core/types';
+import { isFrozenPlan } from '../render/plan-draw';
 import type { FrameInfo } from '../render3d';
 import { strikeFace } from '../snap/guide';
 import { iconMarkup } from './icons';
@@ -50,6 +51,32 @@ export function powerRamp(i: number): string {
 export type LabelContent =
   | { kind: 'stroke'; stroke: Pick<Stroke, 'power' | 'side' | 'vert'>; name?: string | null }
   | { kind: 'warn'; text: string; sub?: string };
+
+/**
+ * What the in-scene label says for a plan (main.ts calls it on every render): the stroke, or for a
+ * shot that cannot happen as planned, why in a few words and what to try — the card's reason, never
+ * a generic failure:
+ * - a ball in the way; balls frozen together (pool: only the line of centres); snooker's touching
+ *   ball (moving it is a push stroke, a foul: play away from it); otherwise "Not makeable";
+ * - the cue ball stopping short, with the power the warning quotes (advisePower, a half step).
+ * `pending`: a provisional stroke about to be replaced by the recommended one — say nothing yet.
+ */
+export function planLabelContent(p: ShotPlan | null, names: Partial<Record<PocketId, string>>, opts: { pending?: boolean; snooker?: boolean } = {}): LabelContent | null {
+  if (!p) return null;
+  if (opts.pending && p.strokeSource !== 'player' && p.makeable) return null;
+  const alt = p.alternatives[0];
+  const elsewhere = alt ? `Try the ${names[alt.pocketId] ?? alt.pocketId}` : 'Pick another ball or play a safety';
+  if (!p.makeable) {
+    const frozen = isFrozenPlan(p) && p.warnings.some((w) => w.code === 'not-makeable');
+    if (frozen && opts.snooker) return { kind: 'warn', text: 'Not makeable · touching ball', sub: 'Play away from it (a push is a foul)' };
+    if (frozen) return { kind: 'warn', text: 'Not makeable · balls frozen together', sub: elsewhere };
+    const blocked = p.warnings.some((w) => w.code === 'blocked-cue' || w.code === 'blocked-object');
+    return { kind: 'warn', text: blocked ? 'Not makeable · a ball is in the way' : 'Not makeable', sub: elsewhere };
+  }
+  if (p.warnings.some((w) => w.code === 'cb-short'))
+    return { kind: 'warn', text: 'Too soft: the cue ball stops short', sub: p.minPower <= 10 ? `Use power ${powerFigure(advisePower(p.minPower))}+` : 'Too far even at full power' };
+  return { kind: 'stroke', stroke: p.stroke, name: p.strokeName };
+}
 
 /** Inner markup of the label for a stroke; `compact` (Player view) drops the mini cue ball. */
 export function shotLabelMarkup(stroke: Pick<Stroke, 'power' | 'side' | 'vert'>, opts: { compact?: boolean; name?: string | null; noBall?: boolean } = {}): string {

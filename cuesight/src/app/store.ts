@@ -49,7 +49,24 @@ export interface AppState {
   pocketId: PocketId | null;
   strokeMode: 'recommended' | 'mine';
   myStroke: Stroke;
-  recommended: { key: string; stroke: Stroke | null; pending: boolean; reachable: boolean; evaluated: number; risks?: StrokeRisk[] } | null;
+  /**
+   * The open or answered recommendation (planner worker 'recommendation', core Recommendation):
+   * `risks` absent = not known (never "safe"); `fragile` = no stroke was verified against small
+   * speed errors; `timedOut` = the safety cap cut the search short; `nextQuality` = next-shot quality
+   * 0..1 of the chosen stroke (default objective only). The shot card reads them through
+   * ui/shot-card.ts recommendationContext().
+   */
+  recommended: {
+    key: string;
+    stroke: Stroke | null;
+    pending: boolean;
+    reachable: boolean;
+    evaluated: number;
+    risks?: StrokeRisk[];
+    fragile?: boolean;
+    timedOut?: boolean;
+    nextQuality?: number;
+  } | null;
   landing: Vec2 | null;
   interaction: Interaction;
   calibTaps: Vec2[];

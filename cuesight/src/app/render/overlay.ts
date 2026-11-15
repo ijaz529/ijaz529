@@ -7,7 +7,8 @@
 import type { Ball, PocketId, ShotPlan, TableSpec, Vec2 } from '../../core/types';
 import type { Calibration } from '../../vision/calibration';
 import { applyH, invert3 } from '../../vision/homography';
-import { DASH, HIT_RADIUS_PX, PALETTE, UI } from './palette';
+import { DASH, HIT_RADIUS_PX, PALETTE, STICK_ALPHA, UI } from './palette';
+import { aimLine, planLabel, stickLine } from './plan-draw';
 
 export interface FrameMapping {
   /** Processing-frame px → CSS px in the overlay canvas. */
@@ -119,22 +120,36 @@ export class Overlay {
       const pts = plan.cuePath.points;
       const i0 = hit ? Math.max(0, pts.findIndex((p) => Math.hypot(p.x - hit.pos.x, p.y - hit.pos.y) < 1e-6)) : pts.length;
       this.screenPoly(pts.slice(i0).map(onR), PALETTE.cue, DASH.cue, 3, 8, UI.halo, 6);
-      this.screenPoly([cue.pos, plan.ghost].map(onR), plan.makeable ? PALETTE.aim : PALETTE.warn, [], 4, 10, UI.halo, 6);
-      // Ghost ball: a shaded translucent sphere with a dotted ring.
-      const ring = circlePts(plan.ghost, R);
-      const g = onR(plan.ghost);
+      // Aim line: cue ball → ghost ball (a frozen cue ball: the stroke from the cue ball, no ghost ball).
+      const aim = aimLine(plan, cue.pos, R, { hx, hy });
+      this.screenPoly([aim.from, aim.to].map(onR), plan.makeable ? PALETTE.aim : PALETTE.warn, [], 4, 10, UI.halo, 6);
+      // Side spin: the cue stick behind the cue ball, faint, long-dashed and labelled "Cue stick".
+      const stick = stickLine(plan, cue.pos, R, { hx: hx + t.cushionWidth, hy: hy + t.cushionWidth });
+      if (stick) {
+        c.save();
+        c.globalAlpha = STICK_ALPHA;
+        this.screenPoly([stick.from, stick.to].map(onR), PALETTE.stick, DASH.stick, 2.5, 0, UI.halo, 3);
+        c.restore();
+      }
+      // Ghost ball: a shaded translucent sphere with a dotted ring (none for a frozen cue ball). The
+      // label sits by it, or by the end of the frozen stroke line.
+      const anchor = aim.ghost ?? aim.to;
+      const ring = circlePts(anchor, R);
+      const g = onR(anchor);
       const gr = ring.reduce((acc, q) => acc + Math.hypot(q.x - g.x, q.y - g.y), 0) / ring.length;
-      c.save();
-      const fill = c.createRadialGradient(g.x - gr * 0.35, g.y - gr * 0.4, gr * 0.05, g.x, g.y, gr * 1.05);
-      fill.addColorStop(0, 'rgba(255,255,255,0.6)');
-      fill.addColorStop(0.7, 'rgba(255,255,255,0.18)');
-      fill.addColorStop(1, 'rgba(255,255,255,0.05)');
-      c.fillStyle = fill;
-      c.beginPath();
-      ring.forEach((q, i) => (i ? c.lineTo(q.x, q.y) : c.moveTo(q.x, q.y)));
-      c.fill();
-      c.restore();
-      this.screenPoly(ring, PALETTE.ghost, DASH.ghost, 2.5, 0, UI.halo, 5);
+      if (aim.ghost) {
+        c.save();
+        const fill = c.createRadialGradient(g.x - gr * 0.35, g.y - gr * 0.4, gr * 0.05, g.x, g.y, gr * 1.05);
+        fill.addColorStop(0, 'rgba(255,255,255,0.6)');
+        fill.addColorStop(0.7, 'rgba(255,255,255,0.18)');
+        fill.addColorStop(1, 'rgba(255,255,255,0.05)');
+        c.fillStyle = fill;
+        c.beginPath();
+        ring.forEach((q, i) => (i ? c.lineTo(q.x, q.y) : c.moveTo(q.x, q.y)));
+        c.fill();
+        c.restore();
+        this.screenPoly(ring, PALETTE.ghost, DASH.ghost, 2.5, 0, UI.halo, 5);
+      }
       // Contact point on the object ball.
       const cp = onR(plan.contactPoint);
       c.save();
@@ -152,8 +167,13 @@ export class Overlay {
       const nx = -(g.y - a.y) / L;
       const ny = (g.x - a.x) / L;
       const side = nx >= 0 ? 1 : -1;
-      const text = plan.makeable ? `${plan.cutAngleDeg.toFixed(0)}° · ${plan.fractionLabel} ball` : 'Not makeable';
+      const text = planLabel(plan, cue.pos);
       this.label(text, { x: g.x + nx * side * (gr + 12), y: g.y + ny * side * (gr + 12) }, plan.makeable ? UI.text : '#FFAB7A', side < 0 ? 'right' : 'left');
+      if (stick) {
+        const e = onR(stick.to);
+        const s0 = onR(stick.from);
+        this.label('Cue stick', { x: e.x, y: e.y + (e.y >= s0.y ? 14 : -14) }, 'rgba(244,246,251,0.85)', e.x < s0.x ? 'right' : 'left');
+      }
       if (plan.cueRest) {
         this.screenPoly(circlePts(plan.cueRest, R), PALETTE.cue, [2, 3], 2, 0, UI.halo, 4);
         const q = onR(plan.cueRest);

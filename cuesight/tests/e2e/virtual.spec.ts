@@ -13,6 +13,23 @@ async function screenOf(page: Page, what: { ball?: string; pocket?: string }) {
   }, what);
 }
 
+/**
+ * Where a ball or pocket is on screen once the table has stopped moving: picking a target grows the
+ * sheet and the 3D table re-frames (animated, and slow on the software renderer under load), so a
+ * position read at once can be a pocket's old place.
+ */
+async function stillScreenOf(page: Page, what: { ball?: string; pocket?: string }) {
+  let q = await screenOf(page, what);
+  for (let i = 0; i < 60; i++) {
+    await settled(page);
+    await page.waitForTimeout(150);
+    const next = await screenOf(page, what);
+    if (Math.hypot(next.x - q.x, next.y - q.y) < 0.5) return next;
+    q = next;
+  }
+  return q;
+}
+
 test.describe('practice table (US1, US3)', () => {
   test('tap a ball and a pocket → full shot card with tangent-line coaching', async ({ page }) => {
     await page.goto('/?mode=practice');
@@ -50,13 +67,15 @@ test.describe('practice table (US1, US3)', () => {
   });
 
   test('blocked drill warns and names the blocker', async ({ page }) => {
+    test.setTimeout(90_000);
     await page.goto('/?mode=practice');
     await page.locator('select[aria-label="Practice layout"]').selectOption('blocked');
-    const ball = await screenOf(page, { ball: 'b1' });
+    const ball = await stillScreenOf(page, { ball: 'b1' });
     await page.mouse.click(ball.x, ball.y);
-    const pocket = await screenOf(page, { pocket: 'TR' });
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __cuesight: SelHook }).__cuesight.state.targetId), { timeout: 15_000 }).toBe('b1');
+    const pocket = await stillScreenOf(page, { pocket: 'TR' });
     await page.mouse.click(pocket.x, pocket.y);
-    await expect(page.locator('.warnings')).toContainText('blocked by 5');
+    await expect(page.locator('.warnings')).toContainText('blocked by 5', { timeout: 15_000 });
   });
 });
 

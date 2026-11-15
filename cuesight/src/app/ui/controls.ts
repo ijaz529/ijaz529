@@ -130,6 +130,33 @@ export interface StrokeActions {
   useRecommended(): void;
 }
 
+/**
+ * Calls `fn` at most once per animation frame, with the latest value pushed, and at once on flush.
+ * A fast slider drag fires several input events per frame and each one replans on the main thread
+ * (a soft frozen-ball plan with its power advice costs 12–75 ms); only the last value of a frame
+ * matters.
+ */
+export function perFrame<T>(fn: (v: T) => void, raf: (cb: () => void) => unknown = (cb) => (typeof requestAnimationFrame === 'function' ? requestAnimationFrame(cb) : setTimeout(cb, 16))) {
+  let pending: { v: T } | null = null;
+  let scheduled = false;
+  const run = () => {
+    scheduled = false;
+    const p = pending;
+    pending = null;
+    if (p) fn(p.v);
+  };
+  return {
+    push(v: T): void {
+      pending = { v };
+      if (!scheduled) {
+        scheduled = true;
+        raf(run);
+      }
+    },
+    flush: run,
+  };
+}
+
 export function buildStrokeControls(el: HTMLElement, actions: StrokeActions) {
   el.innerHTML = `
     <section class="stroke" aria-labelledby="stroke-title">
@@ -149,11 +176,15 @@ export function buildStrokeControls(el: HTMLElement, actions: StrokeActions) {
   const range = el.querySelector('#power') as HTMLInputElement;
   const out = el.querySelector('#power-out') as HTMLOutputElement;
   const fill = () => range.style.setProperty('--fill', `${((Number(range.value) - 1) / 9) * 100}%`);
+  // The number follows the thumb at once; the replan runs at most once per frame (and at once when
+  // the drag ends), so a fast drag does not plan every half step it passes.
+  const send = perFrame((v: number) => actions.power(v));
   range.addEventListener('input', () => {
     out.value = range.value;
     fill();
-    actions.power(Number(range.value));
+    send.push(Number(range.value));
   });
+  range.addEventListener('change', () => send.flush());
   const pad = createSpinPad((side, vert) => actions.spin(side, vert));
   el.querySelector('.pad-slot')!.prepend(pad.el);
   el.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((b) => b.addEventListener('click', () => actions.preset(b.dataset.p as 'stun')));

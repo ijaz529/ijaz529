@@ -2,6 +2,11 @@ import { expect, test, type Page } from '@playwright/test';
 import { changedFrac, gridDiff, regionStats, tableBox } from './pixels';
 
 /** Feature 002 US1: the 3D practice table (falls back to the 2D table without WebGL2). */
+
+// SwiftShader draws every frame in software. At the Pixel 7's device pixel ratio (2.625) a frame took
+// 0.6–3.3 s under CPU load and the camera-preset and replay tests flaked (wave-2a item 16); the
+// iPhone SE and iPad projects already run at 1. The layout in CSS px stays the phone's.
+test.use({ deviceScaleFactor: 1 });
 type V2 = { x: number; y: number };
 type Hook = {
   state: {
@@ -137,6 +142,8 @@ test.describe('3D practice table (feature 002 US1)', () => {
   });
 
   test('tap a ball and a pocket → plan; camera presets switch the view', async ({ page }) => {
+    // Software rendering under load: every wait below gets 15 s (a camera transition is several frames).
+    test.setTimeout(120_000);
     const play = page.locator('.vc-play');
     await expect(play).toBeDisabled();
     await planB1(page);
@@ -144,6 +151,11 @@ test.describe('3D practice table (feature 002 US1)', () => {
     // The provisional stroke is replaced by the recommended one a moment later (its label and cue-ball
     // path change): compare pictures of the final plan only.
     await expect(page.getByTestId('shot-card')).toContainText('recommended for position', { timeout: 20_000 });
+    // Under CPU load the device evaluation budget is small and the recommendation can come back
+    // "fragile", with a 3.6 s toast over the top of the stage: the first picture must not hold it
+    // while the one taken back in Overview does not (gridDiff 5.4 in 2 of 5 iPhone SE runs).
+    await recommendedPlan(page);
+    await expect(page.locator('#toast')).toBeHidden({ timeout: 15_000 });
     await settled(page);
     expect(await camera(page)).toBe('overview');
     const box = { x: 0, y: 0, width: page.viewportSize()!.width, height: Math.round(page.viewportSize()!.height * 0.6) };
@@ -158,8 +170,8 @@ test.describe('3D practice table (feature 002 US1)', () => {
     for (const [name, id] of presets) {
       const btn = page.getByRole('button', { name });
       await btn.click();
-      await expect(btn).toHaveAttribute('aria-pressed', 'true');
-      await expect.poll(() => camera(page)).toBe(id);
+      await expect(btn).toHaveAttribute('aria-pressed', 'true', { timeout: 15_000 });
+      await expect.poll(() => camera(page), { timeout: 15_000 }).toBe(id);
       await settled(page);
       seen[id] = await regionStats(page, box);
     }
@@ -167,10 +179,11 @@ test.describe('3D practice table (feature 002 US1)', () => {
     expect(gridDiff(top, seen.player!)).toBeGreaterThan(6);
     expect(gridDiff(seen.player!, seen.broadcast!)).toBeGreaterThan(6);
     expect(gridDiff(top, seen.overview!)).toBeLessThan(3);
-    await expect(play).toBeEnabled();
+    await expect(play).toBeEnabled({ timeout: 15_000 });
   });
 
   test('Play shot replays the simulated shot to the end and leaves the layout untouched', async ({ page }) => {
+    test.setTimeout(120_000);
     await planB1(page);
     // Replay the final plan: the recommended stroke landing during a replay is a new plan, which stops
     // the replay first (spec edge case, tested below), so wait for it.
@@ -178,21 +191,30 @@ test.describe('3D practice table (feature 002 US1)', () => {
     const before = await balls(page);
     const box = await tableBox(page);
     const still = await regionStats(page, box);
+    // The page notes, frame by frame, that the replay ran: polling from the test can miss a short one
+    // when the software renderer is slow.
+    await page.evaluate(() => {
+      const w = window as unknown as { __cuesight: Hook; __sawPlaying: boolean };
+      w.__sawPlaying = false;
+      const tick = () => (w.__cuesight.view3d!.isPlaying() ? (w.__sawPlaying = true) : requestAnimationFrame(tick));
+      requestAnimationFrame(tick);
+    });
     await page.getByRole('button', { name: 'Play shot' }).click();
     // During the replay the picture differs from the still plan (the plan lines hide, balls roll).
     let sawPlaying = false;
     let moved = 0;
-    for (const t0 = Date.now(); Date.now() - t0 < 10_000 && moved <= 0.004; ) {
+    for (const t0 = Date.now(); Date.now() - t0 < 15_000 && moved <= 0.004; ) {
       const now = await playing(page);
       if (!now && sawPlaying) break;
       sawPlaying ||= now;
       if (now) moved = Math.max(moved, changedFrac(still, await regionStats(page, box)));
     }
+    sawPlaying ||= await page.evaluate(() => (window as unknown as { __sawPlaying: boolean }).__sawPlaying);
     expect(sawPlaying).toBe(true);
     expect(moved).toBeGreaterThan(0.004);
     // ×1 speed, capped at 4 s, plus the strike and the hold: finishes on its own.
-    await expect.poll(() => playing(page), { timeout: 12_000, intervals: [250] }).toBe(false);
-    await expect(page.getByRole('button', { name: 'Play shot' })).toBeEnabled();
+    await expect.poll(() => playing(page), { timeout: 20_000, intervals: [250] }).toBe(false);
+    await expect(page.getByRole('button', { name: 'Play shot' })).toBeEnabled({ timeout: 15_000 });
     expect(await balls(page)).toEqual(before);
     await expect(page.getByTestId('cut')).toHaveText('30.0°');
     // Right after a replay ends by itself, Play ignores taps briefly (REPLAY_TAP_GUARD_MS = 350 ms)
@@ -203,11 +225,11 @@ test.describe('3D practice table (feature 002 US1)', () => {
     // so the tap lands while the replay is still running.
     for (const skip of [() => page.locator('.vc-play').click({ force: true }), () => page.keyboard.press('Escape')]) {
       await page.getByRole('button', { name: 'Play shot' }).click();
-      await expect.poll(() => playing(page)).toBe(true);
-      await expect(page.locator('.vc-play')).toHaveAttribute('aria-label', 'Skip the replay');
+      await expect.poll(() => playing(page), { timeout: 15_000 }).toBe(true);
+      await expect(page.locator('.vc-play')).toHaveAttribute('aria-label', 'Skip the replay', { timeout: 15_000 });
       await skip();
-      await expect.poll(() => playing(page), { timeout: 5_000 }).toBe(false);
-      await expect(page.getByRole('button', { name: 'Play shot' })).toBeVisible();
+      await expect.poll(() => playing(page), { timeout: 15_000 }).toBe(false);
+      await expect(page.getByRole('button', { name: 'Play shot' })).toBeVisible({ timeout: 15_000 });
       // Not restarted by a late tap.
       await page.waitForTimeout(300);
       expect(await playing(page)).toBe(false);
@@ -277,6 +299,10 @@ test.describe('3D practice table (feature 002 US1)', () => {
   test('idle: no animation frames and no GL draws without interaction (FR-109, SC-101)', async ({ page }) => {
     await planB1(page);
     await expect(page.getByTestId('shot-card')).toContainText('recommended for position', { timeout: 20_000 });
+    // A "fragile" recommendation (small evaluation budget under CPU load) shows a toast that clears
+    // itself 3.6 s later through a store update, which asks for one frame: let it go first.
+    await recommendedPlan(page);
+    await expect(page.locator('#toast')).toBeHidden({ timeout: 15_000 });
     await settled(page);
     // Count from here on: requestAnimationFrame is looked up on window by every loop, and every 3D draw
     // goes through the WebGL2 prototype.

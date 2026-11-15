@@ -9,6 +9,7 @@
  */
 import { describeSpin, speedWord } from '../core/shot/power';
 import type { PocketId, ShotPlan } from '../core/types';
+import { isFrozenPlan } from './render/plan-draw';
 
 export const ANNOUNCE_DEBOUNCE_MS = 600;
 
@@ -24,7 +25,10 @@ export function planSentence(p: ShotPlan, names: Partial<Record<PocketId, string
   const short = p.warnings.find((w) => w.code === 'cb-short');
   if (short) return `${ball} to the ${pocket}: ${short.message}`;
   const pw = Math.round(p.stroke.power * 10) / 10;
-  return `${ball} to the ${pocket}: cut ${p.cutAngleDeg.toFixed(0)} degrees, ${p.fractionPhrase}.${p.strokeName ? ` ${p.strokeName}.` : ''} Power ${pw} of 10, ${speedWord(p.stroke.power)}. Strike ${describeSpin(p.stroke)}.`;
+  // A frozen cue ball has no cut or ghost ball (the core's cut 0 / 'full' are conventions): the
+  // 'frozen' warning, spoken next, says which way to stroke.
+  const aim = isFrozenPlan(p) ? 'frozen to the cue ball, no ghost ball' : `cut ${p.cutAngleDeg.toFixed(0)} degrees, ${p.fractionPhrase}`;
+  return `${ball} to the ${pocket}: ${aim}.${p.strokeName ? ` ${p.strokeName}.` : ''} Power ${pw} of 10, ${speedWord(p.stroke.power)}. Strike ${describeSpin(p.stroke)}.`;
 }
 
 export interface Announcer {

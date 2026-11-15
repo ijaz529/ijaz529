@@ -11,6 +11,7 @@
 import { describeSpin } from '../../core/shot/power';
 import type { PocketId, ShotPlan, Stroke, TableSpec, Vec2, Vec3 } from '../../core/types';
 import { projectBallOutline, strikePoint, type CameraPose } from '../../vision/player-view';
+import { aimLine, fractionTile, frozenStroke, isFrozenPlan, stickDir } from '../render/plan-draw';
 
 /** Cue-tip radius used to size the strike dot (a 13 mm tip). ASSUMPTION: typical pool tip. */
 export const TIP_RADIUS_M = 0.0065;
@@ -305,9 +306,10 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   const C = cameraCenter(pose);
   const cue3 = on(i.cue, R);
   // The cue itself points along the squirt-corrected direction (equal to aim without side spin).
-  const cd = plan.cueDir ?? plan.aimDir;
-  const cdL = Math.hypot(cd.x, cd.y) || 1;
-  const cueDir = { x: cd.x / cdL, y: cd.y / cdL };
+  const cueDir = stickDir(plan);
+  // The aim line on the cloth: cue ball → ghost ball; a frozen cue ball has no ghost ball, so the
+  // stroke along aimDir from the cue ball, past the object ball.
+  const aimL = aimLine(plan, i.cue, R, { hx: table.length / 2, hy: table.width / 2 });
 
   // Lines on the cloth disappear where the cue ball or the target hides the cloth from the camera
   // (the ball itself is what the player sees there); where any other ball hides them, the stretch is
@@ -317,8 +319,8 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   const others = (i.others ?? []).map((p) => on(p, R));
   const hide = others.length ? (p: Vec3) => occluded(C, p, others, R) : undefined;
   const none = { visible: [] as Vec2[][], hidden: [] as Vec2[][] };
-  // Aim line on the cloth: from under the cue ball to under the ghost ball.
-  const aimS = splitPolyline(pose, [on(i.cue), on(plan.ghost)], 0.004, drop, hide);
+  // Aim line on the cloth: from under the cue ball to under the ghost ball (or along the stroke).
+  const aimS = splitPolyline(pose, [on(aimL.from), on(aimL.to)], 0.004, drop, hide);
   const obPts = plan.objectPath.points.map((p) => on(p));
   const cbPts = plan.cuePath.points.map((p) => on(p));
   const obS = obPts.length >= 2 ? splitPolyline(pose, obPts, 0.01, drop, hide) : none;
@@ -328,7 +330,7 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   const cuePath = cbS.visible;
   const hidden = { aim: aimS.hidden, objectPath: obS.hidden, cuePath: cbS.hidden };
 
-  const ghost = projectBallOutline(pose, on(plan.ghost, R), R);
+  const ghost = aimL.ghost ? projectBallOutline(pose, on(aimL.ghost, R), R) : [];
   const target = i.target ? projectBallOutline(pose, on(i.target, R), R) : [];
   const cueBall = projectBallOutline(pose, cue3, R);
 
@@ -347,8 +349,8 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
 
   const cc = toCam(pose, { x: plan.contactPoint.x, y: plan.contactPoint.y, z: R });
   const contact = cc.z > NEAR ? pix(pose, cc) : null;
-  const gc = toCam(pose, on(plan.ghost, R));
-  const ghostCenter = gc.z > NEAR ? pix(pose, gc) : null;
+  const gc = aimL.ghost ? toCam(pose, on(aimL.ghost, R)) : null;
+  const ghostCenter = gc && gc.z > NEAR ? pix(pose, gc) : null;
   const ccam = toCam(pose, cue3);
   const cueCenter = ccam.z > NEAR ? pix(pose, ccam) : null;
   const dCue = Math.hypot(ccam.x, ccam.y, ccam.z);
@@ -491,4 +493,19 @@ export function unplayableHeadline(plan: Pick<ShotPlan, 'makeable' | 'warnings' 
   const w = plan.warnings.find((x) => x.code === 'not-makeable') ?? plan.warnings.find((x) => x.code === 'blocked-cue' || x.code === 'blocked-object');
   const reason = (w?.message ?? 'No clean path to this pocket.').replace(/^Not makeable: /, '').replace(/ Try the [^.]+\.$/, '');
   return { title: 'Not makeable', reason: reason.charAt(0).toUpperCase() + reason.slice(1), altPocketId: plan.alternatives[0]?.pocketId ?? null };
+}
+
+/**
+ * The Snap HUD's aim line in player words: "Aim at the ghost ball · 36° cut, ⅜+ ball" (the card's
+ * tile wording, one short line), or for a frozen cue ball, which has no ghost ball, the stroke the
+ * coaching tip asks for: "Frozen: stroke 12° left of the line of centres" / "Frozen: stroke
+ * straight through the line of centres". `cue` is the cue-ball centre (default: the frozen plan's
+ * ghost, which the core puts on the cue ball).
+ */
+export function aimHudText(plan: Pick<ShotPlan, 'cutAngleDeg' | 'fractionLabel' | 'fractionPhrase' | 'warnings' | 'aimDir' | 'contactPoint' | 'ghost'>, cue: Vec2 = plan.ghost): string {
+  if (isFrozenPlan(plan)) {
+    const f = frozenStroke(plan, cue);
+    return f.side === 'straight' ? 'Frozen: stroke straight through the line of centres' : `Frozen: stroke ${f.deg}° ${f.side} of the line of centres`;
+  }
+  return `Aim at the ghost ball · ${plan.cutAngleDeg.toFixed(0)}° cut, ${fractionTile(plan).replace(/-/g, '\u2011')}`;
 }
