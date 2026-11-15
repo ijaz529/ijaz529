@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "fixtures": "tsx scripts/make-fake-camera.ts",
+    "fixtures": "tsx scripts/make-fake-camera.ts && tsx scripts/make-snap-fixtures.ts",
     "e2e": "npm run fixtures && vite build && playwright test --trace off",
     "icons": "node scripts/make-icons.cjs",
     "cap:sync": "vite build && cap sync ios",

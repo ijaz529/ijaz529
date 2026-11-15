@@ -81,6 +81,11 @@ test('works offline after the first load, with zero external requests @offline @
   const page2 = await context.newPage();
   await page2.goto('/?mode=practice');
   await expect(page2.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+  // The bundled Snap sample photos were never fetched online: they are precached with the build (T161).
+  await page2.locator('.mode-switch [data-mode="snap"]').click();
+  await page2.getByRole('button', { name: 'Try it with sample photos' }).click();
+  await page2.waitForFunction(() => ['review', 'overview-error'].includes((window as unknown as { __cuesight: Hook }).__cuesight.state.snap.step), null, { timeout: 45_000 });
+  expect(await page2.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.snap.step)).toBe('review');
   await page2.close();
 
   await context.setOffline(false);
