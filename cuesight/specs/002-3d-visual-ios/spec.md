@@ -325,19 +325,42 @@ appear in TestFlight.
   below the photo — tilt up a little") and shows the strike point on the shaded spin ball instead.
 - Cue ball **not visible** in the player photo → the pose can still come from other balls and the
   cushions. The aim line and ghost ball are drawn. The strike point is shown on the spin ball, with
-  the message "Include the cue ball in the photo to see where to strike it".
+  the message "Include the cue ball in the photo to see where to strike it". *Not yet met on
+  `rc/release`*: a photo without the cue ball is not fitted from the other balls; it fails with "I
+  can't find the cue ball…" (or "I couldn't line up this photo…") and offers the two taps.
 - Target ball hidden behind another ball in the player photo → the aim line and ghost ball are still
   drawn from the known layout, and the hidden part of the path is dashed and labelled "hidden".
 - **Low light** or a noisy photo → detection confidence falls. The app shows low confidence, suggests
   more light or a steadier phone, and offers the two-tap fallback. It never draws a guide it trusts
-  less than the threshold as if it were right.
+  less than the threshold as if it were right. The reasons say which: "The photo is too dark to read
+  the table…" only for a dark photo or a dim cloth, and "The photo is too grainy to read the table…"
+  only when sensor noise is what defeats the fit (cloth texture is not noise). Snap shows the reason,
+  suggests a better photo and still offers the two taps.
+- A photo with **no table cloth** in view (a wall, the floor, the photo aimed too high) → "I can't
+  find the table cloth in this photo. Aim along your shot so more of the cloth is in view." The two
+  taps are still offered. A grey cloth is found like any other colour.
 - **Different zoom between the two photos** (for example 1× for the table, 0.5× or 2× for the player
   photo) → the focal length is re-estimated for the player photo. The table photo's focal length is
-  only a soft hint, so a lens change does not break the fit.
+  only a soft hint, so a lens change does not break the fit: the fit sweeps the phone lenses
+  (HFOV ≈ 110° to 26°) and its focal prior is heavy-tailed around the hint.
 - The player photo is not taken from behind the cue ball (for example from the far side) → the fit
   can still succeed. The app says "You're not behind the cue ball" and still draws the guide.
 - Balls moved between the two photos → the fit is poor or contradicts the layout. The app says "The
-  balls seem to have moved — retake the table photo".
+  balls seem to have moved — retake the table photo". This also stops a fit that would otherwise be
+  good, when the target, the cue ball or any other ball is no longer where the table photo put it
+  (FR-121). Snap then asks for a new table photo (Retake the table photo, or Start over) and does not
+  offer the two taps, because a guide from the old layout would be wrong. Limits: a target
+  camouflaged in the cloth (green on green) cannot be seen to be gone; when the whole layout moved
+  around a cue ball that stayed, about a third of the photos say "I couldn't line up this photo"
+  instead.
+- Snap reason → next step (`snap/session.ts` `playerFailAction`): "moved" → retake the table photo;
+  too dark, too grainy, no cloth → a better photo, with the two taps still offered; no cue ball, too
+  few balls (fewer than three ball circles in the photo), no fit → the two taps. A failed fit never
+  reports a confidence of 0.5 or more.
+- Table photo **from video frames** (the in-app camera's frame, whose colour is often 4:2:0
+  upsampled bilinearly) → ball detection reads the chroma's transition width and widens its
+  dilation ring by itself (001 research R-04). Limit: on 960-px frames from such video the snooker
+  end view loses a red that shows 28 % of its outline in 5 of 6 calibrations.
 - Photo orientation → the app reads the photo's EXIF orientation itself and neutralises the tag
   before decoding, so no decoder turns the photo twice. Portrait and landscape photos are both
   upright.
@@ -597,6 +620,15 @@ appear in TestFlight.
   succeeds:
   - the drawn ghost-ball centre is within 1.5 % of the image diagonal of ground truth;
   - the strike dot is within 0.1 R of the true strike point on the ball's face.
+
+  *Met on `rc/release`* (the player-photo merge `0a30cf5`): ≈ 95 % of 912 envelope photos with
+  enough balls in view line up within tolerance, with and without the app's hints, and there are
+  0 SC-107 violations (research R-24). `tests/integration/player-view-envelope.test.ts` asserts
+  ≥ 90 % over its L18 grid of the envelope (with roll ±10° and occlusion added) and no ok fit
+  outside tolerance on any photo. A 960×720 photo takes ≈ 104 ms (median) and ≈ 250 ms (p95) on
+  Node. The remaining limits (untinted grey cloth, a charcoal cloth in a dark room, a camouflaged
+  target, rare strike-dot residuals and false "moved", the cue ball out of frame) are in R-24 and
+  the README.
 - **SC-107**: Honest failure. No synthetic player-photo scene reports success with a ghost-ball error
   above 3 % of the image diagonal. Every scene that fails gives a player-facing reason.
 - **SC-108**: With two manual taps within 1.5 % of the image diagonal of the true ball centres, the

@@ -87,7 +87,7 @@ the correction is stated in the decision itself.
   - Hough lines: more parameters, slower, and fragile with the rail diamonds.
   - Asking the user to calibrate: kept as the fallback (FR-003), not the default.
 
-## R-04 Ball-height parallax correction
+## R-04 Ball-height parallax correction and ball detection
 
 - **Decision**: decompose the homography into pose (r₁, r₂, r₃, t) using the estimated K. Build the
   homography of the plane at ball-centre height, H_R = H + s·(R − h)·K·r₃, and **rectify the image
@@ -96,6 +96,123 @@ the correction is stated in the decision itself.
   biases positions by ≈ R·cot(elevation), about 3 cm, which breaks SC-003. Rectifying at z = R
   removes that bias to first order.
 - **Alternatives rejected**: ignoring it (fails accuracy); per-ball ray–sphere fitting (heavier, small gain).
+
+### Ball detection (`vision/ball-detect.ts`)
+
+*Revised 2026-11-15 for the ball-cluster merge (`360b268`, from `fix1b/vclusters` `d66694b`; T074).*
+
+- **Decision**:
+  1. **Rectify and de-stretch.** Through H_R a ball's silhouette is a blob centred on its true
+     (X, Y), elongated by ≈ 1/sin(elevation) toward the camera. Scaling the along-view axis by
+     sin(elevation) turns every silhouette into a disc of radius R.
+  2. **Mask.** Non-cloth pixels: the table detector's loose cloth test, tightened by the cloth's own
+     saturation spread (so cloth-hued balls stand out), plus the blend seams inside a cloth-coloured
+     stripe. Pixels a near cushion hides and dark hole pixels in the pocket throats are *unknown*
+     (neither ball nor cloth).
+  3. **Blobs.** Connected blobs, small holes filled, long thin attachments (a cue stick) stripped.
+  4. **Count each cluster by model selection over k.** A k-disc fit costs the whole-cluster residual
+     (blob cells left uncovered plus cloth cells covered, the mask sampled once per rectified px
+     along the view) plus a toll per ball (`DISC_GAIN` 0.1 · πR², at least 6 cells). The search
+     grows past the toll (while one more disc saves at least `GROW_FRAC` 0.25 of it, and up to
+     `GROW_PAST` 3 discs beyond the first count where it no longer pays the whole toll), then prunes
+     back by backward elimination (`PRUNE_BELOW` 2 below that count). Every count visited is kept,
+     and the least penalised cost wins. Insertions start at the deepest uncovered cell and at the
+     residual's matched-filter peaks (`N_PEAKS` 4). Leave-one-out: a ball the cluster can do without
+     once its neighbours re-settle (within one toll) is not counted. Centres split from one blob stay
+     at least `MIN_SEP_SPLIT` 1.5 R apart (real balls are 2R apart; the fit's lattice can shave a
+     little).
+  5. **A forgiven dilation ring.** A coloured silhouette bleeds a fraction of a pixel into the cloth
+     (more on video). When the frame has a coloured single ball, its dilation is measured. Otherwise
+     the discs keep the true radius, and the mask's outer ring, as wide as a coloured silhouette may
+     have grown, is evidence neither way. The ring is only the mask's outer layer, so interior
+     evidence is kept, and there is no size to choose, so no knife edge between two sizes. The ring
+     width comes from the chroma around the cluster (`chromaBand`, over the cluster's image bounding
+     box plus 2 px), from two readings independent of the content and contrast:
+     - the 2×2-block parity of the chroma differences (≈ 0 for 4:2:0 upsampled by replication, 0.4–1
+       otherwise);
+     - the chroma transition width, lag-2 over lag-1 energy (a step reads 2, a ramp of width w reads
+       4 − 2/w; full-resolution chroma 2.5–2.9, bilinear 4:2:0 3.4–3.7).
+
+     Ring = 0.33 image px (`BAND_SHARP`), moving toward 0.6 (`BAND_VIDEO`) as the parity falls below
+     `PARITY_FULL` 0.6, and toward 0.8 (`BAND_SMOOTH`) as the width goes from 3.0 to 3.5
+     (`WIDTH_FULL`, `WIDTH_VIDEO`), whichever is wider. It changes continuously, so a frame between
+     two kinds gets a ring between the two. The camera and Snap paths need no setting: when video
+     reaches the detector with smoothly upsampled chroma (a GPU or canvas YUV → RGB conversion, Snap
+     from ≤ 960-px video), the detector reads the width and widens the ring itself.
+  6. **Small packs on their own window.** A cluster seen at less than `RP_FIT` 7 px of ball radius is
+     rectified again, finer, in its own window (margin `WIN_MARGIN` 3 R) and fitted there: at 4–5 px
+     the scallops between touching balls are ≲ 1 px deep and the fit cannot tell which ball a slice
+     of the outline belongs to. The window pass has its own scratch set, so the whole-table pass's
+     buffers stay intact. `DetectedBall.px` is always in whole-table rectified pixels.
+  7. **Circles, gate, names.** A circle is fitted to each ball's visible silhouette boundary
+     (occluded and unknown edges excluded). The shape gate (fill, aspect, size, shading, width across
+     the view) rejects lamp glare and sticks. Colours are named from the table's palette.
+  8. **Cue ball by rim geometry.** The cue is the whitest *complete* ball with a clear margin (0.15)
+     over the runner-up, or none. A white ball whose rim against the cloth leaves an opposite pair of
+     directions hidden (`enclosedRim`: 32 direction bins, `ENC_MIN` 1 pair) is ambiguous: a stripe
+     whose band is out of sight (a rack's back row shows only its caps) looks the same, because a
+     band reaches the rim at two opposite points. The cue is then chosen among the unambiguous
+     candidates, and an ambiguous ball is the cue only when no other ball is white. A cue ball partly
+     behind one object ball is hidden on one side only, so it stays a candidate.
+  9. **Grow-only scratch.** All per-pixel work runs on module-level typed arrays, reused across
+     frames and grown only when a frame needs more (Constitution IV). The hole fill and the thin-part
+     strip grow their work queue instead of skipping, so a frame gives the same detections whatever
+     frame came before (Constitution III, `ball-detect-determinism.test.ts`).
+- **Rationale**: the wave-1 count grew one disc at a time while each disc paid its own toll. A
+  0.1–0.3 px change of the table corners (vision-geometry's refined outline, no less accurate) moved
+  that knife edge: 6 cluster and pair tests failed (P-C1), and ±0.3 px of corner jitter changed the
+  count by up to 3. Choosing on the whole cluster's penalised cost is stable under that error. Failing
+  calibrations out of 62 per scene (auto, exact and 60 jittered at ±0.15–1 px), wave-1 → now:
+  - 9-ball: end 18 → 11, side 6 or more → 0, corner 56 → 0;
+  - 15-ball: end 19 → 7, side 53 → 0, corner 7 → 0;
+  - snooker: end 38 → 6, side 48 → 0, corner 31 (12 phantoms) → 5, overhead 1 → 0; mirrored corner
+    19 (11 phantoms) → 6;
+  - 3-ball rows end-on in the corner view: 3 and 6 → 0 and 0;
+  - phantoms next to a cluster: 23 → 0.
+
+  Measured oracle dilations (the mask's best-fitting disc radius minus R, exact calibration): RGB
+  red packs 0.36–0.41 image px; 640-px grabs of bilinear video 0.48–0.56; 960-px Snap frames from
+  1280-px bilinear video 0.69–0.76; bilinear 4:2:0 at the processing size 0.81–0.97. Cue identity:
+  beside a rack the real cue is flagged in 377 of 392 runs (wave-1 308), and no object ball is
+  flagged anywhere (wave-1: 10, 27 and 14 runs in three of the sets).
+
+  Fixture accuracy is unchanged (within 0.2 mm of wave-1 on every printed line). Cost: a frame with a
+  snooker pack spends about 10–20 ms more in `detectBalls` (≈ 45–56 ms against 35–40 ms on Node) for
+  the window pass; pool frames and frames without a cluster are unchanged or faster. The 4:2:0 rack
+  stage stays at ×1.7–1.8 of the fixture frame (guard 2.25×).
+- **Measured limits** (Constitution II; the `ball-detect.ts` header has the full list):
+  - a ball (almost) entirely inside its neighbours' silhouettes (under 15 % of its outline) cannot be
+    counted; the tests allow those per view, by ray cast (spec.md SC-003 notes);
+  - under jittered calibrations the end views lose one ball at 28–56 % of its outline in 6–11 of 60
+    (a pool pack's green 6 or black 8, a snooker row-2 end ball), and the snooker corner views reach
+    a 10–12 mm median in 5–6 of 60; the auto and exact calibrations are not affected;
+  - the 15-ball end view under the exact calibration loses the green 6 (29 %, green on green): two
+    13-ball fits differ by 14 mask samples against a toll of 33 (the auto calibration and wave-1 find
+    it);
+  - 4:2:0 snooker packs in the end, corner and mirrored corner views lose or misplace 3–5 reds
+    (25–40 mm, medians 15–18 mm; wave-1 17–20 mm): about one chroma sample per ball radius. Phantoms
+    next to the pack over 62 calibrations × replicated, YUV and bilinear chroma: end 119, corner 151,
+    mirrored corner 167 (wave-1 141, 199, 211);
+  - 960-px Snap frames from bilinear video: the snooker end view loses a 28 %-visible red in 5 of 6
+    calibrations (wave-1 3);
+  - with corner error a pocket's hole can fall outside its throat mask and read as a dark ball in the
+    pocket, 0.6–1 m from any ball (2 of 1798 fresh-seed runs at ±0.3 and ±0.5 px; more at ±1–2 px);
+  - a green stripe on green cloth in far 4:2:0 views can still be flagged as the cue (1 of 216
+    jittered runs);
+  - grey-cloth detection of the white cue ball and light stripes (Live and Snap table photos) is not
+    part of this merge.
+- **Alternatives rejected** (measured on the 20- or 62-calibration sweeps):
+  - lower tolls (0.05–0.075 πR²): snooker corner phantoms in 18 of 20;
+  - relocation swaps: no gain, more cost;
+  - an edge-measured radius refit for packs: snooker side failures in 19 of 20;
+  - a sharp-dilation prior for packs (0.2 or 0.35 image px): every side view lost a ball;
+  - fitting ≤ 4-ball clusters at two sizes and choosing by cost: a 1–2-cell difference decided the
+    size and lost the middle ball of a 3-ball row end-on in 46 of 62 calibrations;
+  - a sharp ring of 0.37 or 0.40 px: 23 and 32 failing calibrations over the snooker end, corner and
+    mirrored corner views (62 each), against 18 at 0.33; a smooth ring of 0.9 px loses the end view's
+    thin crescents;
+  - the block parity alone (the previous round): blind to bilinear chroma, whose transitions are wide
+    but not blocky. 84 of 543 bilinear pair scenes failed, against 0 with the width reading.
 
 ## R-05 Cushion offset
 

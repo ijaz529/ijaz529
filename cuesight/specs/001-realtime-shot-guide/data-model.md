@@ -301,10 +301,16 @@ hint.
 
 `{ pos (table m), image (px), isCue, score 0..1, rgb [r,g,b], label, white (cue-likelihood score), px (blob pixel count) }`
 
+- **`px`** is always counted in whole-table rectified pixels, also for a cluster fitted on its own
+  finer window (research.md R-04; before the ball-cluster merge window-pass balls reported window
+  pixels). Nothing outside `ball-detect.ts` reads it today.
 - **Cue ball**: the whitest *complete* ball (own plus hidden share of its true-size silhouette),
   with a clear margin (0.15) over the runner-up. When the choice is ambiguous (no white ball, two
   whites too close to call, a stripe whose band faces away), **no** ball has `isCue`, and the app
-  should ask the player to tap the cue ball.
+  should ask the player to tap the cue ball. A white ball whose rim against the cloth is hidden in
+  an opposite pair of directions (walled in by a rack's balls: a stripe whose band is out of sight
+  looks the same) is set aside: the cue is chosen among the other candidates, and the walled-in one
+  is the cue only when no other ball is white.
 - **Labels**: 'cue', 'white?' (a white ball that was not picked as the cue), 'black', or a palette
   name.
   - Pool palette: red, maroon, orange, yellow, green, blue, purple, with a " stripe" suffix for

@@ -224,7 +224,11 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   check). Low detection quality is shown.
 - Non-green cloth (blue, red, grey) → the cloth colour is learned from the table centre, not assumed.
 - Balls touching each other or frozen to a cushion → each ball is still detected separately. A plan
-  with the object ball frozen to the rail is still computed.
+  with the object ball frozen to the rail is still computed. A ball hidden almost entirely inside
+  its neighbours' outline (the middle of a pack seen from low down) is not invented (Constitution II;
+  the allowances are in the SC-003 notes). A white ball walled in by a rack's balls on opposite
+  sides could be a stripe whose band is out of sight, so it is the cue ball only when no other ball
+  is white.
 - Cue ball not found, or several white-ish candidates → the player is asked to tap the cue ball.
   The hint says 'No cue ball found — tap “Cue ball”, then tap the cue ball.', or, with two whites too
   close to call (both "white?"), 'Two white balls — tap “Cue ball”, then tap the one you play with.'.
@@ -406,6 +410,34 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 - **SC-003**: On reference table layouts with known ground truth, detected ball positions are within 1 cm
   (median) and 2.5 cm (95th percentile) of the true positions. The table outline is within 1.5 % of the
   image diagonal.
+  - *Touching clusters (2026-11-15, the ball-cluster merge `360b268`, T074).* The 3-, 9- and 15-ball
+    racks and the 15-red snooker pack in the end, side, corner and overhead views, the mirrored
+    snooker corner view and 3-ball rows end-on are verified under **62 calibrations per scene**: the
+    table detector's (auto), the camera's exact one, and 60 with the exact corners jittered by
+    ±0.15–1 px (`ball-detect-edge.test.ts`, `ball-detect-clusters.test.ts`; helpers in
+    `ball-detect-helpers.ts`). A perfect detector's position under each jittered calibration is the
+    reference, so the detector is not charged for the calibration's own error.
+  - No phantom ball next to a cluster under any of the 62. Under auto and exact every criterion holds:
+    every ball with at least 25 % of its outline its own is found (asserted per ball), median ≤ 10 mm,
+    p95 ≤ 25 mm (30 mm next to an uncounted ball, whose neighbours absorb a little of it).
+  - **Hidden-ball allowances** follow ray-cast visibility: a ball with under 15 % of its outline its
+    own may be missed. The test checks that each allowance never exceeds the number of such balls and
+    that no ball lies between 15 % and 25 %. Allowances: 9-ball end and corner 1; 15-ball end 3 and
+    corner 3 (six balls at 6–13 %; raised from 2); snooker end 3 (#5, #8 and #9 at 9 %, about 2 image
+    px each; raised from 2), corner 3 and mirrored corner 3; every other view 0.
+  - **Jittered calibrations**: at most `jitterFails` of the 60 per view may lose one more ball at
+    28–56 % of its outline or exceed a 10 mm median: 9-ball end 11, 15-ball end 7, snooker end 6,
+    snooker corner 5, mirrored snooker corner 6; every other view 0.
+  - **One recorded exception** (`KNOWN_VISIBLE_MISS`): the 15-ball end view under the exact
+    calibration misses the green 6 (29 % of its outline, green on green). The wave-1 detector and the
+    auto calibration find it. The two raised allowances and this exception were accepted with the
+    merge and are recorded here for the spec owner to revisit.
+  - Video: bilinear 4:2:0 pair matrices, and snooker packs on replicated, YUV and bilinear chroma
+    under the 62 calibrations, bounded by the wave-1 detector's phantoms and visible misses (the
+    packs' measured limits are in research.md R-04). The cue-identity floors beside racks and behind
+    an object ball are the wave-1 detector's measured counts, and no object ball may be flagged.
+  - Determinism: the same frame and calibration give the same detections whatever frame came before
+    (`ball-detect-determinism.test.ts`).
 - **SC-004**: On reference shots, predicted aim, cue-ball deflection (stun and rolling), throw and squirt
   match published billiards physics within 0.5°–1° in the ideal-ball limit the formulas assume. With
   realistic ball properties, deviations from those idealised rules stay within 4°.

@@ -5,8 +5,8 @@ are SI internally.
 
 **Revised 2026-11-15** to match `fix2b/app`. The TypeScript sources of truth are
 `src/app/render3d/index.ts`, `src/app/render3d/camera.ts`, `src/app/render3d/gestures.ts`,
-`src/app/snap/session.ts`, `src/app/snap/guide.ts`, `src/vision/player-view.ts` and
-`src/workers/protocol.ts`.
+`src/app/snap/session.ts`, `src/app/snap/guide.ts`, `src/vision/player-view.ts` (with
+`src/vision/player-detect.ts` since the player-photo merge) and `src/workers/protocol.ts`.
 
 ## Coordinate frames
 
@@ -152,8 +152,9 @@ table photo's tracked balls).
 | `balls` | KnownBall[] | ≥ 1, exactly one with `isCue` |
 | `cueId` | string | must match the `isCue` ball |
 | `targetId` | string? | sets the yaw hypotheses and the confidence point (ghost ball) |
-| `focalPx` | number? | soft prior (σ log f = 0.15); otherwise a 65° HFOV prior (σ = 0.6) |
+| `focalPx` | number? | a soft hint: the player may switch lens (0.5×–3×) for this photo. A heavy-tailed (Cauchy) prior on log f, σ = 0.1 near the hint; otherwise a 65° HFOV Gaussian prior (σ = 0.5). A lens sweep seeds the hypotheses either way (R-24) |
 | `manualTaps` | `{ cue: Vec2; target: Vec2 }`? | image px. Switches to the R-25 fallback |
+| `clothHint` | ClothModel \| null? | the table photo's cloth (`VisionResult.cloth`, chromatic or neutral). Its candidate is tried first when this photo shows a plausible region of it; a neutral model's hue is never read |
 
 ### CameraPose
 
@@ -169,24 +170,32 @@ table photo's tracked balls).
 
 | Field | Type | Notes |
 |---|---|---|
-| `ok` | boolean | confidence ≥ 0.5 and the residual and match rules of R-24 |
+| `ok` | boolean | confidence ≥ 0.5 and the residual, match and identity rules of R-24 (contracts/player-view-api.md § Decide) |
 | `pose` | CameraPose \| null | may be non-null with `ok = false` (low-confidence pose, for display hints only) |
-| `confidence` | 0..1 | capped at 0.7 for the manual fallback |
-| `residualPx` | number | robust RMS of the ball-centre residuals |
+| `confidence` | 0..1 | capped at 0.7 for the manual fallback with fewer than 3 balls matched; always < 0.5 when `ok` is false |
+| `residualPx` | number | robust spread (1.4826 × median) of the ball-silhouette crack-point residuals, px; `Infinity` when no fit was made |
 | `matched` | `{ id, image, radiusPx }[]` | balls found in the photo and their ids |
 | `reason` | string? | player-facing, present when `!ok` (see below). Also used for "not behind the cue ball" warnings when `ok` |
 | `ms` | number | solver time |
 
-Reason messages (the canonical wording; the app shows them verbatim):
+Reason messages (`PLAYER_VIEW_REASONS`, the canonical wording; the app shows them verbatim). *Revised
+2026-11-15 for the player-photo merge (`0a30cf5`) and the Snap app (`9a162bf`).* Each reason names
+its true cause (Principle II). The last column is what Snap does next (`snap/session.ts`
+`playerFailAction`, matched on the text so the app bundle does not import the vision module):
 
-| Situation | `reason` |
-|---|---|
-| fewer than 2 balls matched | "I can't see enough balls. Include the cue ball and at least two others." |
-| the layout contradicts the photo | "The balls seem to have moved. Retake the table photo." |
-| too dark or no cloth found | "The photo is too dark to read the table. Add light or hold the phone steady." |
-| cue ball not matched | "I can't find the cue ball. Tap the cue ball, then your target." |
-| camera far from the shooter's position | "You're not behind the cue ball. The guide is drawn from where you stood." (a warning; `ok` may be true) |
-| solver did not converge | "I couldn't line up this photo. Tap the cue ball, then your target." |
+| Key | Situation | `reason` | Snap's next step |
+|---|---|---|---|
+| `tooFewBalls` | the photo holds fewer than 3 ball circles (with more circles a failed fit is `noFit` or `noCue`, however few balls the pose matched) | "I can't see enough balls. Include the cue ball and at least two others." | the two taps |
+| `moved` | the moved-ball signature: a ball the layout puts in full view on plain cloth, with a circle of its colour resting elsewhere on the bed (≥ 2.5 R from its old spot, apparent size within ×1.5 of a ball there) that the pose cannot absorb (pinning the ball to that circle costs more than ×2.5 and +100 of the robust cost), seen from a plausible camera (≤ 2 m from the cue ball, 2–80 cm high) whose pose is pinned by balls that did not move (≥ 3 sure identities or ≥ 5 matched balls, with ≥ 50 % of the cloth boundary explained or ≥ 20 % of it on the cushions; or ≥ 3 balls with crossing cushion lines and ≥ 50 % explained) and fits within the residual limit. Two balls on bare cloth with circles of their colours elsewhere count too, without the refit. FR-121: it also turns a fit that would otherwise be ok into a failure when the target or the cue ball is missing from plain cloth (on untinted grey cloth, S < 0.08, only with a circle of its colour elsewhere) or any other ball shows the signature | "The balls seem to have moved. Retake the table photo." | retake the table photo; the two taps are not offered (a guide from the old layout would be wrong) |
+| `dark` | a failed fit on a dark photo (mean V < 0.12, or more than 80 % of it nearly black) or on a dim cloth (V < 0.15); a lit photo of a lit cloth never says "too dark" | "The photo is too dark to read the table. Add light or hold the phone steady." | a better photo; the two taps are still offered |
+| `noisy` | a failed fit where sensor noise is the cause: every candidate cloth region broke into ≥ 60 noise specks per 1000 px, or no cloth region was kept and the frame's chroma σ is ≥ 4.5 (0–255). Never overrides `moved`; cloth texture is not noise | "The photo is too grainy to read the table. Add light or hold the phone steady." | a better photo; the two taps are still offered |
+| `noCloth` | a lit photo in which no candidate surface encloses a hole (no ball, no pocket) and fewer than 2 ball circles were found, or no cloth candidate at all. A cloth whose region encloses holes is a table even when its region is too small to fit: then `tooFewBalls` or `noFit` | "I can't find the table cloth in this photo. Aim along your shot so more of the cloth is in view." | a better photo; the two taps are still offered |
+| `noCue` | the cue ball not matched: no white circle of the cue ball's colour, or no pose from the white circles | "I can't find the cue ball. Tap the cue ball, then your target." | the two taps |
+| `notBehind` | camera more than 2 m from the cue ball, or more than 40° off the cue → target line. A warning on an ok fit, set only on a convincing fit; a fit that is not convincing from there fails instead (`noFit` / `noCue`) | "You're not behind the cue ball. The guide is drawn from where you stood." (`ok` is true) | the guide, with the warning |
+| `noFit` | anything else: no pose meets the rules | "I couldn't line up this photo. Tap the cue ball, then your target." | the two taps |
+
+Precedence on a failed fit: `dark` for a dark photo, then `noisy` (unless the reason is `moved`), then
+`dark` for a dim cloth, then `noCloth`, then the fit's own reason.
 
 ### Strike point
 
@@ -254,6 +263,10 @@ any ──reset (Start over, leaving Snap)──▶ intro        (photos release
   the fit on show is for the current target: `current`, `checking`, `refit` (an automatic fit for
   another target: fit again), `taps` (a two-tap fit for another target: tap again) or `none`. The
   pocket and the stroke never matter.
+- After a failed player-photo fit, `playerFailAction(reason)` gives the next step (the reason table
+  above): `retake-table` for "moved" (the step shows Retake the table photo and Start over, and
+  `manual-tap` events are ignored), `retake-light` for too dark, too grainy and no cloth (the taps
+  stay on offer next to the retake), `taps` otherwise.
 - `detectionUsable(v)` = the result has a calibration. A table found without balls still opens the
   review ("I found the table but no balls…"). A table cut off by the border that vision cannot
   complete has no calibration.

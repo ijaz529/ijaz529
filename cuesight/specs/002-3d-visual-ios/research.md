@@ -267,56 +267,109 @@ tests on synthetic fixtures must confirm or tune.
 
 ## R-24 Player-photo pose: known-layout model fitting
 
-- **Camera model**: pinhole, square pixels, principal point at the image centre, no distortion.
-  ASSUMPTION: phone pipelines correct lens distortion. Unknowns θ = (rotation vector ρ ∈ ℝ³,
-  translation t ∈ ℝ³, log f): **6-DoF plus focal**.
-- **Image evidence** (allocation-free over typed arrays):
-  - **Cloth mask**: hue learned from the photo's lower-central band, checked against the table
-    photo's cloth hue.
-  - **Ball candidates**: connected non-cloth blobs bounded by cloth. Each gets a circle fit to its
-    *cloth-adjacent* boundary pixels: an algebraic (Kåsa) fit, then a geometric refinement. Arcs
-    ≥ 120° are accepted, so balls cut off by the frame edge or partly hidden by nearer balls still
-    fit. Each candidate gives a centre, a radius, a mean RGB and its arc fraction.
-  - **Cushion edges**: points on the cloth→rail boundary above the balls (row-wise transitions),
-    later fitted to the projected cushion-nose lines.
-- **Residuals** (robust, Cauchy loss):
-  1. **Ball silhouette centre**: the centroid of `projectBallOutline` (exact cone-tangent silhouette,
-     not the projected centre, which is biased off-axis) vs the detected centre. σ = 1.5 px.
-  2. **Ball apparent radius**: the predicted silhouette radius vs the detected radius. σ = 1 px + 3 %.
-     It fixes depth and breaks the focal–distance (dolly-zoom) ambiguity once two balls lie at
-     different depths.
-  3. **Cushion edges**: point-to-projected-segment distance to the outer cloth edge
-     (`L/2 + cushionWidth` at `cushionHeight`, as in 001 R-05). σ = 2 px, down-weighted.
-  4. **Priors**:
-     - log f: σ = 0.15 when `focalPx` is given (same camera), else 0.6 around a 65° HFOV;
-     - roll ≈ 0 (σ = 10°; phones are held level);
-     - camera height 0.03–0.8 m (soft barrier);
-     - every matched ball in front of the camera.
-- **Initialisation**: multi-hypothesis "player behind the cue ball", deterministic and in a fixed
-  order.
-  - The yaw direction is from the cue ball to the target (`targetId`), or else to each of 8 compass
-    directions.
-  - Camera position: distance d ∈ {0.35, 0.6, 1.0} m behind the cue ball, height h ∈ {0.10, 0.25,
-    0.45} m, yaw ψ ∈ aim ± {0°, 12°, 25°}, looking at the target.
-  - Focal: f ∈ {0.6, 1, 1.6} × prior. This covers the 0.5×, 1× and 2× phone lenses.
+*Revised 2026-11-15 for the player-photo merge (`0a30cf5`, from `fix1b/pview` `453561e`). The
+earlier design (a cloth hue from the photo's lower band, a fixed d × h × yaw grid with three focal
+guesses, centre and radius residuals) met SC-106 on 53.7 % of the envelope; it is replaced below.
+The step-by-step contract is [contracts/player-view-api.md](./contracts/player-view-api.md).*
 
-  Each hypothesis is scored cheaply. Known balls are projected and associated greedily with
-  candidates by distance < 3 r̂, radius ratio ∈ [0.6, 1.6] and colour (the cue ball is the whitest;
-  others by `rgb` when known). The best 5 by inliers and cost are refined.
-- **Refinement**: Levenberg–Marquardt (Nielsen damping) with a forward-difference Jacobian. There
-  are 7 parameters and ≤ ~150 residuals. Up to 50 iterations, stopping at a relative cost change below
-  1e-6. Associations are re-run after convergence, and the solver refines once more. The lowest
-  robust cost wins.
-- **Confidence and honesty** (Principle II):
-  - Posterior covariance Σ = σ²(JᵀJ)⁻¹, propagated to the image position of the ghost ball → σ_px.
-  - confidence = inlier term × residual term × exp(−σ_px / (0.01·diag)), in [0, 1].
-  - `ok` when confidence ≥ 0.5, residualPx ≤ max(4 px, 0.6 % of the diagonal), ≥ 3 balls matched (or 2
-    balls plus ≥ 1 cushion edge) and the cue ball or target matched. ASSUMPTION: thresholds tuned on
-    the synthetic grid so that SC-106 and SC-107 hold.
-  - Failure reasons are player-facing strings: too few balls, balls moved, too dark, cue ball not
-    found, not behind the cue ball (a warning only).
-- **Performance**: the hypotheses × cheap scoring plus ≤ 5 refinements run well under the 0.5 s CI
-  budget (SC-109). Everything runs in the vision worker.
+- **Camera model**: pinhole, square pixels, principal point at the image centre, no distortion.
+  ASSUMPTION: phone pipelines correct lens distortion. Unknowns (rotation, camera centre C ∈ ℝ³,
+  log f): **6-DoF plus focal**.
+- **Detection** (`src/vision/player-detect.ts`; pure, deterministic, typed-array scratch reused
+  between calls):
+  - **Cloth candidates, not "the colour of the bottom of the photo"**: a table-level photo is mostly
+    the room, the near rail and the floor, and the cloth can be any colour, grey included. Every
+    chromatic hue mode and grey value mode covering ≥ 1.5 % of the photo is a candidate, ranked by a
+    structure score (round, ball-sized holes in the main region; speckle from a band that cuts
+    through a surface's shading counts against it). The overview's cloth is promoted only when this
+    photo shows a plausible region of it. The best 3 are tried in turn until one fits.
+  - **Evidence**: cloth-boundary crack points with noise speckle removed; ball circles on
+    cloth-bordered arcs ≥ 120° (Kåsa plus deterministic RANSAC, also per colour class, local arcs on
+    large blobs); colour and whiteness from each circle's own pixels, with thresholds scaled by the
+    exposure read off the brightest balls.
+- **Hypotheses**: a 20-step lens sweep (HFOV ≈ 110° to 26°) plus the overview's focal length ×0.95,
+  1 and 1.05. Per focal guess, the cue-ball circle fixes the cue ball in camera coordinates, and any
+  other circle paired with a colour-compatible known ball fixes the rotation up to a turn about the
+  line between them: the level member in closed form, plus roll completion from the remaining
+  circles' votes. Scored by the known balls that land on circles of the right size and colour, the
+  balls predicted on bare cloth and the circles left unexplained.
+- **Refinement**: Levenberg–Marquardt over (rotation, C, log f), forward-difference Jacobian, 8
+  iterations per stage, on exact residuals: for a ball, the angle between a crack point's ray and the
+  silhouette cone's axis minus its half-angle (no off-axis ellipse bias; σ 1 px); for a cushion edge,
+  outer and nose, the angle between the ray and the plane through the camera and the edge (σ 1.5 px).
+  ICP-style re-association under a shrinking gate (24, 12, 6, 3.5 px per 1000 px of the long side,
+  at least 3 px), Cauchy weights (scale 2σ). Priors: log f heavy-tailed around `focalPx` (σ 0.1) or
+  Gaussian around 65° HFOV (σ 0.5) without it; roll σ 10° (5° with taps); camera height soft-bounded
+  to 2 cm–2 m (0.2 ± 0.15 m with taps).
+- **Confidence and honesty** (Principle II): inlier term × residual term × exp(−σ_px / (0.01·diag)),
+  σ_px from the posterior covariance at the target's image position plus, for fits of ≤ 4 balls
+  without crossing cushion lines, the layout's own uncertainty. `ok` needs confidence ≥ 0.5,
+  residualPx ≤ max(4 px, 0.6 % of the diagonal), enough balls with sure identities (a near-minimal
+  fit), the cue or target matched, a convincing fit for a camera away from the cue ball, and no
+  moved ball (FR-121). A failure never reports confidence ≥ 0.5. Reasons name the true cause; the
+  table is in data-model.md § PlayerViewResult.
+- **Decisions and constants** (ASSUMPTION: synthetic table-level renders unless stated; each
+  constant is documented in place in `player-view.ts` / `player-detect.ts`):
+
+  | Decision | Constant(s) | Evidence |
+  |---|---|---|
+  | Hue modes tried as cloth candidates | `MAX_CANDIDATES` 6 (≥ 30° apart; grey value modes: 2, ≥ ×1.5 apart) | With 4 slots, σ 6 noise gave the dark room hue modes that pushed a green cloth seen as a 2.6 % sliver off the list |
+  | Smallest candidate and main cloth region | `MIN_CANDIDATE_SHARE` 1.5 %, `MIN_CLOTH_AREA` 1 % of the frame | From 8 cm up and 1.2 m back with a 100° lens the cloth is ≈ 2.5 % of the frame |
+  | Exposure from the brightest balls, never above nominal | `BRIGHT_NOMINAL` 0.9, `MIN_EXPOSURE` 0.5 | A cloth-based scale took a light cloth's albedo for exposure and lost the cue ball: light cloths 49/80 → 80/80 |
+  | Noise speckle | `SPECK_AREA` 10 px | Removed before cracks and circles |
+  | "Too grainy" | `NOISY_SPECKS` 60 per 1000 px of cloth; `NOISY_SIGMA` 4.5 (whole-frame chroma σ, when no cloth region was kept) | 4 cloths × 7 noise levels: green and light-blue fits succeed below 60 specks (40/40, 48/48) and on none above; a smooth render reads σ ≈ 0.3, and σ ≥ 10 dissolves a tinted grey's region |
+  | "Too dark" | `DARK_MEAN_V` 0.12, `DARK_SHARE` 0.8, `DIM_CLOTH_V` 0.15 | A lit table-level photo has mean V 0.25–0.5, cloth V 0.3–0.55; the ×0.15 test frame 0.06. "Too dark" on lit photos: 8–12 per perturbation variant → 0 |
+  | "Too few balls" | `MIN_BALL_CIRCLES` 3 | Means what it says: fewer than 3 ball circles in the photo |
+  | Sure identity | `MINIMAL_COLOUR_COST` 1 (a hue within 14°) | Neighbouring pool colours differ by 20–25°; a repeated colour (a snooker red, a solid/stripe pair) let a camera 95 cm off fit two orange balls swapped with a third out of view |
+  | A pose the static scene supports | `SOLID_EXPLAINED` 0.5, `SOLID_EDGES` 0.2 | A right pose puts 25–40 % of the cracks on the cushions, a wrong one 2–5 % |
+  | Plausible camera for "moved" | `PLAUSIBLE_CAMERA_DIST` 2 m, height 2–80 cm (`PLAUSIBLE_CAMERA_HEIGHT` 0.8) | Spec assumptions (5–50 cm, ≤ 1.5 m) with margin: from a few cm up a camera metres away can line up nearly parallel cushion lines |
+  | Moved-ball signature | `DISPLACED_MIN` 2.5 R, `DISPLACED_SIZE` 1.5 | A moved ball's new spot is ≥ 2.5 R away (layout error ≲ 1 cm) |
+  | The pose cannot absorb a moved ball | `STILL_FITS_RATIO` 2.5, `STILL_FITS_ABS` 100 | An unmoved ball at the edge of a 92° grey photo costs ×1.3–1.8; a cue ball moved 8–20 cm ×4.7–23 (+170 … +1000) |
+  | Plain cloth is no evidence of absence on untinted grey | `UNTINTED_SAT` 0.08 | A ball's shaded side has the cloth's own grey; 4 of 117 static grey photos said "moved" otherwise |
+  | Colour of a partly cloth-like ball | `BALL_PIXEL_SHARE` 0.1 | A white ball's lit cap on untinted grey is 10–40 % of its disc; bare cloth ≈ 0 % |
+  | Layout uncertainty | `LAYOUT_SIGMA` 5 mm per coordinate | 001 SC-003 (median ≤ 10 mm). From 7 cm up with a 96° lens three balls and the far cushion fitted a camera 35 cm off within 1 px (ghost 7 %): σ 9 px with the propagation, 0.3 px without |
+  | Lens sweep | `LENS_SWEEP` 0.446 · 1.1ⁱ, i < 20 | HFOV ≈ 110° (0.5×) to 26° (3×) in ≈ 10 % steps; lens-change sweep 45/48 with no bad ok |
+  | Pair depth check | `PAIR_DEPTH_RATIO` 2 | No change over 136 photos; it prunes roots whose depth disagrees with the circle's size |
+  | Roll | `ROLL_MAX` 35°, 2° vote bins over ±40° | The spec allows ±20°, with margin for the fit to settle |
+  | Deterministic budget | `REFINE_BUDGET` 10, `SEEDS_FIRST` 4, `SEEDS_LATER` 2, `ALT_ANCHORS` 2 | Fits need 1 refine in 95 % of cases (at most 8, over 154 runs); failing photos refined up to 24, which took 450–630 ms CPU |
+  | Hypotheses kept | `TOP_HYPS` 64 | Far more than the ≤ 4 diverse seeds a solve takes |
+  | Coarse-to-fine refine | 30 / 55 points per ball / edge on the wide gates, 90 / 160 on the last two | The wide gates only bring a seed into the basin |
+
+- **Measured** (independent sweeps and the tests `player-view-envelope.test.ts`,
+  `player-view-honesty.test.ts`, `player-view.test.ts`):
+  - SC-106 envelope, 912 photos with enough balls in view: 53.7 % → 95.4 % within tolerance without
+    hints (pool 438/454, snooker 432/458), 40.0 % → 95.5 % with the app's hints; SC-107 violations
+    7 → 0 (with hints). The Snap fixtures and the player-view grid are unchanged (snap-player.png:
+    0.39 cm, 0.026°, ghost 0.012 %, confidence 0.99).
+  - Perturbations (40 photos): noise σ 3 / 6 / 8 97.5 / 92.5 / 90 %, gain 0.5–1.5 92.5–97.5 %,
+    4:2:0 95 %, layout jitter 2 / 6 / 10 mm 95 / 85 / 80 %.
+  - A ball in front of the cue ball: 88.8 % (80 photos); light cloths 80/80.
+  - Grey cloth, by tint S: 0 33 %, 0.04 29 %, 0.08 67 %, 0.10 79 %, 0.12 96 %; never an ok fit off
+    tolerance, never "too dark".
+  - FR-121: the cue ball moved 8–20 cm 78/80 "moved"; the target moved 22/24; a shot played since
+    the table photo: no ok fit with a wrong guide in 160 runs; static photos never "moved" in the
+    envelope tests.
+  - Time per 960×720 photo: median ≈ 104 ms, p95 ≈ 250 ms (wall, Node; before: 61 and 140 ms). The
+    tests guard p95 < 250 ms CPU over the envelope and over a set of mostly failing photos; a 1280 px
+    photo stays inside SC-109's 500 ms. The slow tail is wide-angle and snooker photos (5–6 k
+    hypotheses).
+- **Known limits** (Constitution II):
+  - untinted grey cloth (S ≤ 0.06): the shaded cue ball has the cloth's own grey, so ≈ 30 % line up;
+    the failures are honest (no cue ball, no fit) and the two taps fit. Reaching 90 % needs a
+    different cue-ball cue (shading or specular) in the detector;
+  - a charcoal cloth in a dark grey room: the room shares the cloth's neutral band and outgrows its
+    region, so the photo may read "no cloth";
+  - a target camouflaged in the cloth (green on green) cannot trigger "moved" when it moves or is
+    pocketed: plain cloth is no evidence of its absence;
+  - a rare strike-dot residual on a small cue ball: one random-envelope photo fits with ghost 0.08 %
+    but the dot 0.23 R off (confidence 0.52); the hypotheses never seed its true basin;
+  - rare false "moved": 1 of 77 static untinted grey photos, and 2 snooker photos at the envelope's
+    extreme corner (HFOV 100°, 8 cm up, 1.2 m back) pinned by 3 balls and crossing cushion lines;
+  - a whole layout moved around a cue ball that stayed: "moved" in ≈ 2/3 of photos, otherwise
+    "couldn't line up" (no correct pose exists then); never an ok fit with a wrong guide;
+  - the cue ball out of frame: the photo is not yet fitted from the other balls (the reason is "can't
+    find the cue ball" or "couldn't line up");
+  - two-ball fits whose second ball has a repeated colour fail honestly and ask for the taps.
 - **Alternatives rejected**:
   - PnP from ball centres alone (EPnP and the like): needs ≥ 4 well-spread correspondences and known
     association. At table level, balls are often nearly collinear in depth, and the association is
@@ -324,6 +377,13 @@ tests on synthetic fixtures must confirm or tune.
   - Learned pose regression: needs a dataset and a model runtime (Principle VII).
   - Vanishing points from cushion lines alone: the rails are often out of frame or occluded at table
     level.
+  - A generic "moved" rule (two balls missing, or one missing and a circle unexplained): "moved" on
+    30 of 146 static envelope runs and 2–3 of 117 static grey photos.
+  - For the false "moved" in the extreme corner: requiring a non-minimal pose, or a nearby-circle test
+    for missing balls; neither separated them, both were reverted.
+  - Two other grey-band variants for untinted cloth: measured worse.
+  - A plain-cloth brightness check in the "missing ball" test: it changed no outcome in the sweeps
+    and was dropped.
 
 ## R-25 Manual two-tap fallback
 
@@ -539,12 +599,20 @@ tests on synthetic fixtures must confirm or tune.
     - `render3d`: math, camera presets and clamps, picking, playback timing and rotation, plan
       geometry and cue placement, the gesture state machine;
     - `vision/player-view`: projection, silhouettes, strike point, the estimator on synthetic photos;
+    - `vision/player-detect`: cloth candidates (grey included), circles on touching and merged
+      blobs, colour and exposure, noise speckle (`tests/unit/vision/player-detect.test.ts`);
     - the Snap session state machine;
     - the icon headers.
   - **Synthetic player photos**: `vision/synth/render.ts` already supports any camera pose and FOV.
     Table-level scenes come from a fixed, deterministic grid (heights 8–40 cm, distances 0.3–1.2 m,
     yaw ±15°, HFOV 40–100°, 3 cloths). "Low light" frames are post-processed in the test helper with
     gain and deterministic noise. Negative scenes: one ball visible, balls moved, too dark.
+    *Since the player-photo merge*, `tests/integration/player-view-envelope.test.ts` covers the whole
+    SC-106 envelope (an L18 orthogonal array over table, HFOV, height, distance, yaw, roll and
+    occlusion at 960×720 and 1280×960, with and without the app's hints), plus lens changes, grey
+    and light cloths, exposure, noise, 4:2:0, layout error, FR-121 and the reasons; and
+    `tests/integration/player-view-honesty.test.ts` checks SC-107 and FR-121 on random layouts and
+    continuous poses, the grain reasons and the per-photo CPU budget.
   - **Browser** (Playwright):
     - Chromium with SwiftShader (`--use-angle=swiftshader --enable-unsafe-swiftshader
       --ignore-gpu-blocklist`) proves the WebGL2 path, using `toScreen` taps and pixel probes.

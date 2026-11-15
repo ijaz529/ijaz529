@@ -16,8 +16,9 @@ Feature 002 builds on the finished 001 shot guide. It adds four things:
    WebGL2 is missing, the app falls back to the 001 2D `TableView`.
 2. **Snap two-photo guide** (US2). A table photo runs through the 001 vision pipeline on a still,
    giving the layout. A table-level player photo is fitted against that known layout by a new pure
-   solver (`src/vision/player-view.ts`): 6-DoF plus focal Levenberg–Marquardt over ball silhouettes,
-   apparent radii and cushion edges, from multiple "behind the cue ball" hypotheses. The app then
+   solver (`src/vision/player-view.ts`, with the photo detection in `src/vision/player-detect.ts`):
+   6-DoF plus focal Levenberg–Marquardt over ball silhouettes and cushion edges, from pair
+   hypotheses over a phone-lens sweep (research R-24). The app then
    draws the aim line, ghost ball, object-ball path, the strike dot on the cue ball and the power on
    the photo. A two-tap manual fallback covers the failures. Both new vision messages travel over
    worker protocol v2. Snap photos are processed at 960 px on the long side.
@@ -99,7 +100,7 @@ components, 1 native wrapper and 1 CI workflow.
 |---|---|---|---|
 | I | Physics Fidelity | No new physics constants. The 3D replay uses the 001 simulator's trajectories and event times, and the 001 sliding-friction law for rotation (R-17), with `params` from the active `PhysicsParams`. The strike point is exact sphere geometry (R-26). The cue-stick power gap is a display mapping, not physics, and is labelled as such | ✅ |
 | II | Honest Uncertainty | The player-photo fit returns a confidence from 0 to 1, the residual and a reason. The guide is not drawn as if right below the threshold. The manual fallback shows its (capped) confidence. Warnings cover "balls moved", "not behind the cue ball" and "strike point off-photo" (FR-116 … FR-121, SC-107). The 3D fallback note says when 3D is unavailable | ✅ |
-| III | Test-First, Deterministic Core | The new algorithms are pure and deterministic, with no randomness (fixed hypothesis order): `vision/player-view.ts` (detection and the solver are consolidated in it on `fix2b/app`; the planned `player-detect.ts` / `lm.ts` split may land with the vision branch, tasks T133/T134/T139/T140), `render3d/{math3d,geom,camera,picking,playback,scene-data,gestures}.ts` and `snap/session.ts`. Ground truth comes from synthetic table-level renders through the existing ray tracer. Test tasks precede implementation in tasks.md | ✅ |
+| III | Test-First, Deterministic Core | The new algorithms are pure and deterministic, with no randomness (fixed hypothesis order): `vision/player-view.ts` and, since the player-photo merge, `vision/player-detect.ts` (the photo detection, T133/T140; the solver is still inside `player-view.ts`, so the planned `lm.ts` split, T134/T139, is not made), `render3d/{math3d,geom,camera,picking,playback,scene-data,gestures}.ts` and `snap/session.ts`. Ground truth comes from synthetic table-level renders through the existing ray tracer. Test tasks precede implementation in tasks.md | ✅ |
 | IV | Real-Time Budget | Render on demand. Contact shadows are one decal quad per ball (no shadow maps). Plan ribbons are rebuilt only when the plan changes, into a pre-allocated buffer. Pose solving and still processing run in the vision worker. No allocation in per-pixel loops. Budgets: SC-101, SC-105, SC-109 | ✅ |
 | V | Privacy by Architecture | Photos stay in memory in the page and the worker, and are discarded on *Start over* or on leaving Snap. Still no `fetch` for user data. The iOS app bundles its assets with no remote URL. No analytics. The TestFlight upload is CI-only and never part of the app | ✅ |
 | VI | Player-First Language and Accessibility | Strike shown as a dot plus words ("½ tip below centre"; 1 tip = ¼ R, with mm in the card details) plus the spin ball. Power as 1–10, a speed word and a meter. The Okabe–Ito palette and dash styles reused in 3D and on photos. Targets ≥ 44 px (also in 3D picking, R-19). Focus rings, contrast rules (R-32) and a full 2D fallback | ✅ |
@@ -113,6 +114,11 @@ Post-review re-check (2026-11-15, `fix2b/app`): the rows above hold for the 002 
 corrections made in place (no lazy 3D chunk, iOS 16, the consolidated `player-view.ts`). The 6 failing
 `ball-detect-edge.test.ts` cases belong to the 001 vision code (001 T074) and keep Gate 3 open for the
 merge (001 analysis.md, "Post-wave-2").
+
+Post-vision-merge re-check (2026-11-15, `rc/release` = 9a162bf): the rows still hold. The
+player-photo merge adds `player-detect.ts` (pure, deterministic, typed-array scratch reused between
+calls) and bounds the work per photo by a counted budget, not a clock (Principle III). The 001 T074
+cases pass, so Gate 3 is met (001 analysis.md, "Post-vision merge").
 
 ## Project Structure
 
@@ -180,9 +186,9 @@ src/
 │   ├── styles.css                 # [ui] Midnight Felt tokens + components
 │   └── main.ts                    # [integrate] Live·Snap·Practice, 3D↔2D, tour, ready marker
 ├── vision/                        # [playerview] US2
-│   └── player-view.ts             # contracts/player-view-api.md (binding). On fix2b/app it also holds
-│                                  # the photo detection and the solver; the planned player-detect.ts
-│                                  # and lm.ts split (T133/T134/T139/T140) may land with the vision branch
+│   ├── player-view.ts             # contracts/player-view-api.md (binding): hypotheses, the LM solver
+│   │                              # (no separate lm.ts, T134/T139) and the decision
+│   └── player-detect.ts           # cloth candidates, crack evidence, circle candidates (T133/T140)
 └── workers/                       # [playerview]
     ├── protocol.ts                # PROTOCOL_VERSION = 2; still + player-view (+ plan, perEvalMs) messages
     ├── vision.worker.ts           # still (processStill: N passes, separate pipeline) + player-view

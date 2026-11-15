@@ -112,7 +112,10 @@ WebGL2, or with `?renderer=2d`, the 2D table does everything the same way.
    like, a pocket.
 2. **Crouch behind the cue ball** at table level, facing the shot, and take a second photo. CueSight works
    out where the camera was from the known layout (a 6-DoF pose and focal-length fit,
-   `src/vision/player-view.ts`) and draws on your photo, in perspective:
+   `src/vision/player-view.ts`, on the cloth, ball circles and cushion edges that
+   `src/vision/player-detect.ts` finds). The cloth can be any colour, grey included, and you may
+   switch lens between the two photos (0.5×–3×): the table photo's focal length is only a hint. It
+   then draws on your photo, in perspective:
    - the aim line on the cloth to the ghost ball (**Aim here**), the object-ball path and the pocket.
      Parts that another ball hides from the camera are dashed and marked "hidden";
    - a bold **strike dot** with a crosshair on the cue ball's face, with the miscue ring and the centre
@@ -120,10 +123,19 @@ WebGL2, or with `?renderer=2d`, the 2D table does everything the same way.
    - power 1–10 with a speed word and a gauge, and the spin in words ("Strike ½ tip below centre");
    - how sure it is ("Fit: good · 98 %"), for the target ball the fit was made for.
 
-If the photo can't be lined up, CueSight says why and asks for two taps: the cue ball, then the target.
-Change the stroke or pocket and the guide redraws on the same photo. Change the target and the same
-photo is fitted again (after a two-tap fit you tap again). If the whole table isn't in the table photo,
-CueSight asks you to step back and retake it, or to tap the four corners if they are all in view.
+If the photo can't be lined up, CueSight says why, and the reason decides the next step:
+- "The balls seem to have moved": retake the **table** photo. A guide from the old layout would be
+  wrong, so the two taps are not offered. This also stops a fit that would otherwise be good, when the
+  target, the cue ball or any other ball is no longer where the table photo put it.
+- too dark, too grainy, or no table cloth in view: take a better photo (more light, a steadier phone,
+  more cloth in view). The two taps are still offered.
+- no cue ball found, too few balls (fewer than three ball circles in the photo), or no fit: two taps,
+  the cue ball, then the target.
+
+A fit that fails never reports a confidence of 50 % or more. Change the stroke or pocket and the guide
+redraws on the same photo. Change the target and the same photo is fitted again (after a two-tap fit
+you tap again). If the whole table isn't in the table photo, CueSight asks you to step back and
+retake it, or to tap the four corners if they are all in view.
 
 Photos are turned upright from their own orientation tag and scaled to 960 px on the long side
 (decoded straight to that size where the browser allows it). Both photos stay in memory on the device. Start over and leaving Snap clear the photo and its
@@ -150,7 +162,7 @@ builds and troubleshooting are in [`docs/ios.md`](docs/ios.md).
  camera ─▶ frame grabber (≤640 px, 1 in flight) ─▶ [vision worker]
                                                      cloth colour ▸ table mask ▸ hull ▸ max-area quad ▸ robust side refit
                                                      ▸ homography ▸ focal length from the known rectangle ▸ pose
-                                                     ▸ rectify at ball-centre height (parallax-free) ▸ blobs ▸ disc-model split
+                                                     ▸ rectify at ball-centre height (parallax-free) ▸ blobs ▸ disc-model count
                                                      ▸ shape gate ▸ colour names ▸ cue pick (none if ambiguous)
                                                      ▸ tracker + lock state machine
                          layout ◀────────────────────┘   (planned and drawn only while the table is locked)
@@ -198,6 +210,15 @@ poses (`tests/unit/vision`, 2026-11-15):
 The table outline is also tested on blue, red and grey cloth, and ball detection on 4:2:0
 chroma-subsampled (video-like) frames, touching clusters, glare and pocket hangers.
 
+**Touching clusters** (3-, 9- and 15-ball racks and a 15-red snooker pack, in every view) are checked
+under 62 calibrations each: the table detector's, the camera's exact one, and 60 with the table
+corners jittered by ±0.15–1 px, as calibration error. The ball count of a cluster is chosen by a
+penalised whole-cluster cost (research.md R-04), so small corner errors no longer swing it. Under all
+62 no phantom ball appears next to a cluster. Under the detector's and the exact calibration every
+ball that shows at least 25 % of its outline is found (one recorded exception, below), with a median
+error ≤ 10 mm and p95 ≤ 25 mm. Balls under 15 % of their outline (the middle of a pack seen from low
+down) are allowed to be missed, per view, as a ray cast of the scene counts them.
+
 **Speed** (Node, 2026-11-15, on a shared 4-core machine; a quiet machine is faster). The CI guards
 are looser than the device budgets:
 
@@ -206,6 +227,11 @@ are looser than the device budgets:
 | Vision pipeline per frame (640×480) | ~30–85 ms | — | 150 ms |
 | Full shot plan, 22 balls | ~7–20 ms | 50 ms | 100 ms |
 | Position search (264 simulations on the test layout; at most 324) | ~0.6 s | 1.5 s | 3 s |
+| Snap player-photo fit (960×720) | median ~104 ms, p95 ~250 ms | 1.5 s | p95 < 250 ms CPU, 500 ms at 1280 px |
+
+A frame with a snooker pack spends about 10–20 ms more in ball detection than before the cluster fix
+(about 45–56 ms against 35–40 ms on Node): a pack seen small is fitted again on a finer window. Pool
+frames and frames without a cluster are unchanged or faster.
 
 The physics changed on 2026-11-15: rails now take top and back spin off the ball (research.md R-08), so
 the cue ball travels further after a rail at the same power than it did before (up to about a third).
@@ -241,15 +267,43 @@ The power scale itself was not changed; R-12 in research.md lists the travel per
   no ball is marked as the cue ball and CueSight asks you to tap it.
 - **Ball colours.** Colour names are approximate, and a colour it cannot name is shown as an unnamed
   ball. Solid balls the colour of the cloth are found, but a green stripe on green cloth (the 14) is
-  lost in most video frames when its stripe faces the camera.
-- **Clusters.** A ball hidden inside its neighbours' outline cannot be counted. A snooker pack seen
-  from an end or a corner on video frames loses 3 to 5 reds. Six touching-cluster tests still fail
-  (see the test status above).
+  lost in most video frames when its stripe faces the camera, and in far views on video frames it can
+  still be flagged as the cue ball (1 of 216 jittered runs).
+- **Grey cloth.** The table is found on grey cloth, but on mid or light grey cloth the white cue ball
+  and light stripes may not be detected in Live frames or the Snap table photo (a fix is in progress
+  separately). Tap *Cue ball* to mark the cue ball, or add the missing ball in the Snap review.
+- **Clusters.** A ball hidden inside its neighbours' outline (under about 15 % of its outline its own)
+  cannot be counted. With a slightly wrong calibration (some of 60 jittered calibrations per scene,
+  ±0.15–1 px corners) the end views lose one more ball that shows 28–56 % of its outline (in 6–11 of
+  60: a pool pack's green 6 or black 8, a snooker end ball in the second row), and the snooker corner
+  views reach a median error of 10–12 mm (5–6 of 60). Under the exact calibration the 15-ball end view
+  misses the green 6 (29 % of its outline, green on green; the recorded exception).
+- **Snooker packs on video frames.** Seen from an end or a corner on 4:2:0 video, a snooker pack has
+  about one colour sample per ball radius: 3–5 reds are lost or misplaced by 25–40 mm (median error
+  15–18 mm), and phantom reds can appear next to the pack (fewer than with the earlier detector). On
+  960-px Snap frames taken from video with smoothly upsampled colour, the snooker end view loses a red
+  that shows 28 % of its outline in 5 of 6 calibrations.
+- **Pocket holes.** With calibration error a pocket's dark hole can fall outside its masked throat and
+  read as a dark ball in the pocket, away from every ball: rarely at ±0.3–0.5 px corner error (2 of
+  1798 runs), more often at ±1–2 px.
 - **Corner pockets out of view.** The table can lock with a corner just off the screen; the status then
   reads "Table locked — a corner pocket is out of view", and balls in that pocket may be missed.
 - **Snap.** The player-photo fit assumes a pinhole camera, a photo taken at table level (5–50 cm above
   the cloth, within about 1.5 m of the cue ball, held roughly level) and balls that did not move between
-  the two photos. It is validated on synthetic photos only so far.
+  the two photos. It is validated on synthetic photos only so far: over 912 photos across that range
+  (8–40 cm up, 0.3–1.2 m back, ±15° off the line, 40–100° lenses) that show the cue ball and two more
+  balls, about 95 % line up within tolerance, and none reports a fit that is far off (spec 002
+  SC-106, SC-107). Known gaps:
+  - untinted grey cloth (tint S ≤ 0.06): the cue ball's shaded side has the cloth's own grey, so the
+    photo lines up in about 30 % of cases; otherwise CueSight asks for the two taps, which work;
+  - a charcoal cloth in a dark grey room may read "I can't find the table cloth";
+  - a target camouflaged in the cloth (green on green) cannot trigger "The balls seem to have moved"
+    when it moves or is pocketed;
+  - on a tiny cue ball the strike dot of a fit that is otherwise right can, rarely, be about 0.2 R off;
+  - a few photos say "moved" when nothing moved (1 of 77 on untinted grey cloth; 2 from 8 cm up with
+    a 100° lens);
+  - a photo without the cue ball is not yet fitted from the other balls: it fails with "I can't find
+    the cue ball" (or "I couldn't line up this photo"); retake it with the cue ball in view.
 - **Ball identity and rules.** Planning is rule-agnostic: any object ball can be the target.
 - **Out of scope for now.** Bank, kick and combination shots.
 
@@ -270,7 +324,8 @@ part of the repo:
    - [plan](specs/001-realtime-shot-guide/plan.md) and [research decisions](specs/001-realtime-shot-guide/research.md)
    - [data model](specs/001-realtime-shot-guide/data-model.md) and [contracts](specs/001-realtime-shot-guide/contracts/)
    - [quickstart](specs/001-realtime-shot-guide/quickstart.md)
-   - [tasks](specs/001-realtime-shot-guide/tasks.md): all done except T074, the touching-cluster vision fix
+   - [tasks](specs/001-realtime-shot-guide/tasks.md): all done, T074 (the touching-cluster vision fix)
+     last
    - [analysis](specs/001-realtime-shot-guide/analysis.md), with the post-review status
 5. [`specs/002-3d-visual-ios/`](specs/002-3d-visual-ios/): the 3D table, Snap, the Midnight Felt design
    and the iOS app ([spec](specs/002-3d-visual-ios/spec.md), [plan](specs/002-3d-visual-ios/plan.md),

@@ -15,13 +15,14 @@ playback, scene-data, gestures) and through Playwright with SwiftShader.
 
 **Organization**: tasks are grouped by user story, so each story can be built and demoed on its own.
 
-**Status (2026-11-15, `fix2b/app`)**: 67 of 72 tasks are done. Open: T133 and T134 (the planned
-`player-detect.ts` / `lm.ts` split was not made: detection and the solver are consolidated in
-`src/vision/player-view.ts`; the split may land with the vision branch), T168 (TestFlight needs the
-owner's App Store Connect secrets), T171 (the device frame rate needs a phone) and T172 (the
-`analysis.md` report). Where the build
-differs from a task's text, an **On `fix2b/app`** line under the task says how. The 6 failing
-`ball-detect-edge.test.ts` cases are 001 vision tests (001 T074), not 002 tasks.
+**Status (2026-11-15, `rc/release` = 9a162bf)**: 68 of 72 tasks are done. The player-photo merge
+(`0a30cf5`) split the photo detection into `src/vision/player-detect.ts` with its own unit tests, so
+T133 is done. Open: T134 (the `lm.ts` split was not made: the Levenberg–Marquardt solver is still
+inside `src/vision/player-view.ts`, so there is no `lm.test.ts`), T168 (TestFlight needs the owner's
+App Store Connect secrets), T171 (the device frame rate needs a phone) and T172 (the `analysis.md`
+report). Where the build differs from a task's text, an **On `fix2b/app`** (or **On `rc/release`**)
+line under the task says how. The 6 `ball-detect-edge.test.ts` cases that failed on `fix2b/app` were
+001 vision tests (001 T074); they pass since the ball-cluster merge (`360b268`).
 
 ## Format: `[ID] [P?] [Story] Description (pkg: owner)`
 
@@ -189,8 +190,9 @@ pass.
 
 ### Tests for User Story 2 ⚠️ (write first, must fail)
 
-- [ ] T133 [P] [US2] Unit tests for player-photo detection in `tests/unit/vision/player-detect.test.ts`, on table-level renders:
+- [X] T133 [P] [US2] Unit tests for player-photo detection in `tests/unit/vision/player-detect.test.ts`, on table-level renders:
   - **On `fix2b/app`**: not done as written: there is no separate `player-detect.ts`, so no `player-detect.test.ts`. Detection is inside `src/vision/player-view.ts` and covered end to end by `tests/integration/player-view.test.ts`. The dedicated unit tests come with the module split, which may land with the vision branch.
+  - **On `rc/release`** (player-photo merge `0a30cf5`, from `fix1b/pview` `453561e`): done. `src/vision/player-detect.ts` holds the cloth candidates, the crack evidence and the circle candidates. `tests/unit/vision/player-detect.test.ts` covers the cloth predicate (chromatic and neutral), the cloth candidates (green with the near rail filling the bottom of the photo, grey on grey or red floors, charcoal against a wider grey band, the overview hint promoted only on a plausible region, no candidate in a black frame), two touching balls split into their own circles (balls overlapping in depth), small and large balls merged into the rail band or the room, the cue ball's colour behind a nearer red, the exposure read off the brightest ball, and noise speckle and `clothNoise`. The envelope tests extend it: `tests/integration/player-view-envelope.test.ts` (SC-106/SC-107 over the envelope with a frontCue occlusion level, lens changes, grey and light cloths, exposure, noise and 4:2:0, layout error, FR-121 sweeps, the reasons, a CPU p95 guard) and `tests/integration/player-view-honesty.test.ts` (SC-107 grey literals and sweep, FR-121 shot literals and sweep, the grain reasons, a CPU guard on a fixed set of failing photos). Not unit-tested as written: the circle-centre and radius bounds, a partial arc at the frame edge and the cushion-edge points (they are checked through the pose accuracy end to end, frame-edge cuts included), and scratch reuse (there is no allocation guard for `player-detect.ts`).
   - circle centre ≤ 1 px and radius ≤ 3 %;
   - a partial arc at the frame edge; balls overlapping in depth;
   - cushion-edge points within 2 px of the projected nose line;
@@ -199,8 +201,10 @@ pass.
   (pkg: playerview)
 - [ ] T134 [P] [US2] Unit tests for the Levenberg–Marquardt solver in `tests/unit/vision/lm.test.ts`: it converges on Rosenbrock and a known curve fit, damping adapts, and it honours the iteration and tolerance stops (pkg: playerview)
   - **On `fix2b/app`**: not done as written: there is no separate `lm.ts`, so no `lm.test.ts`. The solver is inside `src/vision/player-view.ts` and covered by `tests/integration/player-view.test.ts`. The unit tests come with the split, which may land with the vision branch.
+  - **On `rc/release`**: still open. The player-photo merge split out the detection (`player-detect.ts`, T133) but not the solver: `levenberg` stays inside `src/vision/player-view.ts`, tested only through the pose fit (`player-view.test.ts`, `player-view-envelope.test.ts`, `player-view-honesty.test.ts`).
 - [X] T135 [P] [US2] Integration tests for `estimatePlayerView` against the accuracy contract in contracts/player-view-api.md, in `tests/integration/player-view.test.ts`:
   - **On `fix2b/app`**: on the scene grid in the file (heights 0.15–0.45 m, 0.3–0.8 m back, 10–20° off the line), plus the failure scenes, the manual taps, determinism and the 500 ms budget on the 1280×960 fixture. Extending it to the full SC-106 envelope belongs to the vision branch.
+  - **On `rc/release`**: the full envelope is in `tests/integration/player-view-envelope.test.ts` (8–40 cm, 0.3–1.2 m, ±15° yaw, ±10° roll, HFOV 40–100°, occlusion, 960×720 and 1280×960), with the honesty sweeps in `tests/integration/player-view-honesty.test.ts`.
   - ≥ 90 % success; ghost ≤ 1.5 % of the diagonal; strike ≤ 0.1 R;
   - no false confidence > 3 %; the failure scenes give reasons;
   - manual taps ≤ 2.5 %; focal ×0.5 and ×2;
@@ -226,8 +230,10 @@ pass.
 
 - [X] T139 [P] [US2] Implement the small dense Levenberg–Marquardt solver (Nielsen damping, forward-difference Jacobian, robust Cauchy weights) in `src/vision/lm.ts` (pkg: playerview)
   - **On `fix2b/app`**: not a separate `lm.ts`: the Levenberg–Marquardt solver (Nielsen-style damping, forward-difference Jacobian, Cauchy weights) is inside `src/vision/player-view.ts`. The split into its own module may land with the vision branch.
+  - **On `rc/release`**: still not a separate module (see T134).
 - [X] T140 [P] [US2] Implement the player-photo cloth mask, ball circle fits on cloth-adjacent arcs (Kåsa + geometric refinement) and cushion-edge points, with pre-allocated scratch, in `src/vision/player-detect.ts` (pkg: playerview)
   - **On `fix2b/app`**: not a separate `player-detect.ts`: the cloth mask, the circle fits (Kåsa plus deterministic RANSAC) and the cushion-edge points are inside `src/vision/player-view.ts`. The split may land with the vision branch.
+  - **On `rc/release`**: `src/vision/player-detect.ts` exists (player-photo merge). It holds the cloth candidates (chromatic hue modes and grey value modes, ranked by structure), the crack evidence and the circle candidates with their colour descriptors; `player-view.ts` keeps the hypotheses, the solver and the decision.
 - [X] T141 [US2] Implement `estimatePlayerView` (R-24, R-25) in `src/vision/player-view.ts`:
   - the hypothesis grid; association by distance, radius and colour;
   - the residuals (silhouette centre, radius, cushion edges, priors); LM refinement and re-association;
@@ -450,7 +456,7 @@ Task: "T121 math3d.ts"  Task: "T122 camera.ts"  Task: "T123 picking.ts"  Task: "
 | FR-111 photo input, FR-112 still detection | T142, T143 | `player-view.test.ts` (integration: still through the worker), `snap.spec.ts` |
 | FR-113 edit/corners/retake | T146 | `snap.spec.ts`, quickstart Q110 |
 | FR-114 target + plan, FR-115 player-photo prompt | T146, T148 | `snap.spec.ts` |
-| FR-116 pose + confidence, FR-121 moved / not behind | T139–T141 | `player-view.test.ts` (integration) |
+| FR-116 pose + confidence, FR-121 moved / not behind | T139–T141 | `player-view.test.ts`, `player-view-envelope.test.ts`, `player-view-honesty.test.ts` (integration), `player-detect.test.ts` (unit), `snap-session.test.ts` (reason → next step) |
 | FR-117 guide drawing, FR-119 partial visibility | T145, T146 | `snap.spec.ts`, quickstart Q112/Q115 |
 | FR-118 manual fallback | T141, T146 | `player-view.test.ts`, `snap.spec.ts` |
 | FR-120 re-plan on the same photo | T148 | `snap.spec.ts` |
@@ -472,7 +478,7 @@ Task: "T121 math3d.ts"  Task: "T122 camera.ts"  Task: "T123 picking.ts"  Task: "
 | SC-103 replay fidelity | `render3d-playback.test.ts` |
 | SC-104 3D = 2D values | `practice3d.spec.ts` |
 | SC-105 still accuracy | `player-view.test.ts` (integration: still through the worker) |
-| SC-106, SC-107, SC-108, SC-109 player-photo fit | `player-view.test.ts` (integration) |
+| SC-106, SC-107, SC-108, SC-109 player-photo fit | `player-view.test.ts`, `player-view-envelope.test.ts` (the SC-106 envelope, the CPU p95 guard), `player-view-honesty.test.ts` (SC-107 sweeps, CPU guard on failing photos) (integration) |
 | SC-110 first-use Snap < 60 s | usability session (open; it can't be automated) |
 | SC-111 001 e2e + accessibility | `ui.spec.ts`, `virtual.spec.ts`, `camera.spec.ts` |
 | SC-112 zero runtime deps, bundle | T171 |
