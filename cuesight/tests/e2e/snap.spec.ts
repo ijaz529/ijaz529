@@ -99,32 +99,45 @@ const posted = (page: Page) => page.evaluate(() => (window as unknown as { __pos
 /**
  * Counts the recommendation requests sent to the planner worker and their replies (test instrumentation
  * only): a request is sent 180 ms after a tap (debounced), and a reply to the request before can land
- * inside that window and read as the new recommendation for a moment.
+ * inside that window and read as the new recommendation for a moment. The planner client restarts the
+ * worker to abandon a superseded recommendation (src/app/planner-client.ts): a terminated worker's
+ * requests will never be answered, so they stop counting as open.
  */
 async function trackPlanner(page: Page) {
   await page.addInitScript(() => {
     const w = window as unknown as { __planner: { open: Set<number>; last: number } };
     w.__planner = { open: new Set(), last: 0 };
-    const seen = new WeakSet<Worker>();
+    const sent = new WeakMap<Worker, Set<number>>();
     const orig = Worker.prototype.postMessage;
     Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
       const msg = m as { type?: string; id?: number };
       if (msg?.type === 'recommend' && typeof msg.id === 'number') {
-        if (!seen.has(this)) {
-          seen.add(this);
+        let ids = sent.get(this);
+        if (!ids) {
+          ids = new Set();
+          sent.set(this, ids);
           this.addEventListener('message', (e: MessageEvent) => {
             const d = e.data as { type?: string; id?: number };
             if (d?.type === 'recommendation' || d?.type === 'error') {
               w.__planner.open.delete(d.id!);
+              sent.get(this)?.delete(d.id!);
               w.__planner.last = performance.now();
             }
           });
         }
+        ids.add(msg.id);
         w.__planner.open.add(msg.id);
         w.__planner.last = performance.now();
       }
       return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
     } as typeof orig;
+    const origTerminate = Worker.prototype.terminate;
+    Worker.prototype.terminate = function (this: Worker) {
+      for (const id of sent.get(this) ?? []) w.__planner.open.delete(id);
+      sent.delete(this);
+      w.__planner.last = performance.now();
+      return origTerminate.call(this);
+    };
   });
 }
 /**
@@ -300,6 +313,48 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await expect(page.locator('#snap-fit')).toContainText('Fit:');
     await expect(page.locator('#hud-strike')).toContainText('Strike');
     await expect(page.locator('#snap-hud')).toContainText('/10');
+  });
+});
+
+test.describe('Snap when table detection itself fails', () => {
+  test('the vision worker crashing on the table photo ends the wait with a message; the next photo starts a new worker', async ({ page }) => {
+    await page.addInitScript(() => {
+      const w = window as unknown as { __crashStill: boolean; __visionWorkers: number };
+      w.__crashStill = true;
+      w.__visionWorkers = 0;
+      const W = window.Worker;
+      window.Worker = class extends W {
+        private vision = false;
+        constructor(url: string | URL, opts?: WorkerOptions) {
+          super(url, opts);
+          this.vision = String(url).includes('vision');
+          if (this.vision) w.__visionWorkers++;
+        }
+        override postMessage(m: unknown, t?: Transferable[] | StructuredSerializeOptions): void {
+          if (this.vision && w.__crashStill && (m as { type?: string })?.type === 'still') {
+            // The worker dies on this photo (out of memory, a crash in detection): an error event, never a reply.
+            setTimeout(() => this.dispatchEvent(new ErrorEvent('error', { message: 'injected crash' })), 50);
+            return;
+          }
+          super.postMessage(m, t as Transferable[]);
+        }
+      };
+    });
+    await page.goto('/?mode=snap');
+    await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+    await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+    // Not "Finding the table and the balls…" for ever: the failure is said, with the ways on.
+    await stepIs(page, ['overview-error']);
+    await expect(page.locator('#snap-busy')).toBeHidden();
+    // (The worker never answered before it died, so the app cannot tell this from a script that did
+    // not load: it says it could not start.)
+    await expect(page.locator('#snap-instr')).toContainText('Table detection couldn’t start');
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: { snap: { busy(): boolean } } }).__cuesight.snap.busy())).toBe(false);
+    // The same photo again: a new worker reads it.
+    await page.evaluate(() => ((window as unknown as { __crashStill: boolean }).__crashStill = false));
+    await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+    await stepIs(page, ['review']);
+    expect(await page.evaluate(() => (window as unknown as { __visionWorkers: number }).__visionWorkers)).toBe(2);
   });
 });
 

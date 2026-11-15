@@ -29,7 +29,7 @@ import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
 import { decodePhoto, frameOf, loadSample, photoFromVideo, releasePhoto, type Photo } from './photo';
-import { SNAP_MESSAGES, fitCheck, snapStage, type SnapEvent, type SnapSession } from './session';
+import { SNAP_MESSAGES, fitCheck, snapStage, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
 
 export const SAMPLE_PHOTOS = { table: './samples/snap-table.png', player: './samples/snap-player.png' } as const;
 
@@ -402,6 +402,18 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     if (m.type === 'still') onStill(m.result);
     else onPlayerView(m.result, req.targetId ?? null, !!req.manual);
     return true;
+  }
+
+  /**
+   * The vision worker failed (did not load, crashed): the request waiting on it will never be answered,
+   * so it fails now instead of spinning. The next photo or tap creates a new worker (host.visionWorker).
+   * `loaded`: the failed worker had answered at least once.
+   */
+  function visionFailed(loaded: boolean): void {
+    if (!pending) return;
+    const kind = pending.kind;
+    pending = null;
+    host.dispatch(visionFailedEvent(kind, loaded));
   }
 
   function onStill(r: VisionResult): void {
@@ -915,6 +927,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   return {
     render,
     onVision,
+    visionFailed,
     leave,
     take,
     pick,

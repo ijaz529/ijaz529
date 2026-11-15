@@ -795,6 +795,8 @@ function visionFailed(message: string): void {
   visionErrors = 0;
   // The tracker that issued the selected ids is gone: "Try again" starts a new one (ids from b1).
   liveIdsChanged();
+  // A Snap photo waiting on this worker will never be answered: Snap says so instead of spinning.
+  snapCtl.visionFailed(visionAnswered);
   if (S.mode !== 'camera') return;
   leaveCamera(); // without detection the camera has nothing to do
   store.update((s) => {

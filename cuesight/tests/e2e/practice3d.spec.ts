@@ -35,32 +35,45 @@ const settled = async (page: Page) => {
 /**
  * Counts the recommendation requests the page sends to the planner worker and their replies (test
  * instrumentation only). Needed because a request is sent 180 ms after a tap (debounced), and a reply
- * to the request before can land inside that window and read as the new recommendation.
+ * to the request before can land inside that window and read as the new recommendation. The planner
+ * client restarts the worker to abandon a superseded recommendation (src/app/planner-client.ts): a
+ * terminated worker's requests will never be answered, so they stop counting as open.
  */
 async function trackPlanner(page: Page) {
   await page.addInitScript(() => {
     const w = window as unknown as { __planner: { open: Set<number>; last: number } };
     w.__planner = { open: new Set(), last: 0 };
-    const seen = new WeakSet<Worker>();
+    const sent = new WeakMap<Worker, Set<number>>();
     const orig = Worker.prototype.postMessage;
     Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
       const msg = m as { type?: string; id?: number };
       if (msg?.type === 'recommend' && typeof msg.id === 'number') {
-        if (!seen.has(this)) {
-          seen.add(this);
+        let ids = sent.get(this);
+        if (!ids) {
+          ids = new Set();
+          sent.set(this, ids);
           this.addEventListener('message', (e: MessageEvent) => {
             const d = e.data as { type?: string; id?: number };
             if (d?.type === 'recommendation' || d?.type === 'error') {
               w.__planner.open.delete(d.id!);
+              sent.get(this)?.delete(d.id!);
               w.__planner.last = performance.now();
             }
           });
         }
+        ids.add(msg.id);
         w.__planner.open.add(msg.id);
         w.__planner.last = performance.now();
       }
       return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
     } as typeof orig;
+    const origTerminate = Worker.prototype.terminate;
+    Worker.prototype.terminate = function (this: Worker) {
+      for (const id of sent.get(this) ?? []) w.__planner.open.delete(id);
+      sent.delete(this);
+      w.__planner.last = performance.now();
+      return origTerminate.call(this);
+    };
   });
 }
 

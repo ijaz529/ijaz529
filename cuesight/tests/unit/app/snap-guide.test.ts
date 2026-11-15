@@ -10,7 +10,7 @@ import { makeTable } from '../../../src/core/table';
 import type { Ball, TablePresetId, TableLayout, Vec2 } from '../../../src/core/types';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
 import { buildPlayerGuide, cameraCenter, confidenceLabel, guideFocus, occluded, projectPolyline, scaleFocal, strikeFace, strikeHeadline, strikeWords } from '../../../src/app/snap/guide';
-import { fitCheck, initialSnap, snapReducer, snapStage, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
+import { fitCheck, initialSnap, snapReducer, snapStage, visionFailedEvent, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
 import { describeSpin } from '../../../src/core/shot/power';
 import { projectBallOutline, type CameraPose, type PlayerViewResult } from '../../../src/vision/player-view';
 import type { VisionResult } from '../../../src/vision/pipeline';
@@ -310,6 +310,24 @@ describe('Snap session state machine', () => {
     s = snapReducer(s, { type: 'manual-tap', p: { x: 3, y: 4 } });
     expect(s.step).toBe('player-processing');
     expect(s.taps).toEqual({ cue: { x: 1, y: 2 }, target: { x: 3, y: 4 } });
+  });
+
+  it('the vision worker failing mid-request ends the wait: table photo → error with its ways on; player photo → taps', () => {
+    // The worker never loaded (often: not cached for offline use yet) while the table photo was read.
+    let s = run([{ type: 'overview-photo', photo }, visionFailedEvent('still', false)]);
+    expect(s.step).toBe('overview-error');
+    expect(s.error).toBe(SNAP_MESSAGES.detectionLoad);
+    expect(s.error).toContain('offline');
+    // It had been answering, then crashed on this photo: no claim about being offline.
+    s = run([{ type: 'overview-photo', photo }, visionFailedEvent('still', true)]);
+    expect(s.step).toBe('overview-error');
+    expect(s.error).toBe(SNAP_MESSAGES.detectionStopped);
+    expect(s.error).not.toContain('offline');
+    // While lining up the player photo: the two-tap fallback runs detection again on a new worker.
+    s = run([{ type: 'overview-photo', photo }, { type: 'overview-result', vision: vision(true), balls }, { type: 'player-photo', photo }, visionFailedEvent('player-view', true)]);
+    expect(s.step).toBe('manual-taps');
+    expect(s.error).toBe(SNAP_MESSAGES.detectionStoppedPlayer);
+    expect(s.error).toContain('Tap the cue ball');
   });
 
   it('a player photo needs a layout; reset drops everything (FR-122)', () => {

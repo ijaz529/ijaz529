@@ -113,6 +113,84 @@ describe('render3d picking', () => {
     expect(at(30)?.kind).toBe('cloth');
   });
 
+  describe('a ball reached only through the 22 px floor yields to a nearer pocket mouth (same rule as the 2D table and overlay)', () => {
+    // Snooker in the overview on a phone: balls are drawn ~4.5 px wide, so a ball's natural pick radius
+    // (1.8·R + 12 px) is under the 22 px floor, and a pocket mouth sits inside a nearby ball's floor.
+    const sn = makeTable('snooker12');
+    const gs = tableGeom(sn);
+    const Rs = sn.ballRadius;
+    const VW = 393;
+    const VH = 700;
+    const o = overviewOrbit(gs, VW / VH);
+    const m = cameraMatrices(o, VW / VH);
+    const px = pixelAtUnit(o.fovY, VH);
+    // The pocket pick points Table3D.pick uses (2 cm inside the mouth centre).
+    const snPockets: PickPocket[] = sn.pockets.map((p) => ({ id: p.id, x: p.mouthCenter.x - p.inward.x * 0.02, y: p.mouthCenter.y - p.inward.y * 0.02, r: (p.kind === 'corner' ? sn.cornerMouth : sn.sideMouth) * 0.75 }));
+    const tr = snPockets.find((p) => p.id === 'TR')!;
+    const qP = project(m.vp, [tr.x, tr.y, 0], VW, VH)!;
+    const qC = project(m.vp, [0, 0, 0], VW, VH)!;
+    const len = Math.hypot(qC.x - qP.x, qC.y - qP.y);
+    const toward = { x: (qC.x - qP.x) / len, y: (qC.y - qP.y) / len };
+    const ray = (sx: number, sy: number) => screenRay(m.invVP, sx, sy, VW, VH);
+    /** A ball whose centre is drawn `dist` px from the pocket pick point, toward the table centre. */
+    const ballAt = (dist: number) => {
+      const s = { x: qP.x + toward.x * dist, y: qP.y + toward.y * dist };
+      const r = ray(s.x, s.y);
+      const t = (Rs - r.origin[2]) / r.dir[2];
+      const b: PickBall = { id: 'red', x: r.origin[0] + r.dir[0] * t, y: r.origin[1] + r.dir[1] * t, z: Rs, r: Rs };
+      return { b, s };
+    };
+    const pick = (sx: number, sy: number, balls: PickBall[], pk: PickPocket[] = snPockets, ballMinPx?: number) =>
+      pickRay({ ray: ray(sx, sy), balls, pockets: pk, bedHalf: { x: gs.hx, y: gs.hy }, pxAtUnit: px, ballMinPx });
+    /** How a tap reaches ball `b` with no pocket around: inside its natural slop, only through the 22 px floor, or not at all. */
+    const reach = (sx: number, sy: number, b: PickBall) =>
+      pick(sx, sy, [b], [], 0)?.kind === 'ball' ? 'natural' : pick(sx, sy, [b], [])?.kind === 'ball' ? 'floor' : 'none';
+
+    it('a tap on the pocket mouth picks the pocket, not a ball about 21 px away', () => {
+      const floorOnly: number[] = [];
+      for (let d = 15; d <= 23; d += 0.1) if (reach(qP.x, qP.y, ballAt(d).b) === 'floor') floorOnly.push(d);
+      expect(floorOnly.length, 'ball distances (px) reached from the pocket point only through the floor').toBeGreaterThan(5);
+      const D = floorOnly[Math.floor(floorOnly.length / 2)]!;
+      expect(D).toBeGreaterThan(19);
+      expect(D).toBeLessThan(22.5);
+      const { b } = ballAt(D);
+      // The floor alone reaches the ball from the pocket point (no pockets: the ball)…
+      expect(pick(qP.x, qP.y, [b], [])).toEqual({ kind: 'ball', id: 'red' });
+      // …but the pocket under the finger is nearer.
+      expect(pick(qP.x, qP.y, [b])).toEqual({ kind: 'pocket', id: 'TR' });
+    });
+
+    it('a ball within its natural pick radius still wins next to a pocket', () => {
+      const { b } = ballAt(12);
+      expect(reach(qP.x, qP.y, b)).toBe('natural');
+      expect(pick(qP.x, qP.y, [b])).toEqual({ kind: 'ball', id: 'red' });
+    });
+
+    it('between the two, the nearer of the ball and the pocket wins', () => {
+      const D = 30;
+      const { b, s } = ballAt(D);
+      const normal = { x: -toward.y, y: toward.x };
+      // A tap `rb` px from the ball's centre and `dp` px from the pocket pick point (on screen).
+      const tapAt = (rb: number, dp: number) => {
+        const u = (rb * rb - dp * dp + D * D) / (2 * D); // from the ball back toward the pocket
+        const h = Math.sqrt(rb * rb - u * u);
+        return { x: s.x - toward.x * u + normal.x * h, y: s.y - toward.y * u + normal.y * h };
+      };
+      const cases = { nearBall: 0.8, nearPocket: -0.8 };
+      for (const [name, extra] of Object.entries(cases)) {
+        // Distances from the ball that only the floor reaches, with the pocket in reach too.
+        const ok: number[] = [];
+        for (let rb = 19.5; rb <= 22.5; rb += 0.05) {
+          const q = tapAt(rb, rb + extra);
+          if (reach(q.x, q.y, b) === 'floor' && pick(q.x, q.y, [], snPockets)?.kind === 'pocket') ok.push(rb);
+        }
+        expect(ok.length, `${name}: taps reaching both the ball (floor only) and the pocket`).toBeGreaterThan(3);
+        const q = tapAt(ok[Math.floor(ok.length / 2)]!, ok[Math.floor(ok.length / 2)]! + extra);
+        expect(pick(q.x, q.y, [b]), name).toEqual(extra > 0 ? { kind: 'ball', id: 'red' } : { kind: 'pocket', id: 'TR' });
+      }
+    });
+  });
+
   it('screen rays from an oblique camera land on the right cloth point', () => {
     const { at, px } = setup(broadcastOrbit(g, W / H));
     for (const p of [

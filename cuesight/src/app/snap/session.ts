@@ -75,7 +75,22 @@ export const SNAP_MESSAGES = {
   noBalls: "I found the table but no balls. Retake the photo a little closer, or add the balls by hand.",
   noCue: "I couldn't tell which ball is the cue ball. Tap “Cue ball”, then tap it on the table.",
   decode: "That photo couldn't be opened. Try another one.",
+  /** The vision worker never answered before it failed (its script may not be cached for offline use yet). */
+  detectionLoad: 'Table detection couldn’t start — it may not be available offline yet. Reconnect, then retake the photo or choose it again.',
+  /** The vision worker had been answering, then failed on this table photo. */
+  detectionStopped: 'Table detection stopped working on this photo. Retake it or choose it again to try once more.',
+  /** The vision worker failed while lining up the player photo; the two taps run it again. */
+  detectionStoppedPlayer: 'Table detection stopped working on this photo. Tap the cue ball, then your target, to try again.',
 } as const;
+
+/**
+ * The event that ends a Snap request when the vision worker itself failed (it will never reply):
+ * `loaded` = the worker had answered at least once, so this is not a script that failed to load.
+ */
+export function visionFailedEvent(kind: 'still' | 'player-view', loaded: boolean): SnapEvent {
+  if (kind === 'player-view') return { type: 'player-failed', message: loaded ? SNAP_MESSAGES.detectionStoppedPlayer : SNAP_MESSAGES.detectionLoad };
+  return { type: 'overview-failed', message: loaded ? SNAP_MESSAGES.detectionStopped : SNAP_MESSAGES.detectionLoad };
+}
 
 export function initialSnap(): SnapSession {
   return { step: 'intro', overview: null, layout: null, corners: null, cornerTaps: [], player: null, taps: {}, error: null };
