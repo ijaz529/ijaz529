@@ -3,7 +3,7 @@
  * tests/unit/app/live-logic.test.ts: when the live plan may be drawn, how a selection survives
  * tracker id churn, what the status pill and hints say, manual-calibration feedback, and the start mode.
  */
-import type { Ball, TableLayout, Vec2 } from '../core/types';
+import type { Ball, PocketId, TableLayout, TableSpec, Vec2 } from '../core/types';
 import { applyH, homographyFrom4, invert3 } from '../vision/homography';
 import type { LockStatus } from '../vision/tracker';
 import type { Settings } from './settings';
@@ -202,10 +202,37 @@ export function liveGate(status: LockStatus, sinceLocked: number, hasCalibration
 
 export const STATUS_TEXT = { searching: 'Looking for the table…', unstable: 'Table found — hold steady', locked: 'Table locked' } as const;
 
-/** The status pill's live-region text: the lock state only (no per-frame counters). */
-export function pillText(status: LockStatus | null, frozen: boolean): string {
+/**
+ * The pill's live-region text: the lock state only (no per-frame counters). `cornersOut`: corner
+ * pockets of the locked table outside the frame (nextCornersOut): balls in them may be missed.
+ */
+export function pillText(status: LockStatus | null, frozen: boolean, cornersOut = 0): string {
   if (frozen) return 'Frozen layout';
+  if (status === 'locked' && cornersOut > 0) return cornersOut === 1 ? 'Table locked — a corner pocket is out of view' : 'Table locked — corner pockets are out of view';
   return status ? STATUS_TEXT[status] : 'Starting camera…';
+}
+
+/** Corners of the table outline (calibration corners, frame px) outside the w×h frame by more than `margin` px. */
+export function cornersOutOfView(corners: readonly Vec2[] | null | undefined, w: number, h: number, margin = 0): number {
+  if (!corners) return 0;
+  return corners.filter((c) => c.x < -margin || c.y < -margin || c.x > w + margin || c.y > h + margin).length;
+}
+
+/** Px a corner must pass the frame edge by (either way) before the "out of view" count changes. */
+export const CORNER_OUT_HYSTERESIS_PX = 4;
+
+/**
+ * The merged vision locks a table whose corners are just off-screen (table-detect extrapolates them),
+ * but balls in those corner pockets are not seen. The count of such corners, with hysteresis so a
+ * corner sitting on the border does not flicker the status text: a corner counts once it is more than
+ * CORNER_OUT_HYSTERESIS_PX outside, and stops once it is that far inside. No corners (no calibration): 0.
+ */
+export function nextCornersOut(prev: number, corners: readonly Vec2[] | null | undefined, w: number, h: number): number {
+  if (!corners) return 0;
+  const surely = cornersOutOfView(corners, w, h, CORNER_OUT_HYSTERESIS_PX);
+  const maybe = cornersOutOfView(corners, w, h, -CORNER_OUT_HYSTERESIS_PX);
+  // Between the two bands the previous count stands (clamped to what is possible now).
+  return Math.max(surely, Math.min(prev, maybe));
 }
 
 /** The pill's counters, shown next to the live region but hidden from assistive tech. */
@@ -223,6 +250,8 @@ export interface CameraHintInput {
   balls: number;
   hasCue: boolean;
   interaction: Interaction;
+  /** Balls the vision calls 'white?' (whites that are not the cue ball; two when too close to call). */
+  unsureWhites?: number;
 }
 
 /** The Live-specific shot-card hint, or null to fall through to the shared hints. */
@@ -233,7 +262,11 @@ export function cameraHint(o: CameraHintInput): string | null {
     if (!o.status || o.status === 'searching') return 'Point the camera at the table so the whole cloth is in view.';
     if (!o.live) return 'Hold steady — the table isn’t locked yet.';
   }
-  if (o.balls > 0 && !o.hasCue) return o.interaction === 'mark-cue' ? 'Tap the cue ball.' : 'No cue ball found — tap “Cue ball”, then tap the cue ball.';
+  if (o.balls > 0 && !o.hasCue) {
+    if (o.interaction === 'mark-cue') return 'Tap the cue ball.';
+    // Two whites too close to call (ball-detect: no cue unless clearly whiter than the runner-up).
+    return (o.unsureWhites ?? 0) >= 2 ? 'Two white balls — tap “Cue ball”, then tap the one you play with.' : 'No cue ball found — tap “Cue ball”, then tap the cue ball.';
+  }
   return null;
 }
 
@@ -254,19 +287,26 @@ export interface CalibrationResultLike {
   reason?: string;
 }
 
+/** VisionResult.reason in player words (the same wording as Snap's tapped corners, snap/session.ts). */
 export const CALIBRATION_MESSAGES = {
   ok: 'Calibrated from your four corners.',
-  badQuad: 'Those corners don’t make a table — tap the 4 cloth corners again.',
-  cloth: 'I couldn’t learn the cloth colour inside those corners — tap the 4 cloth corners again, or use Snap.',
-  moved: 'The phone moved — tap Calibrate again or return to automatic detection.',
+  /** reason 'bad-quad', a quad refused here before sending, or (first result) under 80 % of it is cloth. */
+  badQuad: 'Those four taps aren’t the cloth corners — tap them again.',
+  /** reason 'cloth-unknown'. */
+  cloth: 'Couldn’t tell the cloth from its surroundings — tap the 4 cloth corners again, or use Snap.',
+  /** reason 'moved' on a later result: the cloth edges left the tapped sides. */
+  moved: 'The phone moved — recalibrate, or tap Calibrate to go back to automatic detection.',
 } as const;
 
-/** What to tell the player about their four corners from a result computed with them; null = not decided yet. */
+/**
+ * What to tell the player about their four corners from the first result computed with them; null =
+ * not decided yet. The pipeline anchors manual corners on that very frame, so a 'moved' there cannot
+ * be a phone that moved: it says under 80 % of the tapped quad is cloth (taps off the corners).
+ */
 export function calibrationFeedback(r: CalibrationResultLike): CalibrationVerdict | null {
   const reason = typeof r.reason === 'string' ? r.reason : undefined;
-  if (reason === 'bad-quad') return { ok: false, retry: true, message: CALIBRATION_MESSAGES.badQuad };
+  if (reason === 'bad-quad' || reason === 'moved') return { ok: false, retry: true, message: CALIBRATION_MESSAGES.badQuad };
   if (reason === 'cloth-unknown' || (!r.cloth && !r.calibration)) return { ok: false, retry: true, message: CALIBRATION_MESSAGES.cloth };
-  if (reason === 'moved') return { ok: false, retry: false, message: CALIBRATION_MESSAGES.moved };
   if (!r.calibration || r.status === 'searching') return { ok: false, retry: true, message: CALIBRATION_MESSAGES.badQuad };
   if (r.calibration.source === 'manual' && r.status === 'locked') return { ok: true, retry: false, message: CALIBRATION_MESSAGES.ok };
   return null;
@@ -358,4 +398,139 @@ export function bedPointFromProjection(project: (p: Vec2) => Vec2 | null, half: 
   } catch {
     return null;
   }
+}
+
+// --- Rotate / Calibrate keep the selection (wave-2a item 17) ---------------------------------------
+
+/** A ball as the camera sees it: its centre in frame px (through HR) and its label. */
+export interface FrameSpot {
+  px: Vec2;
+  label?: string;
+}
+
+/**
+ * The live selection remembered in frame px, where the camera sees it. Rotate and Calibrate change
+ * the table frame (new ball ids, new table coordinates) but not the camera, so each part is found
+ * again at the same spot of the image once the new frame is locked.
+ */
+export interface FrameMemory {
+  target: FrameSpot | null;
+  /** The marked cue ball (cueOverrideId). */
+  cue: FrameSpot | null;
+  /** The chosen pocket's mouth centre (cloth plane, H0). */
+  pocketPx: Vec2 | null;
+  /** The landing spot (cloth plane, H0). */
+  landingPx: Vec2 | null;
+}
+
+/** The two homographies of a calibration (table metres → frame px): H0 the cloth plane, HR ball centres. */
+export interface FrameCalibration {
+  H0: readonly number[];
+  HR: readonly number[];
+}
+
+/** Results in the new frame the selection waits for before it is given up as cleared. */
+export const REMAP_TTL = 15;
+
+export const REMAP_MESSAGES = {
+  kept: 'Kept your selection.',
+  cleared: 'The selection was cleared: the table frame changed.',
+} as const;
+
+const proj = (H: readonly number[], p: Vec2): Vec2 => applyH(H as number[], p.x, p.y);
+
+/** Remembers the live selection in frame px (null when nothing is selected). A ball not in `balls` is remembered where it was last seen. */
+export function rememberInFrame(
+  s: Pick<AppState, 'targetId' | 'targetMem' | 'cueOverrideId' | 'cueMem' | 'pocketId' | 'landing'>,
+  balls: readonly Ball[],
+  table: Pick<TableSpec, 'pockets'>,
+  cal: FrameCalibration,
+): FrameMemory | null {
+  const spot = (id: string | null, mem: SelectionMemory | null): FrameSpot | null => {
+    if (!id) return null;
+    const b = balls.find((x) => x.id === id);
+    const pos = b?.pos ?? (mem && mem.id === id ? mem.pos : null);
+    if (!pos) return null;
+    const label = b?.label ?? (mem && mem.id === id ? mem.label : undefined);
+    return { px: proj(cal.HR, pos), ...(label ? { label } : {}) };
+  };
+  const target = spot(s.targetId, s.targetMem);
+  const cue = spot(s.cueOverrideId, s.cueMem);
+  const pocket = s.pocketId ? table.pockets.find((p) => p.id === s.pocketId) : undefined;
+  const mem: FrameMemory = {
+    target,
+    cue,
+    pocketPx: target && pocket ? proj(cal.H0, pocket.mouthCenter) : null,
+    landingPx: target && s.landing ? proj(cal.H0, s.landing) : null,
+  };
+  return mem.target || mem.cue ? mem : null;
+}
+
+/**
+ * The ball of `balls` (new table frame, through `HR`) the camera sees where `mem` was: the nearest
+ * within the tolerance, the same label preferred. Tolerance: max(12 px, 2 ball radii in px there)
+ * for a ball with the remembered label; max(6 px, 1 radius) for any other (the same ball whose colour
+ * name changed sits on the spot, while a touching neighbour is 2 radii away). `tolPx` sets both.
+ * Null when none is close enough.
+ */
+export function remapThroughFrame(
+  mem: FrameSpot,
+  balls: readonly Ball[],
+  HR: readonly number[],
+  R: number,
+  opts: { exclude?: readonly (string | null | undefined)[]; allowCue?: boolean; tolPx?: number } = {},
+): string | null {
+  let best: { id: string; d: number; same: boolean } | null = null;
+  for (const b of balls) {
+    if (opts.exclude?.includes(b.id) || (b.kind === 'cue' && !opts.allowCue)) continue;
+    const c = proj(HR, b.pos);
+    const e = proj(HR, { x: b.pos.x + R, y: b.pos.y });
+    const rPx = Math.hypot(e.x - c.x, e.y - c.y);
+    const same = !!mem.label && b.label === mem.label;
+    const tol = opts.tolPx ?? (same || !mem.label ? Math.max(12, 2 * rPx) : Math.max(6, rPx));
+    const d = Math.hypot(c.x - mem.px.x, c.y - mem.px.y);
+    if (!(d <= tol)) continue;
+    if (!best || (same && !best.same) || (same === best.same && d < best.d)) best = { id: b.id, d, same };
+  }
+  return best?.id ?? null;
+}
+
+/** The pocket whose mouth (through the new frame's H0) is where `px` was, within tolPx; else null. */
+export function pocketThroughFrame(px: Vec2, pockets: TableSpec['pockets'], H0: readonly number[], tolPx = 40): PocketId | null {
+  let best: { id: PocketId; d: number } | null = null;
+  for (const p of pockets) {
+    const q = proj(H0, p.mouthCenter);
+    const d = Math.hypot(q.x - px.x, q.y - px.y);
+    if (d <= tolPx && (!best || d < best.d)) best = { id: p.id, d };
+  }
+  return best?.id ?? null;
+}
+
+/** The cloth point (new table frame) the camera sees at `px`, or null when H0 cannot be inverted. */
+export function landingThroughFrame(px: Vec2, H0: readonly number[]): Vec2 | null {
+  try {
+    const p = applyH(invert3(H0 as number[]), px.x, px.y);
+    return Number.isFinite(p.x) && Number.isFinite(p.y) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The remembered selection in the new frame. `found`: every remembered ball was found (the target and
+ * the marked cue ball); until then the caller keeps waiting (a ball may be hidden for a moment).
+ */
+export function restoreFromFrame(
+  mem: FrameMemory,
+  balls: readonly Ball[],
+  table: Pick<TableSpec, 'pockets' | 'ballRadius'>,
+  cal: FrameCalibration,
+): { targetId: string | null; cueOverrideId: string | null; pocketId: PocketId | null; landing: Vec2 | null; found: boolean } {
+  const R = table.ballRadius;
+  const cueOverrideId = mem.cue ? remapThroughFrame(mem.cue, balls, cal.HR, R, { allowCue: true }) : null;
+  const targetId = mem.target ? remapThroughFrame(mem.target, balls, cal.HR, R, { exclude: [cueOverrideId] }) : null;
+  const pocketId = mem.pocketPx ? pocketThroughFrame(mem.pocketPx, table.pockets, cal.H0) : null;
+  const landing = mem.landingPx ? landingThroughFrame(mem.landingPx, cal.H0) : null;
+  const found = (!mem.target || !!targetId) && (!mem.cue || !!cueOverrideId);
+  return { targetId, cueOverrideId, pocketId, landing, found };
 }

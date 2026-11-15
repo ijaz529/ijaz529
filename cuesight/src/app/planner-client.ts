@@ -11,14 +11,18 @@
  *    (`onFailure`), so no spinner waits forever; a failed worker is dropped and recreated on the next send;
  *  - the worker's evaluation-budget figures (`perEvalMs`, from every recommendation reply) are kept
  *    here and sent with each recommendation, so a restarted worker searches with the same budget and
- *    the same request still gets the same stroke.
+ *    the same request still gets the same stroke;
+ *  - the full plan with the frozen power advice (`plan`) is debounced like a recommendation (a slider
+ *    drag asks once, where it settles) and accepted only for the key the app still shows; while one is
+ *    awaited the worker is not restarted.
  */
-import type { Stroke } from '../core/types';
-import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut, type PlannerPerEvalMs } from '../workers/protocol';
+import type { PhysicsParams, Recommendation, ShotRequest, Stroke, TableLayout } from '../core/types';
+import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut, type PlannerPerEvalMs, type PlannerPlanOptions } from '../workers/protocol';
 
-export type PlannerKind = 'recommend' | 'suggest' | 'heatmap';
+export type PlannerKind = 'recommend' | 'suggest' | 'heatmap' | 'plan';
 type Msg<K extends PlannerIn['type']> = Omit<Extract<PlannerIn, { type: K }>, 'v' | 'id'>;
 export type RecommendationReply = Extract<PlannerOut, { type: 'recommendation' }>;
+export type PlanReply = Extract<PlannerOut, { type: 'plan' }>;
 
 /** Calls `onFail` when `worker` cannot load its script or deliver a message (and stops the default console error). */
 export function watchWorker(worker: Worker, onFail: (message: string) => void): void {
@@ -34,7 +38,11 @@ export interface PlannerClientOptions {
   createWorker(): Worker;
   /** Debounce of recommendations (ms, default 180). */
   debounceMs?: number;
+  /** Debounce of full-plan requests (ms, default 120). */
+  planDebounceMs?: number;
   onRecommendation(key: string, m: RecommendationReply): void;
+  /** The full plan (frozen power advice included) for `key`, the plan key the app still shows. */
+  onPlan?(key: string, m: PlanReply): void;
   onSuggestions(m: Extract<PlannerOut, { type: 'suggestions' }>): void;
   onHeatmap(m: Extract<PlannerOut, { type: 'heatmap' }>): void;
   /** A pending request of `kind` failed (an error reply, or the worker died); `key` for recommendations. */
@@ -50,6 +58,10 @@ export function createPlannerClient(o: PlannerClientOptions) {
   let wantedKey: string | null = null;
   const keyById = new Map<number, string>();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  /** The same for full-plan requests, and the message of the one awaited (re-sent after a restart). */
+  let wantedPlanKey: string | null = null;
+  let planTimer: ReturnType<typeof setTimeout> | undefined;
+  let planSent: Msg<'plan'> | null = null;
   /** A sent recommendation whose reply has not arrived yet (the worker is busy with it). */
   let computing: number | null = null;
   /** Per-evaluation cost by ball count measured by a planner worker of this page (outlives restarts). */
@@ -68,11 +80,11 @@ export function createPlannerClient(o: PlannerClientOptions) {
 
   function fail(message: string): void {
     drop();
-    for (const kind of ['recommend', 'suggest', 'heatmap'] as const) {
+    for (const kind of ['recommend', 'suggest', 'heatmap', 'plan'] as const) {
       const id = latest[kind];
       if (id === undefined) continue;
       delete latest[kind];
-      const key = kind === 'recommend' ? keyById.get(id) : undefined;
+      const key = kind === 'recommend' || kind === 'plan' ? keyById.get(id) : undefined;
       keyById.delete(id);
       o.onFailure(kind, key, message);
     }
@@ -121,6 +133,15 @@ export function createPlannerClient(o: PlannerClientOptions) {
         delete latest.heatmap;
         o.onHeatmap(m);
         return;
+      case 'plan': {
+        if (m.id !== latest.plan) return;
+        const key = keyById.get(m.id);
+        keyById.delete(m.id);
+        delete latest.plan;
+        if (key === undefined || key !== wantedPlanKey) return;
+        o.onPlan?.(key, m);
+        return;
+      }
       case 'error': {
         if (m.id !== undefined && m.id === computing) computing = null;
         if (m.id === undefined) {
@@ -128,10 +149,10 @@ export function createPlannerClient(o: PlannerClientOptions) {
           fail(m.message);
           return;
         }
-        const kind = (['recommend', 'suggest', 'heatmap'] as const).find((k) => latest[k] === m.id);
+        const kind = (['recommend', 'suggest', 'heatmap', 'plan'] as const).find((k) => latest[k] === m.id);
         if (!kind) return; // an old request nobody waits for any more
         delete latest[kind];
-        const key = kind === 'recommend' ? keyById.get(m.id) : undefined;
+        const key = kind === 'recommend' || kind === 'plan' ? keyById.get(m.id) : undefined;
         keyById.delete(m.id);
         o.onFailure(kind, key, m.message);
         return;
@@ -155,8 +176,15 @@ export function createPlannerClient(o: PlannerClientOptions) {
       const captured = { ...msg };
       timer = setTimeout(() => {
         timer = undefined;
-        // Still computing a superseded stroke and nothing else waits on this worker: start afresh.
-        if (computing !== null && latest.suggest === undefined && latest.heatmap === undefined) drop();
+        // Still computing a superseded stroke and nothing else waits on this worker: start afresh. A
+        // plan request queued behind it is asked again of the new worker (it takes milliseconds).
+        if (computing !== null && latest.suggest === undefined && latest.heatmap === undefined) {
+          const replay = latest.plan !== undefined && planSent ? { key: keyById.get(latest.plan), msg: planSent } : null;
+          if (latest.plan !== undefined) keyById.delete(latest.plan);
+          drop();
+          if (replay?.key !== undefined) keyById.set(post('plan', replay.msg), replay.key);
+          else delete latest.plan;
+        }
         const id = post('recommend', Object.keys(perEvalMs).length ? { ...captured, perEvalMs: { ...perEvalMs } } : captured);
         computing = id;
         keyById.set(id, key);
@@ -165,18 +193,40 @@ export function createPlannerClient(o: PlannerClientOptions) {
     send(kind: 'suggest' | 'heatmap', msg: Msg<'suggest'> | Msg<'heatmap'>): number {
       return post(kind, msg);
     },
-    /** Nothing of `kind` is wanted any more: a scheduled recommendation is not sent, a late reply is dropped. */
+    /**
+     * Asks for the full plan (frozen power advice included) for plan key `key` after the debounce.
+     * Supersedes every earlier plan request; `msg` is captured now.
+     */
+    plan(key: string, msg: Msg<'plan'>): void {
+      const inFlight = latest.plan !== undefined && keyById.get(latest.plan) === key;
+      if (key === wantedPlanKey && (planTimer !== undefined || inFlight)) return;
+      wantedPlanKey = key;
+      delete latest.plan;
+      clearTimeout(planTimer);
+      const captured = { ...msg };
+      planTimer = setTimeout(() => {
+        planTimer = undefined;
+        planSent = captured;
+        keyById.set(post('plan', captured), key);
+      }, o.planDebounceMs ?? 120);
+    },
+    /** Nothing of `kind` is wanted any more: a scheduled request is not sent, a late reply is dropped. */
     cancel(kind: PlannerKind): void {
       if (kind === 'recommend') {
         wantedKey = null;
         clearTimeout(timer);
         timer = undefined;
       }
+      if (kind === 'plan') {
+        wantedPlanKey = null;
+        clearTimeout(planTimer);
+        planTimer = undefined;
+      }
       delete latest[kind];
     },
     /** A request of `kind` is scheduled or awaiting its reply. */
     pending(kind: PlannerKind): boolean {
-      return latest[kind] !== undefined || (kind === 'recommend' && timer !== undefined);
+      return latest[kind] !== undefined || (kind === 'recommend' && timer !== undefined) || (kind === 'plan' && planTimer !== undefined);
     },
   };
 }
@@ -185,12 +235,58 @@ export type PlannerClient = ReturnType<typeof createPlannerClient>;
 /** What the app shows for a recommendation reply: the stroke to use (null = the basic stroke) and a toast. */
 export function recommendationOutcome(m: RecommendationReply, hasLanding: boolean): { stroke: Stroke | null; toast: string | null } {
   const found = m.evaluated > 0 && Number.isFinite(m.score);
-  // Nothing evaluated: the shot itself is not makeable, which the shot card already says.
-  if (!found) return { stroke: null, toast: hasLanding && m.evaluated > 0 ? 'No stroke reaches that spot cleanly — showing the basic stroke.' : null };
+  // Nothing evaluated: the shot itself is not makeable, which the shot card already says. Strokes
+  // tried and a non-finite score: none of them pots the ball (core types.ts), so say so.
+  if (!found) {
+    if (m.evaluated <= 0) return { stroke: null, toast: null };
+    return { stroke: null, toast: hasLanding ? 'No stroke reaches that spot cleanly — showing the basic stroke.' : 'None of the strokes tried pots this ball — showing the basic stroke.' };
+  }
   // `fragile` (core types.ts): no candidate was verified against ±6/±12 % speed errors — one scratched
   // or missed at some speed, or the budget ran out first. So: "may", and both ways it can go wrong.
   const fragile = m.fragile === true;
   if (hasLanding && !m.reachable) return { stroke: m.stroke, toast: 'That spot can’t be reached safely — showing the best stroke found.' };
   if (fragile) return { stroke: m.stroke, toast: 'This stroke may need precise pace: a little harder or softer could miss or scratch.' };
   return { stroke: m.stroke, toast: null };
+}
+
+/** What the app keeps of a recommendation (AppState.recommended), the shot card and labels read. */
+export interface RecommendedFields {
+  stroke: Stroke | null;
+  pending: false;
+  reachable: boolean;
+  evaluated: number;
+  /** Absent = not known (never "safe"); [] = the checks ran and saw no scratch. */
+  risks?: Recommendation['risks'];
+  /** No stroke was verified against ±6/±12 % speed errors: say the pace may matter. */
+  fragile?: boolean;
+  /** The search was cut short by its time cap: a partial search. */
+  timedOut?: boolean;
+  /** Next-shot quality 0..1 of the chosen stroke (default objective only). */
+  nextQuality?: number;
+}
+
+/**
+ * The recommendation reply as the app stores it: the outcome's stroke (null = the basic stroke), and
+ * wave 1's fragile / timedOut / nextQuality / risks exactly as the reply has them. A field the reply
+ * leaves out stays out: `risks` undefined means "not known", never an empty (safe) list.
+ */
+export function recommendedFromReply(m: RecommendationReply, out: { stroke: Stroke | null }): RecommendedFields {
+  return {
+    stroke: out.stroke,
+    pending: false,
+    reachable: m.reachable,
+    evaluated: m.evaluated,
+    ...(Array.isArray(m.risks) ? { risks: m.risks } : {}),
+    ...(typeof m.fragile === 'boolean' ? { fragile: m.fragile } : {}),
+    ...(typeof m.timedOut === 'boolean' ? { timedOut: m.timedOut } : {}),
+    ...(typeof m.nextQuality === 'number' && Number.isFinite(m.nextQuality) ? { nextQuality: m.nextQuality } : {}),
+  };
+}
+
+/**
+ * The identity of a plan request (`plan` messages): the exact ball positions (not rounded: the worker's
+ * plan replaces the shown one as is), the request, the physics and the options.
+ */
+export function planRequestKey(layout: TableLayout, request: ShotRequest, params: PhysicsParams, opts: PlannerPlanOptions): string {
+  return JSON.stringify([layout.table.id, layout.balls.map((b) => [b.id, b.kind, b.pos.x, b.pos.y]), request, params, opts]);
 }

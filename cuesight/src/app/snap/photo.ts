@@ -8,6 +8,7 @@
  * options are not supported, the full-size bitmap lives only until it is drawn, then it is closed.
  */
 import type { Frame } from '../../vision/image';
+import type { ClothModel } from '../../vision/table-detect';
 import { imageInfo, orientationTransform, orientedSize, withOrientation, type ImageInfo } from './exif';
 import type { PhotoSource } from './session';
 
@@ -160,4 +161,20 @@ export function photoFromVideo(video: HTMLVideoElement): Photo | null {
   const h = video.videoHeight;
   if (!w || !h) return null;
   return photoFromSource(video, w, h, 'camera');
+}
+
+/**
+ * The table photo's cloth model (HSV) → an sRGB cloth colour for the 3D table. A grey (neutral) model
+ * has no hue (table-detect stores 0, which is red), so it is drawn grey: saturation 0.
+ */
+export function clothRgbOf(c: Pick<ClothModel, 'hue' | 'sat' | 'val' | 'kind'> | null | undefined): [number, number, number] | undefined {
+  if (!c) return undefined;
+  const h = (((c.hue % 360) + 360) % 360) / 60;
+  const sat = c.kind === 'neutral' ? 0 : Math.max(0, Math.min(1, c.sat));
+  const v = Math.max(0.38, Math.min(0.62, c.val)); // photos are lit unevenly: keep the cloth in a sane band
+  const k = (n: number) => {
+    const x = (n + h) % 6;
+    return v - v * sat * Math.max(0, Math.min(1, Math.min(x, 4 - x)));
+  };
+  return [Math.round(k(5) * 255), Math.round(k(3) * 255), Math.round(k(1) * 255)];
 }

@@ -156,6 +156,9 @@ describe('power advice: one figure, and played at it nothing says too soft (advi
       const plan = planShot(lay, { targetId: 'b1', stroke: { power: 1, side: 0, vert } }, P, { record: false });
       if (!plan.makeable) continue;
       n++;
+      // Not frozen: the power advice never needs the stroke search, so nothing is skipped or "none".
+      expect(plan.adviceSkipped).toBeUndefined();
+      expect(plan.noWorkingPower).toBeUndefined();
       const w = softWarning(plan);
       const m = w && /[Pp]ower ([\d.]+)\+/.exec(w.message);
       if (!w || !m) continue;
@@ -236,7 +239,7 @@ describe('frozen cue ball: the power advice is checked power by power (frozen-ad
       const lay = frozenLayout(cue, ob);
       const tip = tips[k % tips.length]!;
       const power = [1, 1.5, 2][k % 3]!;
-      const plan = planShot(lay, { targetId: 'b1', stroke: { power, ...tip } }, P, { record: false });
+      const plan = planShot(lay, { targetId: 'b1', stroke: { power, ...tip } }, P, { record: false, advice: true });
       if (!plan.makeable) continue;
       const w = plan.warnings.find((x) => x.code === 'too-soft');
       if (!w || /Too far/.test(w.message)) continue;
@@ -250,8 +253,10 @@ describe('frozen cue ball: the power advice is checked power by power (frozen-ad
         const hi = m[3] ? 10 : m[2] ? Number(m[2]) : lo;
         expect(lo, where).toBe(advisePower(plan.minPower)); // the meter's minimum and the advice agree
         expect(lo, where).toBeGreaterThan(power);
+        expect(plan.noWorkingPower, where).toBeUndefined(); // a power on the scale works
+        expect(plan.adviceSkipped, where).toBeUndefined();
         for (const q of halfSteps(lo, hi)) {
-          const again = planShot(lay, { targetId: 'b1', pocketId: plan.pocketId, stroke: { power: q, ...tip } }, P, { record: false });
+          const again = planShot(lay, { targetId: 'b1', pocketId: plan.pocketId, stroke: { power: q, ...tip } }, P, { record: false, advice: true });
           expect(again.obPocketed && !again.scratch, `at ${q}: ${where}`).toBe(true);
           expect(softWarning(again)?.message, `at ${q}: ${where}`).toBeUndefined();
           expect([...again.warnings.map((x) => x.message), again.tip].some((s) => POWER_WORDS.test(s)), `at ${q}: ${where}`).toBe(false);
@@ -263,6 +268,9 @@ describe('frozen cue ball: the power advice is checked power by power (frozen-ad
         seen.none++;
         expect(w.message, where).toMatch(/no power( with this [a-z ]+)? gets it in with pace/i);
         expect(plan.minPower, where).toBe(10.5);
+        // 10.5 here is not "needs more than full power": no power on the scale works with this tip,
+        // and the plan says why, so the app's meter can say the same as the warning.
+        expect(plan.noWorkingPower, where).toBe(/^Harder throws it less/.test(w.message.replace(/^.*?\. /, '')) ? 'throw' : 'other');
         // No half step above the played power pots it cleanly with this tip, up to full power.
         for (const q of halfSteps(Math.floor(power * 2) / 2 + 0.5, 10)) expect(clean(lay, plan.pocketId, q, tip.side, tip.vert), `at ${q}: ${where}`).toBe(false);
         const c = CENTRE.exec(w.message);
@@ -284,18 +292,19 @@ describe('frozen cue ball: the power advice is checked power by power (frozen-ad
   it("the verifier's chains: one step to a power that works, or no 'more power' when none does", () => {
     // Verifier 2's frozen-chain.ts: 'Use power 4+' → at 4 'Use power 5+' → at 5 throw-uncompensable.
     const bottomRight = frozenLayout({ x: -0.6068573321586506, y: 0.3306092833156285 }, { x: -0.5549026966094971, y: 0.30680091619491573 });
-    const br = planShot(bottomRight, { targetId: 'b1', stroke: { power: 2, side: 0, vert: 0.4 } }, P, { record: false });
+    const br = planShot(bottomRight, { targetId: 'b1', stroke: { power: 2, side: 0, vert: 0.4 } }, P, { record: false, advice: true });
     const brw = br.warnings.find((x) => x.code === 'too-soft')!.message;
     expect(brw).toMatch(/harder throws it less/i);
     expect(brw).toMatch(/no power with this follow gets it in with pace/);
     expect(brw).not.toMatch(/Use power|Power [\d.]+ gives/);
     expect(brw).toMatch(CENTRE);
+    expect(br.noWorkingPower).toBe('throw');
     // TR, draw at power 1: 'Use power 2.5+' → at 2.5 'Use power 4.5+' before; now one step.
     const topRight = frozenLayout({ x: -0.2451160266459315, y: 0.23962167347191393 }, { x: -0.1891063642501831, y: 0.25098126053810116 });
-    const tr = planShot(topRight, { targetId: 'b1', stroke: { power: 1, side: 0, vert: -0.4 } }, P, { record: false });
+    const tr = planShot(topRight, { targetId: 'b1', stroke: { power: 1, side: 0, vert: -0.4 } }, P, { record: false, advice: true });
     const m = RANGE.exec(tr.warnings.find((x) => x.code === 'too-soft')!.message)!;
     expect(m).not.toBeNull();
-    const at = planShot(topRight, { targetId: 'b1', pocketId: tr.pocketId, stroke: { power: Number(m[1]), side: 0, vert: -0.4 } }, P, { record: false });
+    const at = planShot(topRight, { targetId: 'b1', pocketId: tr.pocketId, stroke: { power: Number(m[1]), side: 0, vert: -0.4 } }, P, { record: false, advice: true });
     expect(at.obPocketed && !at.scratch).toBe(true);
     expect(at.warnings.filter((x) => x.code !== 'frozen').map((x) => x.code)).toEqual([]);
   });
@@ -303,12 +312,43 @@ describe('frozen cue ball: the power advice is checked power by power (frozen-ad
   it('advice: false (searches) keeps every code and outcome, and gives no power figure', () => {
     const lay = frozenLayout({ x: -0.2451160266459315, y: 0.23962167347191393 }, { x: -0.1891063642501831, y: 0.25098126053810116 });
     for (const vert of [-0.4, 0, 0.4]) {
-      const full = planShot(lay, { targetId: 'b1', stroke: { power: 1, side: 0, vert } }, P, { record: false });
+      const full = planShot(lay, { targetId: 'b1', stroke: { power: 1, side: 0, vert } }, P, { record: false, advice: true });
       const quick = planShot(lay, { targetId: 'b1', stroke: { power: 1, side: 0, vert } }, P, { record: false, advice: false });
       expect(quick.warnings.map((x) => x.code)).toEqual(full.warnings.map((x) => x.code));
       expect([quick.obPocketed, quick.scratch, quick.cueRest]).toEqual([full.obPocketed, full.scratch, full.cueRest]);
       expect(quick.warnings.find((x) => x.code === 'too-soft')?.message).toMatch(/^(Too soft — object ball stops short|Very soft — the object ball only just drops; any roll-off will miss)\.$/);
+      // The plan says the advice was skipped, so a caller that shows it knows to ask for it.
+      expect(quick.adviceSkipped).toBe(true);
+      expect(full.adviceSkipped).toBeUndefined();
+      // With the advice, everything but the too-soft wording, the minimums and the tip is the same plan.
+      const strip = (p: ShotPlan) => ({ ...p, warnings: p.warnings.map((x) => x.code), minPower: 0, minPowerCapture: 0, minPowerSafe: 0, tip: '', adviceSkipped: undefined, noWorkingPower: undefined });
+      expect(strip(quick)).toEqual(strip(full));
     }
+  });
+
+  it('the advice runs by default only for a plan that is shown (record on); a search plan (record: false) skips it', () => {
+    // The planner worker's evaluation-budget calibration and the stroke search plan with record: false:
+    // timed with the advice on, a too-soft frozen cue ball ran the advice's own stroke search inside
+    // the timing and cut the device budget several times (wave-1b merge reverify).
+    const lay = frozenLayout({ x: -0.2451160266459315, y: 0.23962167347191393 }, { x: -0.1891063642501831, y: 0.25098126053810116 });
+    const req = { targetId: 'b1', stroke: { power: 1, side: 0, vert: -0.4 } };
+    const soft = (p: ShotPlan) => p.warnings.find((x) => x.code === 'too-soft')!.message;
+    const search = planShot(lay, req, P, { record: false });
+    expect(search.adviceSkipped).toBe(true);
+    expect(soft(search)).toBe('Too soft — object ball stops short.');
+    const shown = planShot(lay, req, P); // what the app draws (record on)
+    expect(shown.adviceSkipped).toBeUndefined();
+    expect(soft(shown)).toMatch(RANGE);
+    // Either default can be overridden.
+    expect(soft(planShot(lay, req, P, { record: false, advice: true }))).toBe(soft(shown));
+    expect(planShot(lay, req, P, { advice: false }).adviceSkipped).toBe(true);
+    // A plan the advice never applies to (not frozen) is the same whatever the option.
+    const loose = frozenLayout({ x: -0.6, y: 0.2 }, { x: -0.1891063642501831, y: 0.25098126053810116 });
+    const a = planShot(loose, { targetId: 'b1', stroke: { power: 1, side: 0, vert: 0 } }, P, { record: false });
+    const b = planShot(loose, { targetId: 'b1', stroke: { power: 1, side: 0, vert: 0 } }, P, { record: false, advice: true });
+    expect(a.adviceSkipped).toBeUndefined();
+    expect(a.warnings).toEqual(b.warnings);
+    expect(a.minPower).toBe(b.minPower);
   });
 });
 

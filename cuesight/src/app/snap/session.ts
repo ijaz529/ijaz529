@@ -3,7 +3,7 @@
  * dispatches events and renders whatever state comes back. Photos themselves (pixels) live outside the
  * state, in the controller, and are dropped whenever the session returns to `intro` (FR-122).
  */
-import type { Ball, Vec2 } from '../../core/types';
+import type { Ball, ShotPlan, Stroke, Vec2 } from '../../core/types';
 import type { VisionResult } from '../../vision/pipeline';
 import type { PlayerViewResult } from '../../vision/player-view';
 
@@ -71,7 +71,18 @@ export type SnapEvent =
   | { type: 'back-to-guide' };
 
 export const SNAP_MESSAGES = {
-  noTable: "I couldn't find the table in this photo. Tap its four corners, or retake it with the whole cloth in view.",
+  /**
+   * No table in the table photo. The merged vision refuses a table cut off by the photo's border (no
+   * border-hugging quad), the usual cause, so this says what the photo needs; tapping the corners only
+   * helps when all four are in it.
+   */
+  noTable: 'The whole table must be in the photo — step back or turn the phone and retake it. All four corners already in view? Tap them.',
+  /** Four tapped corners that cannot be a table outline (VisionResult.reason 'bad-quad'). */
+  badCorners: 'Those four taps aren’t the cloth corners — tap them again.',
+  /** No cloth colour could be learned inside the tapped corners (reason 'cloth-unknown'). */
+  clothUnknown: 'Couldn’t tell the cloth from its surroundings — tap the four cloth corners again, or retake the photo.',
+  /** Tapped corners whose quad is not mostly cloth (reason 'moved' on a still: one photo, nothing moved). */
+  cornersLoose: 'Your four corners don’t quite match the cloth — check the layout, or tap the corners again.',
   noBalls: "I found the table but no balls. Retake the photo a little closer, or add the balls by hand.",
   noCue: "I couldn't tell which ball is the cue ball. Tap “Cue ball”, then tap it on the table.",
   decode: "That photo couldn't be opened. Try another one.",
@@ -96,9 +107,21 @@ export function initialSnap(): SnapSession {
   return { step: 'intro', overview: null, layout: null, corners: null, cornerTaps: [], player: null, taps: {}, error: null };
 }
 
-/** True when the table photo detection is usable (table found and at least one ball). */
+/**
+ * The table photo gives a layout to check: the whole table was found (a calibration). A table found
+ * without balls still does (the player adds them by hand). No calibration: no table, which is also what
+ * the merged vision returns for a table cut off by the photo's border.
+ */
 export function detectionUsable(v: VisionResult): boolean {
-  return !!v.calibration && v.balls.length > 0;
+  return !!v.calibration;
+}
+
+/** Why a table photo gave no layout, in the player's words (VisionResult.reason for tapped corners). */
+function noLayoutMessage(v: VisionResult): string {
+  const reason = 'reason' in v && typeof v.reason === 'string' ? v.reason : undefined;
+  if (reason === 'bad-quad') return SNAP_MESSAGES.badCorners;
+  if (reason === 'cloth-unknown') return SNAP_MESSAGES.clothUnknown;
+  return SNAP_MESSAGES.noTable;
 }
 
 export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
@@ -110,9 +133,12 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
     case 'overview-result': {
       if (!s.overview) return s;
       const overview = { ...s.overview, vision: e.vision };
-      if (!e.vision.calibration) return { ...s, step: 'overview-error', overview, layout: null, cornerTaps: [], error: SNAP_MESSAGES.noTable };
-      // A table without balls is still useful: the player can add balls by hand.
-      return { ...s, step: 'review', overview, layout: e.balls, cornerTaps: [], player: null, taps: {}, error: e.balls.length ? null : SNAP_MESSAGES.noBalls };
+      if (!detectionUsable(e.vision)) return { ...s, step: 'overview-error', overview, layout: null, cornerTaps: [], error: noLayoutMessage(e.vision) };
+      // Tapped corners that give a table but whose quad is not mostly cloth ('moved' on one photo).
+      const loose = 'reason' in e.vision && e.vision.reason === 'moved';
+      // A table without balls is still useful: the player can add balls by hand. (With loose corners,
+      // the corners are the first thing to check: they may be why no ball was found.)
+      return { ...s, step: 'review', overview, layout: e.balls, cornerTaps: [], player: null, taps: {}, error: loose ? SNAP_MESSAGES.cornersLoose : e.balls.length ? null : SNAP_MESSAGES.noBalls };
     }
     case 'overview-failed':
       return s.overview ? { ...s, step: 'overview-error', error: e.message } : { ...initialSnap(), error: e.message };
@@ -172,4 +198,32 @@ export function fitCheck(s: SnapSession, targetId: string | null): 'current' | '
 /** The step the progress indicator highlights: 1 (table) or 2 (your view). */
 export function snapStage(step: SnapStep): 1 | 2 {
   return step === 'player-processing' || step === 'guide' || step === 'manual-taps' ? 2 : 1;
+}
+
+// --- Guide words -----------------------------------------------------------------------------------
+
+/** A frozen cue ball (touching the object ball): no ghost ball and no cut; the stroke angle is aimed. */
+export function frozenPlan(plan: Pick<ShotPlan, 'warnings'>): boolean {
+  return plan.warnings.some((w) => w.code === 'frozen');
+}
+
+/**
+ * The guide's aim line (the HUD under the photo): the ghost ball and the cut, or, for a frozen cue
+ * ball, the stroke's angle off the line of centres, in the frozen warning's words (planner.ts: CCW =
+ * left, under half a degree = straight through). `cue` / `target`: table positions of the two balls.
+ */
+export function snapAimText(plan: Pick<ShotPlan, 'warnings' | 'aimDir' | 'cutAngleDeg' | 'fractionPhrase'>, cue: Vec2 | null, target: Vec2 | null): string {
+  if (frozenPlan(plan) && cue && target) {
+    const lx = target.x - cue.x;
+    const ly = target.y - cue.y;
+    const off = (Math.atan2(lx * plan.aimDir.y - ly * plan.aimDir.x, lx * plan.aimDir.x + ly * plan.aimDir.y) * 180) / Math.PI;
+    return Math.abs(off) >= 0.5 ? `Frozen: stroke ${Math.abs(off).toFixed(0)}° to the ${off > 0 ? 'left' : 'right'} of the line of centres` : 'Frozen: stroke straight through the line of centres';
+  }
+  return `Aim at the ghost ball · ${plan.cutAngleDeg.toFixed(0)}° cut, ${plan.fractionPhrase.replace(/-/g, '‑')}`;
+}
+
+/** The guide step's top instruction for a playable plan (`spin` words the strike point: guide.ts strikeWords). */
+export function snapGuideInstruction(plan: Pick<ShotPlan, 'warnings' | 'stroke'>, spin: (s: Stroke) => string): string {
+  const strike = `Strike ${spin(plan.stroke)} (the blue dot on the ball's face).`;
+  return frozenPlan(plan) ? `Frozen balls: aim the stroke, not a ghost ball. ${strike}` : `Aim at the ghost ball. ${strike}`;
 }

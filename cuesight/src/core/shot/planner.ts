@@ -19,7 +19,7 @@
  *    'cb-short' (the cue ball never gets to the object ball) or 'too-soft', checked against it.
  *    Frozen CB too soft: the stroke angle (and so the minimum) moves with the power, so the advice
  *    re-plans the stroke at each half step above and quotes only powers that pot it with pace and
- *    keep the cue ball up, or says none does (PlanOptions.advice: false skips this for searches).
+ *    keep the cue ball up, or says none does (off by default for search plans, record: false).
  * 6. Coaching in player language: the tip, the stroke's name, the direction of the throw shift.
  */
 import { straightLineState, throwAngle } from '../physics/analytic';
@@ -451,11 +451,14 @@ export interface PlanOptions {
   aimErrorRad?: number;
   actualSquirtMassRatio?: number;
   /**
-   * Work out the power to advise for a frozen cue ball the plan calls too soft (default true): the
-   * stroke is re-planned at each half step above the played power (≈ 20–30 ms in all, against
-   * ≈ 1 ms for the plan itself). Searches that read only the warning codes (the position search,
-   * suggestions) pass false: the warning keeps its code and gives no power figure, and minPower
-   * stays the minimum for the stroke angle at the played power.
+   * Work out the power to advise for a frozen cue ball the plan calls too soft: the stroke is
+   * re-planned at each half step above the played power (≈ 8–70 ms in all on a desktop, more on a
+   * phone, against ≈ 1 ms for the plan itself). Default: on for a plan that is shown (record on),
+   * off for a search plan (record: false) — the position search, suggestions and the planner
+   * worker's evaluation-budget timing read only the warning codes, and timed with the advice on, a
+   * too-soft frozen cue ball cut the device budget several times. Without it the warning keeps its
+   * code and gives no power figure, minPower stays the minimum for the stroke angle at the played
+   * power, and the plan says `adviceSkipped`.
    */
   advice?: boolean;
 }
@@ -712,7 +715,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
    * of a step, so advisePower of it is the first figure quoted), or 10.5 when none does. At most
    * 18 + 19 checks, and only for a frozen stroke the card calls too soft.
    */
-  const frozenSoftAdvice = (kind: 'short' | 'very-soft'): { text: string; minPower: number } => {
+  const frozenSoftAdvice = (kind: 'short' | 'very-soft'): { text: string; minPower: number; none?: 'throw' | 'other' } => {
     const above = (Math.floor(stroke.power / POWER_ADVICE_STEP + 1e-9) + 1) * POWER_ADVICE_STEP;
     const band = powerBand(above, (q) => frozenCheck(q, stroke.side, stroke.vert));
     if (band.lo !== null) {
@@ -734,14 +737,20 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       band.end === 'throw' && band.endAt !== null
         ? `Harder throws it less (from power ${powerFigure(band.endAt)} it misses), so no ${what}.`
         : `No ${what}.`;
-    // No power on the scale gets this stroke there with pace: minimumPower's "not even at full power".
-    if (!spin) return { text: none, minPower: 10.5 };
+    // No power on the scale gets this stroke there with pace: minimumPower's "not even at full power",
+    // but more power is not the answer (noWorkingPower says why).
+    const why = band.end === 'throw' && band.endAt !== null ? 'throw' : 'other';
+    if (!spin) return { text: none, minPower: 10.5, none: why };
     const centre = powerBand(1, (q) => frozenCheck(q, 0, 0));
     return {
       text: `${none} ${centre.lo !== null ? `Centre ball gets it in ${centreText(centre)}.` : "Centre ball doesn't either."}`,
       minPower: 10.5,
+      none: why,
     };
   };
+  const advice = opts.advice ?? opts.record !== false;
+  let adviceSkipped = false;
+  let noWorkingPower: 'throw' | 'other' | undefined;
   if (cbShort)
     warnings.splice(softAt + (geo.frozen ? 1 : 0), 0, {
       code: 'cb-short',
@@ -767,11 +776,14 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10) kind = 'very-soft';
     if (kind) {
       const head = kind === 'short' ? 'Too soft — object ball stops short.' : 'Very soft — the object ball only just drops; any roll-off will miss.';
-      if (geo.frozen && opts.advice === false) soft = head;
-      else if (geo.frozen) {
+      if (geo.frozen && !advice) {
+        soft = head;
+        adviceSkipped = true;
+      } else if (geo.frozen) {
         const f = frozenSoftAdvice(kind);
         soft = `${head} ${f.text}`;
         minPower = f.minPower;
+        noWorkingPower = f.none;
         // Kept ≤ minPower (its contract): at the played power's stroke angle it can be the higher of
         // the two, but the stroke pots at minPower.
         minPowerCapture = Math.min(minPowerCapture, minPower);
@@ -834,6 +846,8 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     minPower,
     minPowerCapture,
     minPowerSafe: minPower,
+    ...(noWorkingPower ? { noWorkingPower } : {}),
+    ...(adviceSkipped ? { adviceSkipped } : {}),
     cuePath,
     objectPath,
     otherPaths,

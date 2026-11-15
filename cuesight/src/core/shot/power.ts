@@ -58,7 +58,16 @@ export function speedWord(power: number): string {
   return 'power';
 }
 
-/** One cue tip ≈ ¼ of the ball radius of offset. */
+/**
+ * The app's tip unit: "1 tip" = ¼ of the ball radius of tip offset from the centre (≈ 7 mm on a pool
+ * ball, ≈ 6.5 mm on a snooker ball), so the practical miscue limit of 0.5 R (physics/analytic.ts
+ * MISCUE_LIMIT; Alciatore, "The Illustrated Principles of Pool and Billiards", miscue limit about half
+ * the ball radius) is 2 tips, and the words run ¼ … 2 tips in quarter steps.
+ * ASSUMPTION (a coaching convention, not physics; decided in wave 2b): coaches also say "a tip" for
+ * one tip-width of offset (≈ 12–13 mm ≈ 0.45 R), which would put the miscue limit at about 1 tip and
+ * leave no words for the small offsets the planner uses. The shot card's details give the offset in
+ * mm as well (tipOffsetMm), so a player who counts tip-widths can read it either way.
+ */
 export const TIP_FRACTION = 0.25;
 
 const TIP_WORDS: [number, string][] = [

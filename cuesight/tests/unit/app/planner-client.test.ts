@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPlannerClient, recommendationOutcome, watchWorker, type PlannerKind, type RecommendationReply } from '../../../src/app/planner-client';
+import { createPlannerClient, recommendationOutcome, recommendedFromReply, watchWorker, type PlannerKind, type RecommendationReply } from '../../../src/app/planner-client';
 import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut } from '../../../src/workers/protocol';
 
 /** A planner worker the test answers by hand. */
@@ -216,6 +216,103 @@ describe('planner client: stale replies are dropped (the stale-result rule)', ()
   });
 });
 
+describe('planner client: the full plan (frozen power advice) is computed in the worker', () => {
+  // A too-soft frozen cue ball's advice re-plans the stroke at every half step (8–70 ms on a desktop,
+  // more on a phone): main.ts shows the plan without it at once and asks the worker for the rest.
+  let workers: FakeWorker[];
+  let plans: [string, number][];
+  let fails: [PlannerKind, string | undefined][];
+  let client: ReturnType<typeof createPlannerClient>;
+  const planMsg = (target: string, power: number) => ({ type: 'plan' as const, layout: { target } as never, request: { targetId: target, stroke: { power, side: 0, vert: 0 } }, params: {} as never });
+  const planReply = (id: number): PlannerOut => ({ v: PROTOCOL_VERSION, type: 'plan', id, plan: {} as never });
+  beforeEach(() => {
+    vi.useFakeTimers();
+    workers = [];
+    plans = [];
+    fails = [];
+    client = createPlannerClient({
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w as unknown as Worker;
+      },
+      onRecommendation: () => {},
+      onSuggestions: () => {},
+      onHeatmap: () => {},
+      onPlan: (key, m) => plans.push([key, m.id]),
+      onFailure: (kind, key) => fails.push([kind, key]),
+    });
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('is debounced (a slider drag asks once, for where it settles) and only the latest key is accepted', () => {
+    client.plan('p1', planMsg('b1', 1));
+    vi.advanceTimersByTime(60);
+    client.plan('p1.5', planMsg('b1', 1.5));
+    vi.advanceTimersByTime(60);
+    client.plan('p2', planMsg('b1', 2));
+    expect(workers.length).toBe(0); // nothing sent while the slider moves
+    vi.advanceTimersByTime(120);
+    const w = workers[0]!;
+    expect(w.posted.map((m) => m.type)).toEqual(['plan']);
+    expect((w.last('plan') as Extract<PlannerIn, { type: 'plan' }>).request.stroke!.power).toBe(2);
+    expect(client.pending('plan')).toBe(true);
+    w.reply(planReply(w.last('plan').id));
+    expect(plans).toEqual([['p2', w.last('plan').id]]);
+    expect(client.pending('plan')).toBe(false);
+  });
+
+  it('a reply for a plan the app no longer shows is dropped (newer request, or cancelled)', () => {
+    client.plan('p1', planMsg('b1', 1));
+    vi.advanceTimersByTime(120);
+    const w = workers[0]!;
+    const first = w.last('plan').id;
+    client.plan('p2', planMsg('b1', 2));
+    w.reply(planReply(first)); // lands inside p2's debounce
+    expect(plans).toEqual([]);
+    vi.advanceTimersByTime(120);
+    const second = w.last('plan').id;
+    client.cancel('plan'); // the next replan needed no advice
+    w.reply(planReply(second));
+    expect(plans).toEqual([]);
+    expect(client.pending('plan')).toBe(false);
+  });
+
+  it('a superseded recommendation is still abandoned by a restart; a pending plan request goes to the new worker', () => {
+    client.recommend('k1', msg('b1'));
+    vi.advanceTimersByTime(180);
+    client.plan('p', planMsg('b1', 1));
+    vi.advanceTimersByTime(120); // queued behind b1's search
+    client.recommend('k2', msg('b2'));
+    vi.advanceTimersByTime(180);
+    expect(workers.length).toBe(2);
+    expect(workers[0]!.terminated).toBe(true);
+    const w1 = workers[1]!;
+    expect(w1.posted.map((m) => m.type).sort()).toEqual(['plan', 'recommend']);
+    expect((w1.last('plan') as Extract<PlannerIn, { type: 'plan' }>).request.stroke!.power).toBe(1);
+    expect(client.pending('plan')).toBe(true);
+    w1.reply(planReply(w1.last('plan').id));
+    expect(plans.map((p) => p[0])).toEqual(['p']);
+    expect(fails).toEqual([]);
+  });
+
+  it('an error reply or a failed worker ends the wait (the plan without the advice stays)', () => {
+    client.plan('p', planMsg('b1', 1));
+    vi.advanceTimersByTime(120);
+    const w = workers[0]!;
+    w.reply({ v: PROTOCOL_VERSION, type: 'error', id: w.last('plan').id, message: 'boom' });
+    expect(fails).toEqual([['plan', 'p']]);
+    client.plan('q', planMsg('b1', 2));
+    vi.advanceTimersByTime(120);
+    w.onerror!({ preventDefault: vi.fn(), message: 'gone' } as unknown as Event);
+    expect(fails).toEqual([
+      ['plan', 'p'],
+      ['plan', 'q'],
+    ]);
+    expect(client.pending('plan')).toBe(false);
+  });
+});
+
 describe('recommendationOutcome: what the app shows for a recommendation', () => {
   it('keeps a found stroke, and says honestly when the spot cannot be reached', () => {
     expect(recommendationOutcome(recReply(1), false)).toEqual({ stroke, toast: null });
@@ -235,6 +332,35 @@ describe('recommendationOutcome: what the app shows for a recommendation', () =>
     expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 0, reachable: false }), true)).toEqual({ stroke: null, toast: null });
     expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 30, reachable: false }), true)).toEqual({ stroke: null, toast: 'No stroke reaches that spot cleanly — showing the basic stroke.' });
     expect(recommendationOutcome(recReply(1, { score: Number.NaN }), false).stroke).toBeNull();
+  });
+  it('says so when strokes were tried and none pots the ball (score −Infinity), with or without a landing spot', () => {
+    // Core types.ts: −Infinity only when no stroke pots the ball. The app falls back to the basic stroke.
+    expect(recommendationOutcome(recReply(1, { score: -Infinity, evaluated: 30, reachable: false }), false)).toEqual({
+      stroke: null,
+      toast: 'None of the strokes tried pots this ball — showing the basic stroke.',
+    });
+  });
+});
+
+describe('recommendedFromReply: what the app keeps of a recommendation (wave-1 Recommendation fields)', () => {
+  it('keeps fragile, timedOut, nextQuality and risks; absent stays absent (risks undefined = not known, never "safe")', () => {
+    const out = recommendationOutcome(recReply(1), false);
+    expect(recommendedFromReply(recReply(1), out)).toEqual({ stroke, pending: false, reachable: true, evaluated: 40 });
+    const risks = [{ pocketId: 'TR' as const, scratchIf: 'harder' as const }];
+    const full = { ...recReply(1, { reachable: false, evaluated: 77 }), fragile: true, timedOut: true, nextQuality: 0.42, risks } as RecommendationReply;
+    const r = recommendedFromReply(full, recommendationOutcome(full, false));
+    expect(r).toEqual({ stroke, pending: false, reachable: false, evaluated: 77, fragile: true, timedOut: true, nextQuality: 0.42, risks });
+    // An empty list is a real "no scratch seen", kept as such.
+    expect(recommendedFromReply(recReply(1, { risks: [] }), out).risks).toEqual([]);
+    expect('risks' in recommendedFromReply(recReply(1), out)).toBe(false);
+    // Only what the reply says: false and 0 are kept, non-finite qualities dropped.
+    const r2 = recommendedFromReply({ ...recReply(1), fragile: false, timedOut: false, nextQuality: 0 } as RecommendationReply, out);
+    expect(r2).toMatchObject({ fragile: false, timedOut: false, nextQuality: 0 });
+    expect('nextQuality' in recommendedFromReply({ ...recReply(1), nextQuality: Number.NaN } as RecommendationReply, out)).toBe(false);
+  });
+  it('the stroke is the outcome’s (null = the basic stroke when nothing pots it)', () => {
+    const none = recReply(1, { score: -Infinity, evaluated: 30, reachable: false });
+    expect(recommendedFromReply(none, recommendationOutcome(none, false)).stroke).toBeNull();
   });
 });
 

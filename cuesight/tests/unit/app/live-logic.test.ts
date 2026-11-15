@@ -3,8 +3,21 @@ import type { Ball, TableLayout, Vec2 } from '../../../src/core/types';
 import type { SelectionMemory } from '../../../src/app/store';
 import { makeTable } from '../../../src/core/table';
 import { DEFAULT_SETTINGS } from '../../../src/app/settings';
+import { applyH, homographyFrom4, invert3 } from '../../../src/vision/homography';
+import { createPipeline, type VisionResult } from '../../../src/vision/pipeline';
+import { BALL_COLORS, renderSyntheticTable, type SynthCamera } from '../../../src/vision/synth/render';
 import {
+  CALIBRATION_MESSAGES,
   LOCK_GRACE,
+  REMAP_MESSAGES,
+  REMAP_TTL,
+  cornersOutOfView,
+  landingThroughFrame,
+  nextCornersOut,
+  pocketThroughFrame,
+  rememberInFrame,
+  remapThroughFrame,
+  restoreFromFrame,
   STATUS_TEXT,
   applyCueOverride,
   bedPointFromProjection,
@@ -266,6 +279,21 @@ describe('status pill and hints', () => {
     // Frozen: the snapshot is what counts, not the live lock.
     expect(cameraHint({ ...base, status: 'searching', live: false, frozen: true, hasCue: true })).toBeNull();
   });
+  it('cameraHint: two whites too close to call (no ball is the cue) asks the player to tap the one they play with', () => {
+    const base = { error: false, status: 'locked' as const, live: true, frozen: false, balls: 4, hasCue: false, interaction: 'select' as const };
+    expect(cameraHint({ ...base, unsureWhites: 2 })).toBe('Two white balls — tap “Cue ball”, then tap the one you play with.');
+    expect(cameraHint({ ...base, unsureWhites: 1 })).toBe('No cue ball found — tap “Cue ball”, then tap the cue ball.');
+    expect(cameraHint({ ...base, unsureWhites: 2, interaction: 'mark-cue' })).toBe('Tap the cue ball.');
+    expect(cameraHint({ ...base, unsureWhites: 2, hasCue: true })).toBeNull();
+  });
+  it('the pill says when the locked table has corner pockets out of view, without a number', () => {
+    expect(pillText('locked', false, 1)).toBe('Table locked — a corner pocket is out of view');
+    expect(pillText('locked', false, 2)).toBe('Table locked — corner pockets are out of view');
+    expect(pillText('locked', false, 0)).toBe('Table locked');
+    expect(pillText('unstable', false, 2)).toBe(STATUS_TEXT.unstable);
+    expect(pillText('locked', true, 2)).toBe('Frozen layout');
+    for (const n of [1, 2]) expect(pillText('locked', false, n)).not.toMatch(/\d/);
+  });
 });
 
 describe('manual calibration feedback', () => {
@@ -275,22 +303,26 @@ describe('manual calibration feedback', () => {
     expect(calibrationFeedback({ status: 'locked', calibration: cal('manual'), cloth })).toEqual({ ok: true, retry: false, message: 'Calibrated from your four corners.' });
   });
   it('rejects corners that give no table', () => {
-    const bad = { ok: false, retry: true, message: 'Those corners don’t make a table — tap the 4 cloth corners again.' };
+    const bad = { ok: false, retry: true, message: 'Those four taps aren’t the cloth corners — tap them again.' };
     expect(calibrationFeedback({ status: 'locked', calibration: null, cloth })).toEqual(bad);
     expect(calibrationFeedback({ status: 'searching', calibration: null, cloth })).toEqual(bad);
     expect(calibrationFeedback({ status: 'searching', calibration: null, cloth, reason: 'bad-quad' })).toEqual(bad);
   });
   it('says when the cloth colour could not be learned', () => {
-    expect(calibrationFeedback({ status: 'locked', calibration: null, cloth: null })).toMatchObject({ ok: false, retry: true, message: expect.stringContaining('cloth colour') });
-    expect(calibrationFeedback({ status: 'searching', calibration: null, cloth, reason: 'cloth-unknown' })).toMatchObject({ message: expect.stringContaining('cloth colour') });
+    expect(calibrationFeedback({ status: 'locked', calibration: null, cloth: null })).toMatchObject({ ok: false, retry: true, message: expect.stringContaining('Couldn’t tell the cloth from its surroundings') });
+    expect(calibrationFeedback({ status: 'searching', calibration: null, cloth, reason: 'cloth-unknown' })).toMatchObject({ message: expect.stringContaining('Couldn’t tell the cloth from its surroundings') });
   });
-  it('says when the phone moved, and waits while the lock is still settling', () => {
+  it("the first check's 'moved' means the taps are off the cloth corners (nothing has moved yet), and it waits while the lock settles", () => {
+    // The pipeline anchors manual corners on the first frame computed with them, so there 'moved'
+    // can only mean "under 80 % of the tapped quad is cloth" (see the real-pipeline test below). The
+    // phone-moved message is for later frames (main.ts checkManualCorners).
     expect(calibrationFeedback({ status: 'unstable', calibration: cal('manual'), cloth, reason: 'moved' })).toEqual({
       ok: false,
-      retry: false,
-      message: 'The phone moved — tap Calibrate again or return to automatic detection.',
+      retry: true,
+      message: 'Those four taps aren’t the cloth corners — tap them again.',
     });
     expect(calibrationFeedback({ status: 'unstable', calibration: cal('manual'), cloth })).toBeNull();
+    expect(CALIBRATION_MESSAGES.moved).toBe('The phone moved — recalibrate, or tap Calibrate to go back to automatic detection.');
   });
   it('cornersPlausible rejects collinear, clustered, tiny or self-crossing taps', () => {
     const W = 640;
@@ -363,5 +395,268 @@ describe('bedPointFromProjection: the cloth point under a tap on the 3D table', 
   });
   it('is null when the bed is not projectable', () => {
     expect(bedPointFromProjection(() => null, { x: 1, y: 0.5 }, { x: 0, y: 0 })).toBeNull();
+  });
+});
+
+// --- Against the merged vision (src/vision/pipeline.ts), with the synthetic renderer ----------------
+const T9 = makeTable('pool9');
+const R9 = T9.ballRadius;
+const synth = [
+  { pos: { x: -0.7, y: -0.1 }, color: BALL_COLORS.cue! },
+  { pos: { x: 0.3, y: 0.15 }, color: BALL_COLORS.yellow! },
+  { pos: { x: -0.25, y: 0.4 }, color: BALL_COLORS.red! },
+  { pos: { x: 0.95, y: -0.05 }, color: BALL_COLORS.blue! },
+];
+const CORNER: SynthCamera = { pos: { x: -2.25, y: -1.5, z: 1.8 }, target: { x: 0.15, y: 0.05, z: 0 }, fovDeg: 66 };
+/** Further back with a wider lens: all four corners well inside a 640×360 frame. */
+const WHOLE: SynthCamera = { pos: { x: -2.6, y: -1.75, z: 2.1 }, target: { x: 0.15, y: 0.05, z: 0 }, fovDeg: 70 };
+const frameOf = (camera: SynthCamera) => renderSyntheticTable({ table: T9, balls: synth, camera, width: 640, height: 360 });
+const live = (r: VisionResult): Ball[] => r.balls.map((b) => ({ id: b.id, kind: b.isCue ? 'cue' : 'object', pos: b.pos, label: b.isCue ? 'cue' : b.label }));
+const until = (p: ReturnType<typeof createPipeline>, f: ReturnType<typeof frameOf>, ok: (r: VisionResult) => boolean, n = 12): VisionResult => {
+  let r = p.process(f);
+  for (let k = 0; k < n && !ok(r); k++) r = p.process(f);
+  return r;
+};
+const lockedWith = (n: number) => (r: VisionResult) => r.status === 'locked' && r.balls.length >= n;
+
+describe('the lock gate and the frozen-frame check against the merged vision (wave-1 items 15, 16)', () => {
+  it('a frame without a table gives no calibration: the gate closes at once, even within the grace after a lock', () => {
+    const p = createPipeline({ table: T9, fovDeg: 66 });
+    let since = Infinity;
+    const step = (f: ReturnType<typeof frameOf>) => {
+      const r = p.process(f);
+      since = nextSinceLocked(since, r.status);
+      return { r, open: liveGate(r.status, since, !!r.calibration) };
+    };
+    const table = frameOf(CORNER);
+    let s = step(table);
+    for (let k = 0; k < 10 && s.r.status !== 'locked'; k++) s = step(table);
+    expect(s.open).toBe(true);
+    // The camera swings to the floor: no quad, so no calibration and no balls (nothing stale drawn).
+    const floor = step(frameOf({ ...CORNER, target: { x: -3.5, y: -2.5, z: 0 } }));
+    expect(floor.r.calibration).toBeNull();
+    expect(floor.r.balls).toEqual([]);
+    expect(floor.r.status).not.toBe('locked');
+    expect(since).toBeLessThanOrEqual(LOCK_GRACE); // inside the grace …
+    expect(floor.open).toBe(false); // … but without a calibration the gate stays shut
+  });
+
+  it("an 'unstable' frame right after a lock still has a calibration: open within the grace only", () => {
+    const p = createPipeline({ table: T9, fovDeg: 66 });
+    const r0 = until(p, frameOf(CORNER), (r) => r.status === 'locked');
+    expect(r0.status).toBe('locked');
+    // A small shift of the phone: a new quad, the tracker settles again.
+    const moved = frameOf({ ...CORNER, pos: { x: -2.15, y: -1.42, z: 1.8 } });
+    let since = 0;
+    const seen: { status: string; cal: boolean; open: boolean }[] = [];
+    for (let k = 0; k < 4; k++) {
+      const r = p.process(moved);
+      since = nextSinceLocked(since, r.status);
+      seen.push({ status: r.status, cal: !!r.calibration, open: liveGate(r.status, since, !!r.calibration) });
+    }
+    const unstable = seen.filter((x) => x.status === 'unstable');
+    expect(unstable.length).toBeGreaterThan(0);
+    expect(unstable.every((x) => x.cal)).toBe(true); // the merged pipeline keeps the calibration there
+    seen.forEach((x, i) => expect(x.open, JSON.stringify(seen)).toBe(x.status === 'locked' || i + 1 <= LOCK_GRACE));
+  });
+
+  it('Rotate (swapAxes) gives the same corners in another order: framesMatch refuses the frozen frame', () => {
+    const p = createPipeline({ table: T9, fovDeg: 66 });
+    const f = frameOf(CORNER);
+    const before = until(p, f, (r) => r.status === 'locked');
+    p.configure({ swapAxes: true });
+    const after = until(p, f, (r) => r.status === 'locked');
+    const diag = Math.hypot(640, 360);
+    expect(after.calibration).not.toBeNull();
+    // The same four image points …
+    for (const c of before.calibration!.corners) expect(Math.min(...after.calibration!.corners.map((q) => Math.hypot(q.x - c.x, q.y - c.y)))).toBeLessThan(0.01 * diag);
+    // … in another order: not the frozen frame.
+    expect(framesMatch(before.calibration!.corners, after.calibration!.corners, diag)).toBe(false);
+    p.configure({ swapAxes: false });
+    const back = until(p, f, (r) => r.status === 'locked');
+    expect(framesMatch(before.calibration!.corners, back.calibration!.corners, diag)).toBe(true);
+  });
+
+  it("manual corners tapped too wide: the first result already says 'moved' though the camera never moved", () => {
+    const p = createPipeline({ table: T9, fovDeg: 66 });
+    const f = frameOf(CORNER);
+    const auto = until(p, f, (r) => r.status === 'locked');
+    const c = auto.calibration!.corners;
+    const cx = c.reduce((a, q) => a + q.x, 0) / 4;
+    const cy = c.reduce((a, q) => a + q.y, 0) / 4;
+    p.configure({ manualCorners: c.map((q) => ({ x: cx + (q.x - cx) * 1.2, y: cy + (q.y - cy) * 1.2 })) });
+    const first = p.process(f); // the same frame: nothing moved
+    expect(first.reason).toBe('moved');
+    // So the first check says the taps are off, not that the phone moved.
+    expect(calibrationFeedback({ status: first.status, calibration: first.calibration, cloth: first.cloth, reason: first.reason })).toEqual({ ok: false, retry: true, message: CALIBRATION_MESSAGES.badQuad });
+  });
+});
+
+describe('corner pockets out of view (wave-1 item 20: the merged vision locks tables with corners just off-screen)', () => {
+  it('a locked table with a corner past the frame edge reports it; the whole table reports none', () => {
+    const p = createPipeline({ table: T9, fovDeg: 56 });
+    // 640×360 from the corner camera at a narrower lens: the near corner falls below the frame.
+    const f = renderSyntheticTable({ table: T9, balls: synth, camera: { ...CORNER, target: { x: 0.1, y: 0.05, z: 0 }, fovDeg: 56 }, width: 640, height: 360 });
+    const r = until(p, f, (x) => x.status === 'locked');
+    expect(r.status).toBe('locked');
+    expect(cornersOutOfView(r.calibration!.corners, 640, 360)).toBe(1);
+    const whole = until(createPipeline({ table: T9, fovDeg: 70 }), frameOf(WHOLE), (x) => x.status === 'locked');
+    expect(whole.status).toBe('locked');
+    expect(cornersOutOfView(whole.calibration!.corners, 640, 360)).toBe(0);
+  });
+  it('a corner on the border does not flicker the message: it changes only past a few px either way', () => {
+    const quad = (x: number): Vec2[] => [
+      { x, y: 100 },
+      { x: 500, y: 100 },
+      { x: 500, y: 300 },
+      { x: 100, y: 300 },
+    ];
+    expect(cornersOutOfView(quad(-1), 640, 360)).toBe(1);
+    expect(nextCornersOut(0, quad(-1), 640, 360)).toBe(0); // 1 px out: not yet
+    expect(nextCornersOut(0, quad(-6), 640, 360)).toBe(1);
+    expect(nextCornersOut(1, quad(1), 640, 360)).toBe(1); // 1 px back in: still out
+    expect(nextCornersOut(1, quad(6), 640, 360)).toBe(0);
+    expect(nextCornersOut(1, null, 640, 360)).toBe(0);
+  });
+});
+
+describe('Rotate / Calibrate keep the selection: found again by where the camera sees it (wave-2a item 17)', () => {
+  // Two table frames of the same camera image, the way Rotate makes them: the four outline corners
+  // are the same image points, assigned to the table corners one place round (long ↔ short rails).
+  const hx = T9.length / 2;
+  const hy = T9.width / 2;
+  const tableCorners: Vec2[] = [
+    { x: -hx, y: -hy },
+    { x: hx, y: -hy },
+    { x: hx, y: hy },
+    { x: -hx, y: hy },
+  ];
+  const Q: Vec2[] = [
+    { x: 120, y: 300 },
+    { x: 520, y: 300 },
+    { x: 460, y: 120 },
+    { x: 180, y: 120 },
+  ];
+  const Hold = homographyFrom4(tableCorners, Q);
+  const Hnew = homographyFrom4(tableCorners, [Q[1]!, Q[2]!, Q[3]!, Q[0]!]);
+  const toNew = (p: Vec2): Vec2 => {
+    const q = applyH(Hold, p.x, p.y);
+    return applyH(invert3(Hnew), q.x, q.y);
+  };
+  const cal = (H: number[]) => ({ H0: H, HR: H });
+  const before: Ball[] = [ball('cue', -0.7, -0.1, 'cue', 'cue'), ball('b3', 0.3, 0.15, 'object', 'yellow'), ball('b4', 0.38, 0.15, 'object', 'red'), ball('b5', -0.25, 0.4, 'object', 'red')];
+  // After Rotate: a new tracker (new ids) and new table coordinates for the same balls.
+  const after: Ball[] = before.map((b, i) => ({ ...b, id: b.kind === 'cue' ? 'cue' : `b${9 + i}`, pos: toNew(b.pos) }));
+  const px = (H: number[], p: Vec2) => applyH(H, p.x, p.y);
+
+  it('the frame stand-ins agree (a check of the test itself): same image point, other table coordinates', () => {
+    for (const [i, b] of before.entries()) {
+      const a = px(Hold, b.pos);
+      const c = px(Hnew, after[i]!.pos);
+      expect(Math.hypot(a.x - c.x, a.y - c.y)).toBeLessThan(1e-6);
+      if (b.kind !== 'cue') expect(Math.hypot(after[i]!.pos.x - b.pos.x, after[i]!.pos.y - b.pos.y)).toBeGreaterThan(0.05);
+    }
+  });
+
+  it('remapThroughFrame: the ball at the same spot in the frame, its label preferred; none when nothing is there', () => {
+    const yellow = { px: px(Hold, before[1]!.pos), label: 'yellow' };
+    expect(remapThroughFrame(yellow, after, Hnew, R9)).toBe('b10');
+    // Two candidates within the tolerance of a spot: the same label wins over a nearer other colour.
+    const b3 = px(Hold, before[1]!.pos);
+    const b4 = px(Hold, before[2]!.pos);
+    const between = { px: { x: b3.x + 0.4 * (b4.x - b3.x), y: b3.y + 0.4 * (b4.y - b3.y) }, label: 'red' };
+    expect(remapThroughFrame(between, after, Hnew, R9, { tolPx: 40 })).toBe('b11');
+    expect(remapThroughFrame({ ...between, label: 'yellow' }, after, Hnew, R9, { tolPx: 40 })).toBe('b10');
+    // Nothing near: null; an excluded or a cue ball only when allowed.
+    expect(remapThroughFrame({ px: { x: 5, y: 5 } }, after, Hnew, R9)).toBeNull();
+    expect(remapThroughFrame(yellow, after, Hnew, R9, { exclude: ['b10'] })).toBeNull(); // the red one is out of range
+    const cue = { px: px(Hold, before[0]!.pos) };
+    expect(remapThroughFrame(cue, after, Hnew, R9)).toBeNull();
+    expect(remapThroughFrame(cue, after, Hnew, R9, { allowCue: true })).toBe('cue');
+  });
+
+  it('pockets and the landing spot go through the cloth plane; a pocket with none at its spot is dropped', () => {
+    const tr = T9.pockets.find((p) => p.id === 'TR')!;
+    const at = px(Hold, tr.mouthCenter);
+    const now = pocketThroughFrame(at, T9.pockets, Hnew)!;
+    const pk = T9.pockets.find((p) => p.id === now)!;
+    expect(pk.kind).toBe('corner'); // the same physical corner pocket, under its name in the new frame
+    const q = px(Hnew, pk.mouthCenter);
+    expect(Math.hypot(q.x - at.x, q.y - at.y)).toBeLessThan(40);
+    // A side pocket of the old frame sits mid-way along what is now a short rail: no pocket there.
+    expect(pocketThroughFrame(px(Hold, T9.pockets.find((p) => p.id === 'TM')!.mouthCenter), T9.pockets, Hnew)).toBeNull();
+    const land = landingThroughFrame(px(Hold, { x: 0.5, y: -0.2 }), Hnew)!;
+    const want = toNew({ x: 0.5, y: -0.2 });
+    expect(land.x).toBeCloseTo(want.x, 9);
+    expect(land.y).toBeCloseTo(want.y, 9);
+  });
+
+  it('rememberInFrame → restoreFromFrame keeps target, marked cue ball, pocket and landing', () => {
+    const sel = { targetId: 'b3', targetMem: null, cueOverrideId: 'b5', cueMem: null, pocketId: 'TR' as const, landing: { x: 0.5, y: -0.2 } };
+    const mem = rememberInFrame(sel, before, T9, cal(Hold))!;
+    expect(mem).not.toBeNull();
+    const r = restoreFromFrame(mem, after, T9, cal(Hnew));
+    expect(r.found).toBe(true);
+    expect(r.targetId).toBe('b10');
+    expect(r.cueOverrideId).toBe('b12');
+    expect(r.pocketId).toBe(pocketThroughFrame(px(Hold, T9.pockets.find((p) => p.id === 'TR')!.mouthCenter), T9.pockets, Hnew));
+    expect(r.landing!.x).toBeCloseTo(toNew(sel.landing).x, 9);
+    // A ball that is not in view yet: not found, keep waiting (the target is what matters).
+    expect(restoreFromFrame(mem, after.filter((b) => b.id !== 'b10'), T9, cal(Hnew)).found).toBe(false);
+    // Nothing selected: nothing to remember.
+    expect(rememberInFrame({ targetId: null, targetMem: null, cueOverrideId: null, cueMem: null, pocketId: null, landing: null }, before, T9, cal(Hold))).toBeNull();
+    // A target occluded at the moment of Rotate is remembered where it was last seen.
+    const occluded = rememberInFrame({ ...sel, targetId: 'gone', targetMem: { id: 'gone', pos: { x: 0.3, y: 0.15 }, label: 'yellow' } }, before, T9, cal(Hold))!;
+    expect(restoreFromFrame(occluded, after, T9, cal(Hnew)).targetId).toBe('b10');
+    expect(REMAP_TTL).toBe(15);
+    expect(REMAP_MESSAGES.kept).toBe('Kept your selection.');
+  });
+
+  it('through a real Calibrate of the merged pipeline (four tapped corners: a new tracker, new ids): the same ball and pocket', () => {
+    const p = createPipeline({ table: T9, fovDeg: 70 });
+    const f = renderSyntheticTable({ table: T9, balls: synth, camera: WHOLE, width: 640, height: 360 });
+    const r0 = until(p, f, lockedWith(4));
+    const b0 = live(r0);
+    const yellow = b0.reduce((a, b) => (Math.hypot(b.pos.x - 0.3, b.pos.y - 0.15) < Math.hypot(a.pos.x - 0.3, a.pos.y - 0.15) ? b : a));
+    expect(Math.hypot(yellow.pos.x - 0.3, yellow.pos.y - 0.15)).toBeLessThan(0.03);
+    const mem = rememberInFrame({ targetId: yellow.id, targetMem: null, cueOverrideId: null, cueMem: null, pocketId: 'TR', landing: null }, b0, T9, r0.calibration!)!;
+    // The player taps the four cloth corners (1–2 px off, in another order).
+    const c = r0.calibration!.corners;
+    p.configure({ manualCorners: [c[2]!, c[3]!, c[0]!, c[1]!].map((q, i) => ({ x: q.x + (i % 2 ? 1.5 : -1), y: q.y + (i < 2 ? 1 : -1.5) })) });
+    const r1 = until(p, f, lockedWith(4));
+    expect(r1.calibration?.source).toBe('manual');
+    const b1 = live(r1);
+    expect(b1.some((b) => b.id === yellow.id)).toBe(false); // the tracker restarted: other ids
+    const back = restoreFromFrame(mem, b1, T9, r1.calibration!);
+    expect(back.found).toBe(true);
+    const now = b1.find((b) => b.id === back.targetId)!;
+    expect(now.label).toBe(yellow.label);
+    expect(Math.hypot(now.pos.x - yellow.pos.x, now.pos.y - yellow.pos.y)).toBeLessThan(0.03);
+    expect(back.pocketId).toBe('TR');
+  });
+
+  it('a real Rotate of a correctly detected table finds no balls at those spots: the selection is not moved to another ball', () => {
+    const p = createPipeline({ table: T9, fovDeg: 70 });
+    const f = renderSyntheticTable({ table: T9, balls: synth, camera: WHOLE, width: 640, height: 360 });
+    const r0 = until(p, f, lockedWith(4));
+    const b0 = live(r0);
+    const target = b0.find((b) => b.kind !== 'cue')!;
+    const mem = rememberInFrame({ targetId: target.id, targetMem: null, cueOverrideId: null, cueMem: null, pocketId: null, landing: null }, b0, T9, r0.calibration!)!;
+    p.configure({ swapAxes: true });
+    const r1 = until(p, f, (r) => r.status === 'locked');
+    const back = restoreFromFrame(mem, live(r1), T9, r1.calibration!);
+    // Whatever the wrong frame detects, nothing is taken unless it is at the same spot.
+    if (back.targetId) {
+      const q = live(r1).find((b) => b.id === back.targetId)!;
+      const a = applyH(r0.calibration!.HR, target.pos.x, target.pos.y);
+      const c2 = applyH(r1.calibration!.HR, q.pos.x, q.pos.y);
+      expect(Math.hypot(a.x - c2.x, a.y - c2.y)).toBeLessThan(12);
+    }
+    // Rotating back finds it again (main.ts keeps the selection waiting across both changes).
+    p.configure({ swapAxes: false });
+    const r2 = until(p, f, lockedWith(4));
+    const again = restoreFromFrame(mem, live(r2), T9, r2.calibration!);
+    expect(again.found).toBe(true);
+    expect(live(r2).find((b) => b.id === again.targetId)!.label).toBe(target.label);
   });
 });
