@@ -64,7 +64,7 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
 **Test status** (release branch, 2026-11-15): `npx vitest run` runs **1032 tests in 68 files**, all
 passing; the two player-view CPU guards (p95 < 250 ms per photo) sit close to their limit on a slow or
-busy CPU, so re-run them alone before concluding. `npm run e2e` runs **135 tests**, all passing.
+busy CPU, so re-run them alone before concluding. `npm run e2e` runs **137 tests**, all passing.
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
 HTTPS host (GitHub Pages, Netlify, Cloudflare Pages) and open it on the phone. Then use "Add to Home

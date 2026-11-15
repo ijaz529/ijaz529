@@ -26,7 +26,7 @@ This is the `/speckit-analyze` cross-artifact pass for feature 002 (T172), dated
   - In full runs on a busy 4-core machine, the player-view CPU guard for failing photos has read
     206–256 ms at p95 against a 250 ms limit.
   - Run alone, it reads 214–242 ms.
-- `npm run e2e`: 135 tests, all passing.
+- `npm run e2e`: 137 tests, all passing.
 - `tsc --noEmit`: clean.
 
 ## Findings
