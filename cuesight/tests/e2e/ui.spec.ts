@@ -87,6 +87,20 @@ async function openedDialog(page: Page) {
   await page.locator('#settings').evaluate((d) => Promise.all((d.getAnimations?.({ subtree: true }) ?? []).map((a) => a.finished)));
 }
 
+/** The bottom sheet has stopped moving (its transitions are done or were replaced, and its top is still). */
+async function sheetSettled(page: Page) {
+  await page.locator('.panel').evaluate(async (p) => {
+    await Promise.allSettled(p.getAnimations({ subtree: true }).map((a) => a.finished));
+    const frame = () => new Promise((r) => requestAnimationFrame(r));
+    for (let top = NaN, i = 0; i < 120; i++) {
+      await frame();
+      const t = p.getBoundingClientRect().top;
+      if (t === top) break;
+      top = t;
+    }
+  });
+}
+
 async function noOnboarding(page: Page) {
   await page.addInitScript(() => {
     try {
@@ -242,6 +256,82 @@ test.describe('settings dialog commits (Enter saves, an empty number is never sa
     expect(await hookEval(page, (h) => h.state.settings.fovDeg)).toBe(65);
   });
 });
+
+// Release-verify residual #10: on a makeable card the headline warning is shown once (no chip
+// repeating it), so that one line must stay readable: never cut off with an ellipsis.
+for (const viewport of [
+  { width: 393, height: 852 },
+  { width: 375, height: 667 },
+]) {
+  test.describe(`headline warning at ${viewport.width}×${viewport.height}`, () => {
+    test.use({ viewport });
+    test('shown once and in full in every sheet state (peek, medium, expanded)', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      await hookEval(page, (h) => h.selectBall('b1'));
+      await hookEval(page, (h) => h.selectPocket('TR'));
+      await expect(page.getByTestId('cut')).toHaveText('30.0°');
+      await page.locator('#power').evaluate((r: HTMLInputElement) => {
+        r.value = '2';
+        r.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const head = page.locator('#shot-card .head-warn');
+      await expect(head).toContainText('Too soft');
+      const message = (await head.textContent())!.trim();
+      expect(message).toMatch(/Use power [\d.]+\+\.$/);
+      const measure = () =>
+        page.evaluate((message) => {
+          const card = document.querySelector('#shot-card')!;
+          const span = card.querySelector<HTMLElement>('.head-warn span')!;
+          const box = card.querySelector('.head-warn')!.getBoundingClientRect();
+          const visible = (e: Element) => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden' && !e.closest('.sr-only');
+          // Every visible element whose own text is the message (the headline line, a chip, …).
+          const copies = Array.from(card.querySelectorAll('span, p, li')).filter((e) => visible(e) && Array.from(e.childNodes).some((n) => n.nodeType === 3 && n.textContent!.trim() === message));
+          return {
+            sheet: document.querySelector<HTMLElement>('.panel')!.dataset.sheet,
+            text: span.textContent,
+            clippedX: span.scrollWidth - span.clientWidth,
+            clippedY: span.scrollHeight - span.clientHeight,
+            onScreen: box.top >= 0 && box.bottom <= innerHeight,
+            // The wrapped warning must not push the cut numeral out of the peek either.
+            cutOnScreen: card.querySelector('[data-testid="cut"]')!.getBoundingClientRect().bottom <= innerHeight,
+            copies: copies.length,
+          };
+        }, message);
+      const seen: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const m = await measure();
+        seen.push(m.sheet!);
+        expect(m.text, m.sheet).toContain('Use power');
+        expect(m.clippedX, `${m.sheet}: cut off sideways`).toBeLessThanOrEqual(0);
+        expect(m.clippedY, `${m.sheet}: cut off below`).toBeLessThanOrEqual(0);
+        expect(m.onScreen, `${m.sheet}: on screen`).toBe(true);
+        expect(m.copies, `${m.sheet}: shown once`).toBe(1);
+        if (m.sheet === 'peek') expect(m.cutOnScreen, 'peek: the cut numeral stays in view').toBe(true);
+        // Tap the handle: peek → medium → expanded.
+        if (i < 2) {
+          const before = m.sheet;
+          await page.locator('.sheet-handle').click();
+          await expect.poll(() => page.evaluate(() => document.querySelector<HTMLElement>('.panel')!.dataset.sheet)).not.toBe(before);
+          await sheetSettled(page);
+        }
+      }
+      expect(seen).toEqual(['peek', 'medium', 'expanded']);
+      // The longest headline warning the planner writes ("frozen", 85 characters) fits at the peek too.
+      await page.locator('.sheet-handle').click();
+      await expect.poll(() => page.evaluate(() => document.querySelector<HTMLElement>('.panel')!.dataset.sheet)).toBe('peek');
+      await sheetSettled(page);
+      const long = await page.evaluate(() => {
+        const span = document.querySelector<HTMLElement>('#shot-card .head-warn span')!;
+        span.textContent = 'Cue ball is frozen to the object ball: expect extra throw; hit it softly with follow.';
+        const box = span.parentElement!.getBoundingClientRect();
+        return { clippedX: span.scrollWidth - span.clientWidth, clippedY: span.scrollHeight - span.clientHeight, onScreen: box.top >= 0 && box.bottom <= innerHeight };
+      });
+      expect(long).toEqual({ clippedX: 0, clippedY: 0, onScreen: true });
+    });
+  });
+}
 
 test.describe('re-renders keep keyboard focus', () => {
   test('a store flush keeps the focused suggestion (the same element), and picking a pocket by keyboard keeps focus on it', async ({ page }) => {

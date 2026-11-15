@@ -196,7 +196,9 @@ describe('ball hit areas are at least 44 CSS px across (radius ≥ 22 px)', () =
     const canvas = { getContext: () => ({ setTransform() {} }), getBoundingClientRect: () => ({ width: 151, height: 82 }), width: 0, height: 0 };
     const view = new TableView(canvas as unknown as HTMLCanvasElement);
     (view as unknown as { layout(t: typeof table): void }).layout(table);
-    const ball: Ball = { id: 'b1', kind: 'object', pos: { x: 0.3, y: 0.1 }, label: '1' } as Ball;
+    // Clear of every pocket mouth (the nearest, TR and TM, are > 30 px from the taps below): next to
+    // a pocket the floor yields to the pocket (see 'the 22 px ball floor does not swallow pocket taps').
+    const ball: Ball = { id: 'b1', kind: 'object', pos: { x: 0.6, y: 0 }, label: '1' } as Ball;
     const q = view.toCanvas(ball.pos);
     expect(view.ballAt({ x: q.x + 21, y: q.y }, [ball])?.id).toBe('b1');
     expect(view.ballAt({ x: q.x, y: q.y - 21 }, [ball])?.id).toBe('b1');
@@ -226,6 +228,112 @@ describe('ball hit areas are at least 44 CSS px across (radius ≥ 22 px)', () =
     expect(Overlay.hitTest({ x: c.x + 21, y: c.y }, data, map).ball?.id).toBe('b1');
     expect(Overlay.hitTest({ x: c.x, y: c.y + 21 }, data, map).ball?.id).toBe('b1');
     expect(Overlay.hitTest({ x: c.x + 30, y: c.y }, data, map).ball).toBeUndefined();
+  });
+});
+
+describe('the 22 px ball floor does not swallow pocket taps', () => {
+  const tr = table.pockets.find((p) => p.id === 'TR')!;
+  const inward = (cm: number): Vec2 => ({ x: tr.mouthCenter.x + tr.inward.x * (cm / 100), y: tr.mouthCenter.y + tr.inward.y * (cm / 100) });
+  const overlayAt = (k: number, balls: Ball[], targetId: string | null = 'b1'): OverlayData => {
+    const H = [k, 0, 320, 0, -k, 240, 0, 0, 1];
+    return {
+      table,
+      calibration: { corners: [], H0: H, HR: H, focal: 500, focalSource: 'assumed', source: 'auto', camera: { x: 0, y: 0, z: 2 }, width: 640, height: 480 },
+      balls,
+      plan: null,
+      targetId,
+      pocketId: null,
+      calibTaps: [],
+      showPlan: true,
+    };
+  };
+  const map = { toScreen: (p: Vec2) => p, toFrame: (p: Vec2) => p };
+  const screen = (k: number, p: Vec2): Vec2 => ({ x: 320 + k * p.x, y: 240 - k * p.y });
+  /**
+   * A tap just outside the ball's natural pick radius (so only the 22 px floor reaches it) that is
+   * nearer the ball than the pocket: on the circle of radius natural + 1.5 px around the ball, at the
+   * angle where the pocket is a little farther than the ball.
+   */
+  const besideBall = (c: Vec2, m: Vec2, natural: number): Vec2 => {
+    const r = natural + 1.5;
+    const D = Math.hypot(m.x - c.x, m.y - c.y);
+    const th = Math.acos(D / (2 * r) - 0.15);
+    const u = Math.atan2(m.y - c.y, m.x - c.x) + th;
+    const t = { x: c.x + r * Math.cos(u), y: c.y + r * Math.sin(u) };
+    expect(Math.hypot(t.x - c.x, t.y - c.y)).toBeGreaterThan(natural);
+    expect(Math.hypot(t.x - c.x, t.y - c.y)).toBeLessThan(22);
+    expect(Math.hypot(t.x - m.x, t.y - m.y)).toBeGreaterThan(Math.hypot(t.x - c.x, t.y - c.y));
+    return t;
+  };
+
+  it('camera overlay: a tap on a pocket picks the pocket, not a ball that is only in reach through the floor', () => {
+    for (const [k, cm] of [
+      [130, 12],
+      [110, 16],
+      [130, 16],
+      [150, 12],
+    ] as const) {
+      const ball: Ball = { id: 'b1', kind: 'object', pos: inward(cm), label: '1' } as Ball;
+      const hit = Overlay.hitTest(screen(k, tr.mouthCenter), overlayAt(k, [ball]), map);
+      expect(hit.ball?.id, `${k} px/m, ball ${cm} cm from TR`).toBeUndefined();
+      expect(hit.pocket, `${k} px/m, ball ${cm} cm from TR`).toBe('TR');
+    }
+  });
+
+  it('camera overlay: the floor still picks a lone small ball, and a tap nearer the ball than the pocket picks the ball', () => {
+    const k = 130;
+    const ball: Ball = { id: 'b1', kind: 'object', pos: inward(12), label: '1' } as Ball;
+    const c = screen(k, ball.pos);
+    const m = screen(k, tr.mouthCenter);
+    const natural = Math.max(14, 2.2 * table.ballRadius * k);
+    const t = besideBall(c, m, natural);
+    expect(Math.hypot(t.x - m.x, t.y - m.y)).toBeLessThan(26); // the pocket is in reach too
+    expect(Overlay.hitTest(t, overlayAt(k, [ball]), map).ball?.id).toBe('b1');
+    // Away from every pocket the floor is unchanged.
+    const mid: Ball = { id: 'b2', kind: 'object', pos: { x: 0.2, y: 0.1 }, label: '2' } as Ball;
+    const cm = screen(k, mid.pos);
+    expect(Overlay.hitTest({ x: cm.x + 21, y: cm.y }, overlayAt(k, [ball, mid]), map).ball?.id).toBe('b2');
+    // A ball inside its natural radius wins even over a nearer pocket (unchanged behaviour).
+    const close: Ball = { id: 'b3', kind: 'object', pos: inward(5), label: '3' } as Ball;
+    expect(Overlay.hitTest(m, overlayAt(k, [close]), map).ball?.id).toBe('b3');
+  });
+
+  const miniMap = () => {
+    const canvas = { getContext: () => ({ setTransform() {} }), getBoundingClientRect: () => ({ width: 151, height: 82 }), width: 0, height: 0 };
+    const view = new TableView(canvas as unknown as HTMLCanvasElement);
+    (view as unknown as { layout(t: typeof table): void }).layout(table);
+    return view;
+  };
+
+  it('mini-map (151 × 82 px): a tap on the TR mouth with a ball 35 cm inward picks the pocket', () => {
+    const view = miniMap();
+    for (const cm of [32, 35, 40]) {
+      const ball: Ball = { id: 'b1', kind: 'object', pos: inward(cm), label: '1' } as Ball;
+      const tap = view.toCanvas(tr.mouthCenter);
+      // ballAt yields to the pocket so the caller (main.ts) falls through to pocketAt.
+      expect(view.ballAt(tap, [ball]), `ball ${cm} cm from TR`).toBeNull();
+      expect(view.pocketAt(tap)).toBe('TR');
+    }
+    // A tap 21 px above a ball at (0.3, 0.1) m lands 16 px from the top side pocket's mouth: the pocket.
+    const mid: Ball = { id: 'b2', kind: 'object', pos: { x: 0.3, y: 0.1 }, label: '2' } as Ball;
+    const q = view.toCanvas(mid.pos);
+    expect(view.ballAt({ x: q.x, y: q.y - 21 }, [mid])).toBeNull();
+    expect(view.pocketAt({ x: q.x, y: q.y - 21 })).toBe('TM');
+    expect(view.ballAt({ x: q.x + 21, y: q.y }, [mid])?.id).toBe('b2');
+  });
+
+  it('mini-map: a tap nearer the ball than the pocket still picks the ball through the floor', () => {
+    const view = miniMap();
+    const ball: Ball = { id: 'b1', kind: 'object', pos: inward(35), label: '1' } as Ball;
+    const c = view.toCanvas(ball.pos);
+    const m = view.toCanvas(tr.mouthCenter);
+    const natural = (table.ballRadius * 1.8 + 12 / view.scale) * view.scale;
+    const t = besideBall(c, m, natural);
+    expect(view.pocketAt(t)).toBe('TR'); // the pocket is in reach too
+    expect(view.ballAt(t, [ball])?.id).toBe('b1');
+    // A ball within its natural radius of the tap wins even on a pocket (unchanged behaviour).
+    const close: Ball = { id: 'b2', kind: 'object', pos: inward(10), label: '2' } as Ball;
+    expect(view.ballAt(m, [close])?.id).toBe('b2');
   });
 });
 

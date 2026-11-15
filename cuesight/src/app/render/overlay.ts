@@ -37,6 +37,9 @@ export interface OverlayData {
   showPlan: boolean;
 }
 
+/** Pocket pick radius around the mouth centre, CSS px. */
+const POCKET_PICK_PX = 26;
+
 export class Overlay {
   private ctx: CanvasRenderingContext2D;
   private cssW = 0;
@@ -255,22 +258,34 @@ export class Overlay {
     const R = d.table.ballRadius;
     let best: Ball | undefined;
     let bd = Infinity;
+    let natural = false;
     for (const b of d.balls) {
       const q = onR(b.pos);
       const e = onR({ x: b.pos.x + R, y: b.pos.y });
+      const rNat = Math.max(14, 2.2 * Math.hypot(e.x - q.x, e.y - q.y));
       // At least a 44 CSS px target (22 px radius) for small, far balls; the nearest ball wins.
-      const rpx = Math.max(HIT_RADIUS_PX, 2.2 * Math.hypot(e.x - q.x, e.y - q.y));
+      const rpx = Math.max(HIT_RADIUS_PX, rNat);
       const dd = Math.hypot(q.x - tap.x, q.y - tap.y);
       if (dd < rpx && dd < bd) {
         bd = dd;
         best = b;
+        natural = dd < rNat;
       }
     }
-    if (best) return { ball: best };
+    let pocket: PocketId | undefined;
+    let pd = POCKET_PICK_PX;
     for (const pk of d.table.pockets) {
       const q = on0(pk.mouthCenter);
-      if (Math.hypot(q.x - tap.x, q.y - tap.y) < 26) return { pocket: pk.id };
+      const dd = Math.hypot(q.x - tap.x, q.y - tap.y);
+      if (dd < pd) {
+        pd = dd;
+        pocket = pk.id;
+      }
     }
+    // A ball reached only through the 22 px floor yields to a pocket mouth nearer the tap (a ball
+    // a few cm from a pocket must not swallow taps on that pocket).
+    if (best && (natural || !pocket || bd <= pd)) return { ball: best };
+    if (pocket) return { pocket };
     const f = map.toFrame(tap);
     const p = applyH(invert3(cal.HR), f.x, f.y);
     if (Math.abs(p.x) <= d.table.length / 2 && Math.abs(p.y) <= d.table.width / 2) return { table: p };

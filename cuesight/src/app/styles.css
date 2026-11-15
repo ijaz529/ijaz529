@@ -2971,7 +2971,7 @@ body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
 /* Headline warning: visible at the sheet's resting height (icon + text, never colour alone). */
 .head-warn {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   margin: 8px 0 0;
   padding: 6px 10px;
@@ -2982,14 +2982,25 @@ body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
   font-weight: 650;
   line-height: 1.3;
 }
+/* On a makeable card this line is the only place the warning is shown (no chip repeats it), so it
+   wraps instead of ending in an ellipsis: "Use power 3.2+." must stay readable. */
 .head-warn span {
   min-width: 0;
+  overflow-wrap: break-word;
+}
+/* At the peek a (hypothetical) very long warning stops at three lines — every warning the planner
+   writes fits in two at 375 px; medium and expanded always show it all. */
+.panel[data-sheet='peek'] .head-warn span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .head-warn .icon {
   flex: 0 0 auto;
+  /* centred on the first line (16 px icon, 13 px × 1.3 line) */
+  margin-top: 0.5px;
   color: #ff9b66;
 }
 .panel[data-sheet='peek'] .shot.has-warn .hero {
@@ -2997,6 +3008,17 @@ body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
 }
 .panel[data-sheet='peek'] .shot.has-warn .hero-stat .s {
   display: none;
+}
+/* …and the CUT / POWER / SPIN captions step aside (still read by screen readers), so a warning that
+   wraps to a second line does not push the numerals out of the peek. */
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat .k {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 /* Not makeable: the reason and what to do instead replace the numerals. */
 .hero.blocked {
