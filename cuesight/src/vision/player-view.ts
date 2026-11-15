@@ -5,33 +5,42 @@
  * already known from the overview photo, so this photo only has to give the camera: 6-DoF pose plus
  * focal length. Pipeline (pure, deterministic, typed-array scratch reused between calls):
  *
- *  1. Cloth colour from the lower-centre band of the photo (or the overview's cloth as a hint) → cloth
- *     mask → main cloth region.
- *  2. Evidence: "crack" points on the boundary between the main cloth and anything else (ball
- *     silhouettes and the cloth→rail edge), and ball circle candidates fitted to the cloth-bordered
- *     arcs of each non-cloth blob (Kåsa + deterministic RANSAC; spatially local RANSAC on large blobs
- *     such as the rail band that far balls merge into), so balls cut by the frame edge or overlapping in
- *     depth still fit. Each candidate carries a colour descriptor and a whiteness score.
- *  3. Hypotheses: for a focal guess (0.5×–2× of the prior), the cue-ball circle fixes the cue ball in
- *     camera coordinates; pairing any other circle with any colour-compatible known ball then fixes
- *     yaw and pitch in closed form for a level (roll-free) phone. Each hypothesis is scored by the known
- *     balls that land on circles of the right size and colour, the balls predicted on bare cloth, and
- *     the circles left unexplained.
+ *  1. Cloth (player-detect.ts): every hue mode and grey (neutral) value mode of the photo is a cloth
+ *     candidate, ranked by structure (the cloth is the surface with ball-sized holes; a rail band, the
+ *     floor or a wall has none); the overview's cloth, grey included, is promoted when this photo shows
+ *     a plausible region of it. Candidates are tried in turn until one fits.
+ *  2. Evidence (player-detect.ts): "crack" points on the boundary between the main cloth and anything
+ *     else (ball silhouettes and the cushion edges), and ball circle candidates fitted to the
+ *     cloth-bordered arcs of each non-cloth blob (Kåsa + deterministic RANSAC on compact blobs, local-arc
+ *     proposals on large blobs such as the rail band or the room that balls merge into), so balls cut by
+ *     the frame edge or overlapping in depth still fit. Each candidate carries a colour descriptor and a
+ *     whiteness score.
+ *  3. Hypotheses: for each focal guess (a phone-lens sweep, HFOV ≈ 110°…26°, plus the overview's focal
+ *     length as a soft hint), the cue-ball circle fixes the cue ball in camera coordinates; pairing any
+ *     other circle with any colour-compatible known ball fixes the rotation up to a turn about the line
+ *     between them: the level member in closed form, and the rolled member that the remaining circles
+ *     vote for (a phone held at an angle). Each hypothesis is scored by the known balls that land, one
+ *     per circle, on circles of the right size and colour, the balls predicted on bare cloth, and the
+ *     circles left unexplained.
  *  4. Refinement: Levenberg–Marquardt over (rotation, camera centre, log f) on exact residuals — for a
  *     ball, the angle between a crack point's ray and the silhouette cone axis minus the cone half-angle
- *     (so there is no off-axis ellipse bias); for the outer cloth edge, the angle between the ray and the
- *     plane through the camera and that edge — with ICP-style re-association under a shrinking gate,
- *     Cauchy weights, a focal prior and a level-phone prior.
+ *     (so there is no off-axis ellipse bias); for a cushion edge (outer and nose), the angle between the
+ *     ray and the plane through the camera and that edge — with ICP-style re-association under a
+ *     shrinking gate, Cauchy weights, a focal prior (heavy-tailed around the overview's focal length:
+ *     the lens may differ) and a level-phone prior.
  *  5. Honesty (Principle II): confidence from the matched balls, the share of the cloth boundary the
  *     model explains, the residuals and the propagated covariance of the target's image position; `ok`
- *     only when all of them agree. Failures carry the canonical player-facing reasons.
+ *     only when all of them agree, and near-minimal fits only with sure identities. Failures carry the
+ *     canonical player-facing reason of their true cause: too dark, no cloth, too few balls, no cue
+ *     ball, balls moved (only from a pose the static table supports), or no fit.
  *
  * Conventions: world = table frame (m, z up, ball centres at z = R). Camera X_c = R·X_w + t with rows
  * right, down, forward; pixel (u, v) covers [u, u+1) × [v, v+1), principal point at the image centre.
  */
 import type { TableSpec, Vec2, Vec3 } from '../core/types';
 import { hueDiff, rgbToHsv, type Frame } from './image';
-import { HUE_TOL, type ClothModel } from './table-detect';
+import { buildEvidence, camouflaged, ColourAcc, exposureScale, findCandidates, getScratch, learnPlayerCloth, solveN, type Candidate, type ColourDesc, type Scratch } from './player-detect';
+import type { ClothModel } from './table-detect';
 
 export interface KnownBall {
   id: string;
@@ -46,15 +55,18 @@ export interface PlayerViewInput {
   balls: KnownBall[];
   cueId: string;
   targetId?: string;
-  /** Focal length in px for this frame, from the overview calibration, if the same camera took both. */
+  /**
+   * Focal length in px for this frame, from the overview calibration. A soft hint: the player may use
+   * another lens (0.5× … 3×) for this photo, and the image decides when it disagrees.
+   */
   focalPx?: number;
   /** Manual fallback: tapped image px of the cue ball and the target ball. */
   manualTaps?: { cue: Vec2; target: Vec2 };
   /**
    * Optional (non-breaking extension): the cloth colour learned from the overview photo
-   * (`VisionResult.cloth`). Used when this photo's own cloth estimate fails or disagrees with it,
-   * e.g. when the floor or the near rail fills the bottom of the frame. A neutral (grey) model is
-   * ignored: it carries no hue.
+   * (`VisionResult.cloth`, chromatic or neutral). The candidate of that colour (hue for a chromatic
+   * model, grey for a neutral one) is tried first when this photo shows a plausible region of it; its
+   * S and V are re-measured in this photo. A neutral model's hue (0) is never read as a hue.
    */
   clothHint?: ClothModel | null;
 }
@@ -90,6 +102,8 @@ export const PLAYER_VIEW_REASONS = {
   noCue: "I can't find the cue ball. Tap the cue ball, then your target.",
   notBehind: "You're not behind the cue ball. The guide is drawn from where you stood.",
   noFit: "I couldn't line up this photo. Tap the cue ball, then your target.",
+  /** The photo is lit, but no surface in it looks like a table cloth (any colour, grey included). */
+  noCloth: "I can't find the table cloth in this photo. Aim along your shot so more of the cloth is in view.",
 } as const;
 
 /** Default horizontal field of view used as the focal prior when no focalPx is given (degrees). */
@@ -218,49 +232,23 @@ function rodrigues(wx: number, wy: number, wz: number): M3 {
   ];
 }
 
-/** Solve the n×n system A·x = b in place (Gaussian elimination, partial pivoting). Null if singular. */
-function solveN(A: Float64Array, b: Float64Array, n: number): Float64Array | null {
-  for (let col = 0; col < n; col++) {
-    let piv = col;
-    for (let r = col + 1; r < n; r++) if (Math.abs(A[r * n + col]!) > Math.abs(A[piv * n + col]!)) piv = r;
-    if (Math.abs(A[piv * n + col]!) < 1e-300) return null;
-    if (piv !== col) {
-      for (let c = 0; c < n; c++) {
-        const t = A[col * n + c]!;
-        A[col * n + c] = A[piv * n + c]!;
-        A[piv * n + c] = t;
-      }
-      const t = b[col]!;
-      b[col] = b[piv]!;
-      b[piv] = t;
-    }
-    for (let r = col + 1; r < n; r++) {
-      const k = A[r * n + col]! / A[col * n + col]!;
-      if (k === 0) continue;
-      for (let c = col; c < n; c++) A[r * n + c] = A[r * n + c]! - k * A[col * n + c]!;
-      b[r] = b[r]! - k * b[col]!;
-    }
-  }
-  const x = new Float64Array(n);
-  for (let r = n - 1; r >= 0; r--) {
-    let s = b[r]!;
-    for (let c = r + 1; c < n; c++) s -= A[r * n + c]! * x[c]!;
-    x[r] = s / A[r * n + r]!;
-  }
-  return x;
-}
-
 /**
  * Image ellipse of a sphere whose centre is at camera coordinates P (exact conic centre; mean radius
  * √(a·b) of the semi-axes). Null when the silhouette is not a closed ellipse in front of the camera.
  */
 function sphereImage(Px: number, Py: number, Pz: number, Rb: number, f: number, cx: number, cy: number): { u: number; v: number; r: number; d: number } | null {
+  return sphereImageTo(Px, Py, Pz, Rb, f, cx, cy, sphereTmp) ? { u: sphereTmp[0]!, v: sphereTmp[1]!, r: sphereTmp[2]!, d: sphereTmp[3]! } : null;
+}
+const sphereTmp = new Float64Array(4);
+
+/** sphereImage without allocation: writes (u, v, r, d) into `out`; false when there is no image. */
+function sphereImageTo(Px: number, Py: number, Pz: number, Rb: number, f: number, cx: number, cy: number, out: Float64Array): boolean {
   const d = Math.hypot(Px, Py, Pz);
-  if (!(d > Rb) || Pz <= 0) return null;
+  if (!(d > Rb) || Pz <= 0) return false;
   const s = Rb / d;
   const az = Pz / d;
   const den = az * az - s * s;
-  if (den < 0.02) return null;
+  if (den < 0.02) return false;
   const k = az / den;
   // Semi-axes (normalised): radial tanβ/cos²α-ish and tangential tanβ/cosα-ish, exact for the conic.
   const q2 = 1 - az * az;
@@ -269,358 +257,11 @@ function sphereImage(Px: number, Py: number, Pz: number, Rb: number, f: number, 
   const radial = (s * Math.sqrt(c2)) / den;
   const tang2 = (rho0 * Math.sqrt(q2) + az) ** 2 / c2 - rho0 * rho0 - 1;
   const tang = Math.sqrt(Math.max(0, tang2));
-  return { u: cx + (f * Px * k) / d, v: cy + (f * Py * k) / d, r: f * Math.sqrt(radial * tang), d };
-}
-
-// ---------------------------------------------------------------------------------------------------
-// Image evidence
-// ---------------------------------------------------------------------------------------------------
-
-interface Scratch {
-  w: number;
-  h: number;
-  /** 0 = not cloth, 1 = cloth (stray), 2 = main cloth region. */
-  mask: Uint8Array;
-  /** Cloth components (negative ids) during the first pass, then non-cloth components (1-based). */
-  label: Int32Array;
-  queue: Int32Array;
-  crackX: Float32Array;
-  crackY: Float32Array;
-  crackL: Int32Array;
-}
-
-const MAX_CRACKS = 1 << 17;
-let scratchCache: Scratch | null = null;
-
-function getScratch(w: number, h: number): Scratch {
-  if (!scratchCache || scratchCache.w !== w || scratchCache.h !== h) {
-    const n = w * h;
-    scratchCache = {
-      w,
-      h,
-      mask: new Uint8Array(n),
-      label: new Int32Array(n),
-      queue: new Int32Array(n),
-      crackX: new Float32Array(MAX_CRACKS),
-      crackY: new Float32Array(MAX_CRACKS),
-      crackL: new Int32Array(MAX_CRACKS),
-    };
-  }
-  return scratchCache;
-}
-
-/** Cloth model around a known hue (from the overview photo): median S and V of the matching pixels. */
-function clothFromHint(frame: Frame, hint: ClothModel): ClothModel | null {
-  const { width: w, height: h, data } = frame;
-  const hsv = [0, 0, 0];
-  const satH = new Float64Array(101);
-  const valH = new Float64Array(101);
-  let cnt = 0;
-  let n = 0;
-  for (let y = Math.floor(h * 0.2); y < h; y += 3)
-    for (let x = 0; x < w; x += 3) {
-      const i = (y * w + x) * 4;
-      rgbToHsv(data[i]!, data[i + 1]!, data[i + 2]!, hsv);
-      n++;
-      if (hsv[1]! > 0.2 && hsv[2]! > 0.12 && hueDiff(hsv[0]!, hint.hue) < 20) {
-        satH[Math.round(hsv[1]! * 100)]! += 1;
-        valH[Math.round(hsv[2]! * 100)]! += 1;
-        cnt++;
-      }
-    }
-  if (cnt < 0.04 * n) return null;
-  const median = (hist: Float64Array) => {
-    let acc = 0;
-    for (let k = 0; k <= 100; k++) {
-      acc += hist[k]!;
-      if (acc >= cnt / 2) return k / 100;
-    }
-    return 0.5;
-  };
-  return { hue: hint.hue, sat: median(satH), val: median(valH) };
-}
-
-/** Cloth colour = modal hue of saturated pixels in the lower-centre band (the cloth in front of the player). */
-function learnClothBand(frame: Frame): { model: ClothModel | null; meanV: number } {
-  const { width: w, height: h, data } = frame;
-  const hsv = [0, 0, 0];
-  const bins = new Float64Array(36);
-  const satH = new Float64Array(101);
-  const valH = new Float64Array(101);
-  const windows: [number, number, number, number][] = [
-    [0.15, 0.85, 0.55, 0.98],
-    [0.1, 0.9, 0.3, 0.98],
-  ];
-  let meanV = 0;
-  for (const [fx0, fx1, fy0, fy1] of windows) {
-    const x0 = Math.floor(w * fx0);
-    const x1 = Math.ceil(w * fx1);
-    const y0 = Math.floor(h * fy0);
-    const y1 = Math.ceil(h * fy1);
-    bins.fill(0);
-    let n = 0;
-    let vSum = 0;
-    for (let y = y0; y < y1; y += 2)
-      for (let x = x0; x < x1; x += 2) {
-        const i = (y * w + x) * 4;
-        rgbToHsv(data[i]!, data[i + 1]!, data[i + 2]!, hsv);
-        n++;
-        vSum += hsv[2]!;
-        if (hsv[1]! > 0.2 && hsv[2]! > 0.12) bins[Math.min(35, Math.floor(hsv[0]! / 10))]! += 1;
-      }
-    meanV = n ? vSum / n : 0;
-    let mode = 0;
-    for (let b = 1; b < 36; b++) if (bins[b]! > bins[mode]!) mode = b;
-    // The mode and its two neighbours must cover a good share of the band.
-    const share = bins[mode]! + bins[(mode + 1) % 36]! + bins[(mode + 35) % 36]!;
-    if (n === 0 || share < 0.3 * n) continue;
-    const centre = mode * 10 + 5;
-    let sx = 0;
-    let sy = 0;
-    let cnt = 0;
-    satH.fill(0);
-    valH.fill(0);
-    for (let y = y0; y < y1; y += 2)
-      for (let x = x0; x < x1; x += 2) {
-        const i = (y * w + x) * 4;
-        rgbToHsv(data[i]!, data[i + 1]!, data[i + 2]!, hsv);
-        if (hsv[1]! > 0.2 && hsv[2]! > 0.12 && hueDiff(hsv[0]!, centre) < 20) {
-          const a = (hsv[0]! * Math.PI) / 180;
-          sx += Math.cos(a);
-          sy += Math.sin(a);
-          satH[Math.round(hsv[1]! * 100)]! += 1;
-          valH[Math.round(hsv[2]! * 100)]! += 1;
-          cnt++;
-        }
-      }
-    const median = (hist: Float64Array) => {
-      let acc = 0;
-      for (let k = 0; k <= 100; k++) {
-        acc += hist[k]!;
-        if (acc >= cnt / 2) return k / 100;
-      }
-      return 0.5;
-    };
-    let hue = (Math.atan2(sy, sx) * 180) / Math.PI;
-    if (hue < 0) hue += 360;
-    return { model: { hue, sat: median(satH), val: median(valH) }, meanV };
-  }
-  return { model: null, meanV };
-}
-
-/** Mask (0/1), main cloth region (2), non-cloth components and cloth-boundary cracks. */
-function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { nCracks: number; comps: Comp[]; mainArea: number } {
-  const { w, h, mask, label, queue } = sc;
-  const n = w * h;
-  const data = frame.data;
-  // isCloth() inlined (same thresholds: hue within HUE_TOL, s > 0.4·sat, v > 0.28·val); hue is only
-  // computed for pixels that pass the cheap saturation and value tests.
-  const vMin = 0.28 * cloth.val * 255;
-  const sMin = 0.4 * cloth.sat;
-  const hue0 = cloth.hue;
-  for (let i = 0; i < n; i++) {
-    const r = data[i * 4]!;
-    const g = data[i * 4 + 1]!;
-    const b = data[i * 4 + 2]!;
-    const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
-    const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
-    const d = mx - mn;
-    if (mx <= vMin || d <= sMin * mx || d === 0) {
-      mask[i] = 0;
-      continue;
-    }
-    let hh: number;
-    if (mx === r) hh = 60 * (((g - b) / d) % 6);
-    else if (mx === g) hh = 60 * ((b - r) / d + 2);
-    else hh = 60 * ((r - g) / d + 4);
-    if (hh < 0) hh += 360;
-    let dh = Math.abs(hh - hue0) % 360;
-    if (dh > 180) dh = 360 - dh;
-    mask[i] = dh < HUE_TOL ? 1 : 0;
-  }
-  // Cloth components: keep the largest (and any comparable one) as the main cloth region.
-  label.fill(0);
-  let next = 1;
-  let bestSize = 0;
-  const sizes: number[] = [0];
-  for (let s = 0; s < n; s++) {
-    if (mask[s] !== 1 || label[s] !== 0) continue;
-    const id = next++;
-    let head = 0;
-    let tail = 0;
-    queue[tail++] = s;
-    label[s] = -id;
-    while (head < tail) {
-      const i = queue[head++]!;
-      const x = i % w;
-      if (x > 0 && mask[i - 1] === 1 && label[i - 1] === 0) {
-        label[i - 1] = -id;
-        queue[tail++] = i - 1;
-      }
-      if (x < w - 1 && mask[i + 1] === 1 && label[i + 1] === 0) {
-        label[i + 1] = -id;
-        queue[tail++] = i + 1;
-      }
-      if (i >= w && mask[i - w] === 1 && label[i - w] === 0) {
-        label[i - w] = -id;
-        queue[tail++] = i - w;
-      }
-      if (i < n - w && mask[i + w] === 1 && label[i + w] === 0) {
-        label[i + w] = -id;
-        queue[tail++] = i + w;
-      }
-    }
-    sizes.push(tail);
-    if (tail > bestSize) bestSize = tail;
-  }
-  const keep = new Uint8Array(next);
-  let mainArea = 0;
-  for (let id = 1; id < next; id++)
-    if (sizes[id]! >= 0.25 * bestSize && sizes[id]! >= 0.01 * n) {
-      keep[id] = 1;
-      mainArea += sizes[id]!;
-    }
-  for (let i = 0; i < n; i++) {
-    const l = label[i]!;
-    mask[i] = l < 0 && keep[-l] ? 2 : 0;
-  }
-  // Non-cloth components (everything that is not main cloth), 4-connected.
-  label.fill(0);
-  const comps: Comp[] = [{ area: 0, minX: 0, maxX: 0, minY: 0, maxY: 0 }];
-  next = 1;
-  for (let s = 0; s < n; s++) {
-    if (mask[s] === 2 || label[s] !== 0) continue;
-    const id = next++;
-    let head = 0;
-    let tail = 0;
-    queue[tail++] = s;
-    label[s] = id;
-    let minX = w;
-    let maxX = 0;
-    let minY = h;
-    let maxY = 0;
-    while (head < tail) {
-      const i = queue[head++]!;
-      const x = i % w;
-      const y = (i - x) / w;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      if (x > 0 && mask[i - 1] !== 2 && label[i - 1] === 0) {
-        label[i - 1] = id;
-        queue[tail++] = i - 1;
-      }
-      if (x < w - 1 && mask[i + 1] !== 2 && label[i + 1] === 0) {
-        label[i + 1] = id;
-        queue[tail++] = i + 1;
-      }
-      if (i >= w && mask[i - w] !== 2 && label[i - w] === 0) {
-        label[i - w] = id;
-        queue[tail++] = i - w;
-      }
-      if (i < n - w && mask[i + w] !== 2 && label[i + w] === 0) {
-        label[i + w] = id;
-        queue[tail++] = i + w;
-      }
-    }
-    comps.push({ area: tail, minX, maxX, minY, maxY });
-  }
-  // Cracks: unit edges between a main-cloth pixel and a non-cloth pixel, at the shared pixel border.
-  const { crackX, crackY, crackL } = sc;
-  let nc = 0;
-  for (let y = 0; y < h && nc < MAX_CRACKS - 4; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (mask[i] !== 2) continue;
-      if (x > 0 && mask[i - 1] !== 2) {
-        crackX[nc] = x;
-        crackY[nc] = y + 0.5;
-        crackL[nc++] = label[i - 1]!;
-      }
-      if (x < w - 1 && mask[i + 1] !== 2) {
-        crackX[nc] = x + 1;
-        crackY[nc] = y + 0.5;
-        crackL[nc++] = label[i + 1]!;
-      }
-      if (y > 0 && mask[i - w] !== 2) {
-        crackX[nc] = x + 0.5;
-        crackY[nc] = y;
-        crackL[nc++] = label[i - w]!;
-      }
-      if (y < h - 1 && mask[i + w] !== 2) {
-        crackX[nc] = x + 0.5;
-        crackY[nc] = y + 1;
-        crackL[nc++] = label[i + w]!;
-      }
-      if (nc >= MAX_CRACKS - 4) break;
-    }
-  }
-  return { nCracks: nc, comps, mainArea };
-}
-
-interface Comp {
-  area: number;
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
-}
-
-interface Candidate {
-  u: number;
-  v: number;
-  r: number;
-  /** Arc coverage in degrees. */
-  cov: number;
-  comp: number;
-  rgb: [number, number, number];
-  /** Colour descriptor of the blob's pixels inside the circle. */
-  col: ColourDesc;
-  /** Cue-ball likelihood (higher = whiter, less coloured). */
-  white: number;
-}
-
-/**
- * Colour descriptor robust to shading, exposure and stripes: the hue of the saturated pixels only, and
- * the fractions of saturated, dark and white pixels.
- */
-interface ColourDesc {
-  hue: number;
-  satFrac: number;
-  darkFrac: number;
-  whiteFrac: number;
-}
-
-/** Accumulates a ColourDesc pixel by pixel without allocating. */
-class ColourAcc {
-  n = 0;
-  hx = 0;
-  hy = 0;
-  sat = 0;
-  dark = 0;
-  white = 0;
-  private hsv = [0, 0, 0];
-  add(r: number, g: number, b: number): void {
-    const hsv = this.hsv;
-    rgbToHsv(r, g, b, hsv);
-    this.n++;
-    if (hsv[2]! < 0.18) this.dark++;
-    else if (hsv[1]! < 0.25) {
-      if (hsv[2]! > 0.25) this.white++;
-    } else if (hsv[1]! > 0.35) {
-      const a = (hsv[0]! * Math.PI) / 180;
-      this.hx += Math.cos(a);
-      this.hy += Math.sin(a);
-      this.sat++;
-    }
-  }
-  desc(): ColourDesc {
-    let hue = (Math.atan2(this.hy, this.hx) * 180) / Math.PI;
-    if (hue < 0) hue += 360;
-    const n = Math.max(1, this.n);
-    return { hue, satFrac: this.sat / n, darkFrac: this.dark / n, whiteFrac: this.white / n };
-  }
+  out[0] = cx + (f * Px * k) / d;
+  out[1] = cy + (f * Py * k) / d;
+  out[2] = f * Math.sqrt(radial * tang);
+  out[3] = d;
+  return true;
 }
 
 type BallClass = { kind: 'dark' } | { kind: 'white' } | { kind: 'colour'; hue: number } | null;
@@ -633,374 +274,6 @@ function ballClass(rgb: [number, number, number] | undefined): BallClass {
   if (hsv[2]! < 0.22) return { kind: 'dark' };
   if (hsv[1]! < 0.16) return { kind: 'white' };
   return { kind: 'colour', hue: hsv[0]! };
-}
-
-interface Circle {
-  x: number;
-  y: number;
-  r: number;
-}
-
-/** Algebraic (Kåsa) circle fit on the points idx[0..n) in centred coordinates. */
-function kasa(X: Float32Array, Y: Float32Array, idx: Int32Array, n: number): Circle | null {
-  if (n < 3) return null;
-  let mx = 0;
-  let my = 0;
-  for (let q = 0; q < n; q++) {
-    mx += X[idx[q]!]!;
-    my += Y[idx[q]!]!;
-  }
-  mx /= n;
-  my /= n;
-  let suu = 0;
-  let suv = 0;
-  let svv = 0;
-  let suuu = 0;
-  let svvv = 0;
-  let suvv = 0;
-  let svuu = 0;
-  for (let q = 0; q < n; q++) {
-    const u = X[idx[q]!]! - mx;
-    const v = Y[idx[q]!]! - my;
-    suu += u * u;
-    suv += u * v;
-    svv += v * v;
-    suuu += u * u * u;
-    svvv += v * v * v;
-    suvv += u * v * v;
-    svuu += v * u * u;
-  }
-  const det = suu * svv - suv * suv;
-  if (Math.abs(det) < 1e-9) return null;
-  const b1 = 0.5 * (suuu + suvv);
-  const b2 = 0.5 * (svvv + svuu);
-  const uc = (b1 * svv - b2 * suv) / det;
-  const vc = (suu * b2 - suv * b1) / det;
-  const r2 = uc * uc + vc * vc + (suu + svv) / n;
-  if (!(r2 > 0)) return null;
-  return { x: uc + mx, y: vc + my, r: Math.sqrt(r2) };
-}
-
-/** Geometric circle refinement (Gauss–Newton on Σ(|p − c| − r)²). */
-function refineCircle(X: Float32Array, Y: Float32Array, idx: Int32Array, n: number, c0: Circle): Circle {
-  let a = c0.x;
-  let b = c0.y;
-  let r = c0.r;
-  const A = new Float64Array(9);
-  const g = new Float64Array(3);
-  for (let it = 0; it < 6; it++) {
-    A.fill(0);
-    g.fill(0);
-    for (let q = 0; q < n; q++) {
-      const dx = X[idx[q]!]! - a;
-      const dy = Y[idx[q]!]! - b;
-      const d = Math.hypot(dx, dy) || 1e-9;
-      const res = d - r;
-      const j0 = -dx / d;
-      const j1 = -dy / d;
-      const j2 = -1;
-      A[0] += j0 * j0;
-      A[1] += j0 * j1;
-      A[2] += j0 * j2;
-      A[4] += j1 * j1;
-      A[5] += j1 * j2;
-      A[8] += j2 * j2;
-      g[0] += j0 * res;
-      g[1] += j1 * res;
-      g[2] += j2 * res;
-    }
-    A[3] = A[1]!;
-    A[6] = A[2]!;
-    A[7] = A[5]!;
-    for (let k = 0; k < 3; k++) g[k] = -g[k]!;
-    const x = solveN(A, g, 3);
-    if (!x) break;
-    a += x[0]!;
-    b += x[1]!;
-    r += x[2]!;
-    if (Math.abs(x[0]!) + Math.abs(x[1]!) + Math.abs(x[2]!) < 1e-4) break;
-  }
-  return { x: a, y: b, r };
-}
-
-const covBins = new Uint8Array(36);
-
-/** Arc coverage (degrees, 10° bins) of the points around a centre. */
-function coverage(X: Float32Array, Y: Float32Array, idx: Int32Array, n: number, cx: number, cy: number): number {
-  covBins.fill(0);
-  let cnt = 0;
-  for (let q = 0; q < n; q++) {
-    const a = Math.atan2(Y[idx[q]!]! - cy, X[idx[q]!]! - cx);
-    const b = Math.min(35, Math.floor(((a + Math.PI) / (2 * Math.PI)) * 36));
-    if (!covBins[b]) {
-      covBins[b] = 1;
-      cnt++;
-    }
-  }
-  return cnt * 10;
-}
-
-/**
- * Ball arcs on the boundary of a large blob: RANSAC whose three samples come from the same spatial
- * neighbourhood (grid buckets), so each hypothesis is a local circle; non-overlapping circles with an
- * arc of ≥ 150° and dense support are kept. Deterministic.
- */
-function localCircles(X: Float32Array, Y: Float32Array, pts: Int32Array, n: number, rLimit: number, salt: number): { c: Circle; cov: number }[] {
-  if (n < 12) return [];
-  const G = Math.max(4, Math.ceil(rLimit));
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (let q = 0; q < n; q++) {
-    const x = X[pts[q]!]!;
-    const y = Y[pts[q]!]!;
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-  }
-  const gw = Math.floor((maxX - minX) / G) + 1;
-  const gh = Math.floor((maxY - minY) / G) + 1;
-  const cellOf = (q: number) => Math.floor((Y[pts[q]!]! - minY) / G) * gw + Math.floor((X[pts[q]!]! - minX) / G);
-  const cStart = new Int32Array(gw * gh + 1);
-  for (let q = 0; q < n; q++) cStart[cellOf(q) + 1]! += 1;
-  for (let c = 0; c < gw * gh; c++) cStart[c + 1] = cStart[c + 1]! + cStart[c]!;
-  const cFill = cStart.slice(0, gw * gh);
-  const byCell = new Int32Array(n);
-  for (let q = 0; q < n; q++) byCell[cFill[cellOf(q)]!++] = pts[q]!;
-  let seed = (0x9e3779b9 ^ Math.imul(salt + 1, 2246822519)) >>> 0;
-  const rand = (m: number) => {
-    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-    return seed % m;
-  };
-  const near = new Int32Array(n);
-  let nNear = 0;
-  const gather = (x: number, y: number, rad: number) => {
-    nNear = 0;
-    const cx0 = Math.max(0, Math.floor((x - rad - minX) / G));
-    const cx1 = Math.min(gw - 1, Math.floor((x + rad - minX) / G));
-    const cy0 = Math.max(0, Math.floor((y - rad - minY) / G));
-    const cy1 = Math.min(gh - 1, Math.floor((y + rad - minY) / G));
-    for (let cy = cy0; cy <= cy1; cy++)
-      for (let cx = cx0; cx <= cx1; cx++) for (let q = cStart[cy * gw + cx]!; q < cStart[cy * gw + cx + 1]!; q++) near[nNear++] = byCell[q]!;
-  };
-  type Hit = { c: Circle; inl: number; cov: number };
-  const hits: Hit[] = [];
-  const idx = new Int32Array(n);
-  const iters = Math.min(900, 3 * n);
-  for (let it = 0; it < iters; it++) {
-    const a = byCell[rand(n)]!;
-    gather(X[a]!, Y[a]!, 2 * rLimit);
-    if (nNear < 10) continue;
-    const b = near[rand(nNear)]!;
-    const c = near[rand(nNear)]!;
-    const ax = X[a]!;
-    const ay = Y[a]!;
-    const bx = X[b]!;
-    const by = Y[b]!;
-    const cx2 = X[c]!;
-    const cy2 = Y[c]!;
-    const d = 2 * (ax * (by - cy2) + bx * (cy2 - ay) + cx2 * (ay - by));
-    if (Math.abs(d) < 1e-6) continue;
-    const a2 = ax * ax + ay * ay;
-    const b2 = bx * bx + by * by;
-    const c2 = cx2 * cx2 + cy2 * cy2;
-    const ux = (a2 * (by - cy2) + b2 * (cy2 - ay) + c2 * (ay - by)) / d;
-    const uy = (a2 * (cx2 - bx) + b2 * (ax - cx2) + c2 * (bx - ax)) / d;
-    const r = Math.hypot(ax - ux, ay - uy);
-    if (r < 2.5 || r > rLimit) continue;
-    // Skip circles already explained by a stronger hit.
-    let dup = false;
-    for (const hh of hits) if (Math.hypot(hh.c.x - ux, hh.c.y - uy) < 0.5 * hh.c.r && Math.abs(hh.c.r - r) < 0.5 * hh.c.r) dup = true;
-    if (dup) continue;
-    gather(ux, uy, r + 3);
-    const tol = Math.max(1.0, 0.06 * r);
-    let m = 0;
-    for (let k = 0; k < nNear; k++) if (Math.abs(Math.hypot(X[near[k]!]! - ux, Y[near[k]!]! - uy) - r) < tol) idx[m++] = near[k]!;
-    if (m < 10) continue;
-    const cov = coverage(X, Y, idx, m, ux, uy);
-    if (cov < 150 || m < 0.5 * 1.27 * r * ((cov * Math.PI) / 180)) continue;
-    // Refine on the local inliers.
-    const k2 = kasa(X, Y, idx, m);
-    if (!k2) continue;
-    const fit = refineCircle(X, Y, idx, m, k2);
-    if (!(fit.r >= 2.5 && fit.r <= rLimit)) continue;
-    gather(fit.x, fit.y, fit.r + 3);
-    const tol2 = Math.max(1.0, 0.06 * fit.r);
-    let m2 = 0;
-    for (let k = 0; k < nNear; k++) if (Math.abs(Math.hypot(X[near[k]!]! - fit.x, Y[near[k]!]! - fit.y) - fit.r) < tol2) idx[m2++] = near[k]!;
-    const cov2 = coverage(X, Y, idx, m2, fit.x, fit.y);
-    if (cov2 < 150 || m2 < 0.5 * 1.27 * fit.r * ((cov2 * Math.PI) / 180)) continue;
-    hits.push({ c: fit, inl: m2, cov: cov2 });
-  }
-  hits.sort((p, q) => q.inl - p.inl);
-  const out: { c: Circle; cov: number }[] = [];
-  for (const hh of hits) if (out.every((o) => Math.hypot(o.c.x - hh.c.x, o.c.y - hh.c.y) > 0.8 * Math.max(o.c.r, hh.c.r))) out.push({ c: hh.c, cov: hh.cov });
-  return out;
-}
-
-/**
- * Circles in the cloth-bordered boundary of each compact non-cloth blob: one Kåsa fit when it explains
- * the blob, else deterministic RANSAC that peels off up to four circles (balls overlapping in depth).
- */
-function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks: number): Candidate[] {
-  const { w, h, crackX, crackY, crackL, mask, label } = sc;
-  const nComp = comps.length;
-  const start = new Int32Array(nComp + 1);
-  for (let q = 0; q < nCracks; q++) start[crackL[q]! + 1]! += 1;
-  for (let k = 0; k < nComp; k++) start[k + 1] = start[k + 1]! + start[k]!;
-  const fill = start.slice(0, nComp);
-  const order = new Int32Array(nCracks);
-  for (let q = 0; q < nCracks; q++) order[fill[crackL[q]!]!++] = q;
-
-  const rMax = 0.3 * Math.max(w, h);
-  const out: Candidate[] = [];
-  const pts = new Int32Array(Math.max(16, nCracks));
-  const inl = new Int32Array(Math.max(16, nCracks));
-  const hsv = [0, 0, 0];
-  const acc = new ColourAcc();
-  for (let k = 1; k < nComp; k++) {
-    const cp = comps[k]!;
-    const n0 = start[k + 1]! - start[k]!;
-    if (cp.area < 12 || n0 < 10) continue;
-    let n = n0;
-    for (let q = 0; q < n; q++) pts[q] = order[start[k]! + q]!;
-    const circles: { c: Circle; cov: number }[] = [];
-    if (cp.area > 0.2 * w * h || cp.maxX - cp.minX > 0.5 * w || cp.maxY - cp.minY > 0.6 * h) {
-      // A large blob (rail, floor, background): balls touching it from the cloth side show up as arcs
-      // on its cloth-bordered boundary.
-      circles.push(...localCircles(crackX, crackY, pts, n, Math.max(8, 0.06 * Math.max(w, h)), k));
-      n = 0;
-    }
-    let seed = (2463534242 ^ Math.imul(k, 2654435761)) >>> 0;
-    const rand = (m: number) => {
-      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-      return seed % m;
-    };
-    const tolOf = (r: number) => Math.max(1.0, 0.06 * r);
-    const countIn = (c: Circle) => {
-      const tol = tolOf(c.r);
-      let m = 0;
-      for (let q = 0; q < n; q++) if (Math.abs(Math.hypot(crackX[pts[q]!]! - c.x, crackY[pts[q]!]! - c.y) - c.r) < tol) m++;
-      return m;
-    };
-    for (let round = 0; round < 4 && n >= 10; round++) {
-      let best: Circle | null = null;
-      let bestIn = 0;
-      const all = kasa(crackX, crackY, pts, n);
-      if (all && all.r >= 2.5 && all.r <= rMax) {
-        best = all;
-        bestIn = countIn(all);
-      }
-      if (!best || bestIn < 0.9 * n) {
-        const iters = Math.min(250, 20 + n);
-        for (let it = 0; it < iters; it++) {
-          const a = pts[rand(n)]!;
-          const b = pts[rand(n)]!;
-          const c = pts[rand(n)]!;
-          const ax = crackX[a]!;
-          const ay = crackY[a]!;
-          const bx = crackX[b]!;
-          const by = crackY[b]!;
-          const cx2 = crackX[c]!;
-          const cy2 = crackY[c]!;
-          const d = 2 * (ax * (by - cy2) + bx * (cy2 - ay) + cx2 * (ay - by));
-          if (Math.abs(d) < 1e-6) continue;
-          const a2 = ax * ax + ay * ay;
-          const b2 = bx * bx + by * by;
-          const c2 = cx2 * cx2 + cy2 * cy2;
-          const ux = (a2 * (by - cy2) + b2 * (cy2 - ay) + c2 * (ay - by)) / d;
-          const uy = (a2 * (cx2 - bx) + b2 * (ax - cx2) + c2 * (bx - ax)) / d;
-          const r = Math.hypot(ax - ux, ay - uy);
-          if (r < 2.5 || r > rMax) continue;
-          const cand = { x: ux, y: uy, r };
-          const m = countIn(cand);
-          if (m > bestIn) {
-            bestIn = m;
-            best = cand;
-          }
-        }
-      }
-      if (!best) break;
-      // Refine on the inliers (repeatedly: the inlier set grows as the fit improves).
-      let fit: Circle = best;
-      let ni = 0;
-      for (let pass = 0; pass < 3; pass++) {
-        const tol = 1.5 * tolOf(fit.r);
-        let m = 0;
-        for (let q = 0; q < n; q++) if (Math.abs(Math.hypot(crackX[pts[q]!]! - fit.x, crackY[pts[q]!]! - fit.y) - fit.r) < tol) inl[m++] = pts[q]!;
-        if (m < 8) break;
-        const k2 = kasa(crackX, crackY, inl, m);
-        if (!k2) break;
-        const g2 = refineCircle(crackX, crackY, inl, m, k2);
-        if (!(g2.r >= 2.5 && g2.r <= rMax)) break;
-        fit = g2;
-        ni = m;
-      }
-      if (ni < 8) break;
-      const cov = coverage(crackX, crackY, inl, ni, fit.x, fit.y);
-      const expected = 1.27 * fit.r * ((cov * Math.PI) / 180);
-      if (cov >= 120 && ni >= Math.max(8, 0.45 * expected)) circles.push({ c: fit, cov });
-      // Remove this circle's points and look for the next one in the rest of the blob.
-      const tol = 1.5 * tolOf(fit.r);
-      let m = 0;
-      for (let q = 0; q < n; q++) if (!(Math.abs(Math.hypot(crackX[pts[q]!]! - fit.x, crackY[pts[q]!]! - fit.y) - fit.r) < tol)) pts[m++] = pts[q]!;
-      if (m === n) break;
-      n = m;
-    }
-    for (const { c, cov } of circles) {
-      // Mean colour and colour descriptor of this blob's pixels inside 0.8 r.
-      let cnt = 0;
-      let sr = 0;
-      let sg = 0;
-      let sb = 0;
-      let white = 0;
-      let colored = 0;
-      let sSum = 0;
-      acc.n = acc.hx = acc.hy = acc.sat = acc.dark = acc.white = 0;
-      const rr = 0.8 * c.r;
-      const x0 = Math.max(0, Math.floor(c.x - rr));
-      const x1 = Math.min(w - 1, Math.ceil(c.x + rr));
-      const y0 = Math.max(0, Math.floor(c.y - rr));
-      const y1 = Math.min(h - 1, Math.ceil(c.y + rr));
-      for (let y = y0; y <= y1; y++)
-        for (let x = x0; x <= x1; x++) {
-          if ((x + 0.5 - c.x) ** 2 + (y + 0.5 - c.y) ** 2 > rr * rr) continue;
-          const i = y * w + x;
-          if (mask[i] === 2 || label[i] !== k) continue;
-          const R0 = frame.data[i * 4]!;
-          const G0 = frame.data[i * 4 + 1]!;
-          const B0 = frame.data[i * 4 + 2]!;
-          rgbToHsv(R0, G0, B0, hsv);
-          acc.add(R0, G0, B0);
-          sr += R0;
-          sg += G0;
-          sb += B0;
-          sSum += hsv[1]!;
-          if (hsv[1]! < 0.28 && hsv[2]! > 0.22) white++;
-          if (hsv[1]! > 0.45 && hsv[2]! > 0.12) colored++;
-          cnt++;
-        }
-      if (cnt < 5) continue;
-      const mr = sr / cnt;
-      const mg = sg / cnt;
-      const mb = sb / cnt;
-      const mx = Math.max(mr, mg, mb);
-      const meanSat = mx > 0 ? (mx - Math.min(mr, mg, mb)) / mx : 0;
-      out.push({
-        u: c.x,
-        v: c.y,
-        r: c.r,
-        cov,
-        comp: k,
-        rgb: [mr, mg, mb],
-        col: acc.desc(),
-        white: white / cnt - 2.5 * (colored / cnt) - 2 * meanSat - 0.25 * (sSum / cnt),
-      });
-    }
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1016,7 +289,10 @@ interface Seg {
   bz: number;
 }
 
-/** Outer cloth edge (cloth → rail boundary) at cushion height, minus the pocket cut-outs. */
+/**
+ * Outer cloth edge (cloth → rail boundary) at cushion height, minus the pocket cut-outs. Seen from the
+ * table side, that boundary is where the cushion top meets the rail's inner face, at cushion height.
+ */
 function edgeSegments(table: TableSpec): Seg[] {
   const X = table.length / 2 + table.cushionWidth;
   const Y = table.width / 2 + table.cushionWidth;
@@ -1032,6 +308,41 @@ function edgeSegments(table: TableSpec): Seg[] {
     s(-X, -Y + ec, -X, Y - ec),
     s(X, -Y + ec, X, Y - ec),
   ];
+}
+
+/**
+ * Is the camera outside the table beyond this edge (behind that rail)? Then the cloth's boundary in the
+ * photo is the top of the rail in front of the cushion, whose height above the cushion top the table
+ * spec does not give (≈ 4 mm in the renderer, varies on real tables): from 8 cm above the bed that
+ * unknown lip moves the edge by ≈ 8 px, which biased the pose (strike dot ≈ 0.09 R). Such an edge is
+ * left out of the fit; the far and side edges and the balls still hold the pose.
+ */
+function seenFromOutside(sg: Seg, C: Vec3): boolean {
+  if (sg.ax === sg.bx) return sg.ax < 0 ? C.x < sg.ax : C.x > sg.ax;
+  return sg.ay < 0 ? C.y < sg.ay : C.y > sg.ay;
+}
+
+/** Band (px) around an edge seen from behind its rail that holds its cracks (the rail lip is unknown). */
+const BEHIND_EDGE_BAND = 15;
+
+/** Is crack i within `band` px of one of the edge planes `planes` (and within its image extent)? */
+function nearSeg(pr: Problem, fit: Fit, planes: (ReturnType<typeof segPlane> | null)[], i: number, band: number): boolean {
+  const u = pr.px[i]!;
+  const v = pr.py[i]!;
+  const mx = (u - pr.cx) / fit.f;
+  const my = (v - pr.cy) / fit.f;
+  const mn = Math.hypot(mx, my, 1);
+  for (const sp of planes) {
+    if (!sp) continue;
+    const e = fit.f * Math.asin(Math.max(-1, Math.min(1, (mx * sp.nx + my * sp.ny + sp.nz) / mn)));
+    if (Math.abs(e) >= band) continue;
+    const du = sp.u1 - sp.u0;
+    const dv = sp.v1 - sp.v0;
+    const L2 = du * du + dv * dv;
+    const t = L2 > 1e-9 ? ((u - sp.u0) * du + (v - sp.v0) * dv) / L2 : -1;
+    if (t >= 0 && t <= 1) return true;
+  }
+  return false;
 }
 
 interface Fit {
@@ -1053,11 +364,20 @@ interface Problem {
   nPts: number;
   logf0: number;
   sigLogF: number;
+  /**
+   * Heavy-tailed (Cauchy) focal prior: the overview's focal length is a soft hint. It acts like a
+   * Gaussian of σ = sigLogF near the hint, but costs only ≈ ln(1 + x²)/2 far from it, so a different
+   * lens (0.5×–3×) for this photo is decided by the image, not by the hint.
+   */
+  robustF: boolean;
   sigRoll: number;
   /** Height prior (manual mode). */
   height?: { mu: number; sigma: number };
   /** Ball-centre observations (manual taps): ball index → image point. */
   taps: { ball: number; x: number; y: number; sigma: number }[];
+  /** residuals() scratch: per element (balls, then segments) 4 camera quantities and a "computed" flag. */
+  resCache: Float64Array;
+  resHave: Uint8Array;
   /** Main-cloth mask (2 = cloth) for "a ball should be here but the photo shows cloth". */
   mask: Uint8Array;
   frame: Frame;
@@ -1066,27 +386,57 @@ interface Problem {
   camo: Uint8Array;
   /** Colour class of each known ball (null when its colour is unknown). */
   cls: BallClass[];
+  /** Index of the cue ball in `balls`. */
+  cueIdx: number;
+  /** The photo's exposure relative to nominal (player-detect exposureScale), for colour thresholds. */
+  vScale: number;
+  /** colourCost of known ball k against circle candidate j, at [k · nCands + j] (filled once per photo). */
+  cc: Float64Array;
+  nCands: number;
   /** Pocket holes in plan view (x, y, radius): dark round blobs there are not balls. */
   pockets: { x: number; y: number; r: number }[];
 }
 
-/** Does the image point back-project (onto the bed or the cushion top) into a pocket hole? */
-function inPocket(pr: Problem, fit: Fit, u: number, v: number): boolean {
-  const mx = (u - pr.cx) / fit.f;
-  const my = (v - pr.cy) / fit.f;
-  const R = fit.R;
-  // World direction of the ray: Rᵀ·(mx, my, 1).
-  const dx = R[0]! * mx + R[3]! * my + R[6]!;
-  const dy = R[1]! * mx + R[4]! * my + R[7]!;
-  const dz = R[2]! * mx + R[5]! * my + R[8]!;
-  if (dz >= -1e-6) return false;
-  for (const z of [0, pr.cushionZ]) {
-    const t = (z - fit.C.z) / dz;
-    if (t <= 0) continue;
-    const x = fit.C.x + dx * t;
-    const y = fit.C.y + dy * t;
-    for (const p of pr.pockets) if (Math.hypot(x - p.x, y - p.y) < p.r) return true;
+/** Image bounding boxes (u0, v0, u1, v1) of the pocket holes for `pocketFit` (NaN: not in front). */
+const pocketBox = new Float64Array(4 * 8);
+let pocketFit: Fit | null = null;
+
+/**
+ * Is the image circle (u, v, rc) on a pocket hole? Each hole's rim, at bed and at cushion height, is
+ * projected with the pose and the circle must touch that image box. Decided in the image, not by
+ * back-projecting (u, v) onto the bed: from a few cm above the bed a 1 px error moves that
+ * back-projection by decimetres, so the dark mouths of far pockets would read as unexplained balls.
+ */
+function onPocket(pr: Problem, fit: Fit, u: number, v: number, rc: number): boolean {
+  if (pocketFit !== fit) {
+    pocketFit = fit;
+    for (let q = 0; q < pr.pockets.length && q < 8; q++) {
+      const p = pr.pockets[q]!;
+      let u0 = Infinity;
+      let v0 = Infinity;
+      let u1 = -Infinity;
+      let v1 = -Infinity;
+      for (let z = 0; z < 2; z++)
+        for (let a = 0; a < 8; a++) {
+          const th = (a * Math.PI) / 4;
+          const [X, Y, Z] = cameraToWorldC(fit.R, fit.C, { x: p.x + p.r * Math.cos(th), y: p.y + p.r * Math.sin(th), z: z ? pr.cushionZ : 0 });
+          if (Z <= 0.05) continue;
+          const pu = (fit.f * X) / Z + pr.cx;
+          const pv = (fit.f * Y) / Z + pr.cy;
+          if (pu < u0) u0 = pu;
+          if (pu > u1) u1 = pu;
+          if (pv < v0) v0 = pv;
+          if (pv > v1) v1 = pv;
+        }
+      pocketBox[q * 4] = u0;
+      pocketBox[q * 4 + 1] = v0;
+      pocketBox[q * 4 + 2] = u1;
+      pocketBox[q * 4 + 3] = v1;
+    }
   }
+  const m = 0.5 * rc + 2;
+  for (let q = 0; q < pr.pockets.length && q < 8; q++)
+    if (u > pocketBox[q * 4]! - m && u < pocketBox[q * 4 + 2]! + m && v > pocketBox[q * 4 + 1]! - m && v < pocketBox[q * 4 + 3]! + m) return true;
   return false;
 }
 
@@ -1098,7 +448,7 @@ function colourAt(pr: Problem, u: number, v: number, r: number): ColourDesc | nu
   const y0 = Math.max(0, Math.floor(v - rr));
   const y1 = Math.min(pr.h - 1, Math.ceil(v + rr));
   const d = pr.frame.data;
-  const acc = new ColourAcc();
+  const acc = new ColourAcc(pr.vScale);
   let tot = 0;
   for (let y = y0; y <= y1; y++)
     for (let x = x0; x <= x1; x++) {
@@ -1112,33 +462,57 @@ function colourAt(pr: Problem, u: number, v: number, r: number): ColourDesc | nu
   return acc.desc();
 }
 
-/** A ball whose (overview) colour reads as cloth cannot be seen against it. */
-function camouflaged(rgb: [number, number, number], cloth: ClothModel): boolean {
-  const hsv = [0, 0, 0];
-  rgbToHsv(rgb[0], rgb[1], rgb[2], hsv);
-  return hueDiff(hsv[0]!, cloth.hue) < 25 && hsv[1]! > 0.3 * cloth.sat && hsv[2]! > 0.15;
-}
-
-/** True when the photo shows plain cloth around (u, v): a predicted ball there is missing. */
+/**
+ * True when the photo shows plain cloth around (u, v): a predicted ball there is missing. Plain cloth
+ * is cloth by the mask and as bright as the cloth beside it (within PLAIN_CLOTH_V): on an untinted grey
+ * cloth the mask tells a ball from the cloth by value alone, and the shaded side of a white ball under
+ * overhead light (V ≈ 0.34 against the cloth's 0.58 in the renders) falls inside the cloth's value
+ * band — the ball is there, unseen, not missing.
+ */
 function clothAt(pr: Problem, u: number, v: number, r: number): boolean {
   const rr = Math.max(1, 0.5 * r);
   let cloth = 0;
   let tot = 0;
-  for (const [dx, dy] of [
-    [0, 0],
-    [rr, 0],
-    [-rr, 0],
-    [0, rr],
-    [0, -rr],
-  ] as const) {
-    const x = Math.floor(u + dx);
-    const y = Math.floor(v + dy);
+  let vIn = 0;
+  for (let q = 0; q < 5; q++) {
+    const x = Math.floor(u + rr * RING_DX[q]!);
+    const y = Math.floor(v + rr * RING_DY[q]!);
     if (x < 0 || y < 0 || x >= pr.w || y >= pr.h) continue;
     tot++;
-    if (pr.mask[y * pr.w + x] === 2) cloth++;
+    if (pr.mask[y * pr.w + x] !== 2) return false;
+    cloth++;
+    vIn += pixelV(pr, x, y);
   }
-  return tot >= 3 && cloth === tot;
+  if (tot < 3 || cloth !== tot) return false;
+  // The cloth beside it: four points 2.5 r out, those the mask calls cloth.
+  const ro = Math.max(3, 2.5 * r);
+  let nOut = 0;
+  let vOut = 0;
+  for (let q = 1; q < 5; q++) {
+    const x = Math.floor(u + ro * RING_DX[q]!);
+    const y = Math.floor(v + ro * RING_DY[q]!);
+    if (x < 0 || y < 0 || x >= pr.w || y >= pr.h || pr.mask[y * pr.w + x] !== 2) continue;
+    nOut++;
+    vOut += pixelV(pr, x, y);
+  }
+  if (nOut < 2) return true;
+  const ratio = vIn / tot / Math.max(1e-6, vOut / nOut);
+  return ratio > 1 - PLAIN_CLOTH_V && ratio < 1 + PLAIN_CLOTH_V;
 }
+const RING_DX = [0, 1, -1, 0, 0];
+const RING_DY = [0, 0, 0, 1, -1];
+/** HSV value (max channel) of a pixel, 0..1. */
+function pixelV(pr: Problem, x: number, y: number): number {
+  const d = pr.frame.data;
+  const i = (y * pr.w + x) * 4;
+  return Math.max(d[i]!, d[i + 1]!, d[i + 2]!) / 255;
+}
+/**
+ * Relative brightness difference within which a patch still reads as the cloth beside it. Plain cloth
+ * varies by a few % over 2.5 r (lighting gradient, sensor noise σ 4 ≈ 3 % of a mid cloth); a ball's
+ * shaded side differs by ≈ 40 %.
+ */
+const PLAIN_CLOTH_V = 0.2;
 
 /** Per-point assignment: element index (balls first, then segments) or −1, and the residual (px). */
 interface Assignment {
@@ -1209,9 +583,18 @@ function assign(pr: Problem, fit: Fit, gate: number, out: Assignment): void {
     const cosA = bAz[k]!;
     bReach[k] = (1.4 * im.r) / Math.max(0.3, cosA) + gate + 2;
   }
-  const segs = pr.segs.map((s) => segPlane(pr, fit, s));
+  const segs = pr.segs.map((s) => (seenFromOutside(s, fit.C) ? null : segPlane(pr, fit, s)));
+  // Cracks along an edge seen from behind its rail are the rail's lip or a ball cut off by it: neither
+  // an edge nor a ball silhouette the model can explain, so they are left unassigned.
+  const behind = pr.segs.map((s) => (seenFromOutside(s, fit.C) ? segPlane(pr, fit, s) : null));
+  const anyBehind = behind.some((p) => p !== null);
   const { elem, res } = out;
   for (let i = 0; i < pr.nPts; i++) {
+    if (anyBehind && nearSeg(pr, fit, behind, i, BEHIND_EDGE_BAND)) {
+      elem[i] = -1;
+      res[i] = 0;
+      continue;
+    }
     const u = pr.px[i]!;
     const v = pr.py[i]!;
     const mx = (u - cx) / f;
@@ -1262,7 +645,10 @@ function selectPoints(pr: Problem, a: Assignment, maxPerBall: number, maxPerSeg:
   for (let i = 0; i < pr.nPts; i++) if (a.elem[i]! >= 0) cnt[a.elem[i]!]! += 1;
   const stride = new Float64Array(ne);
   for (let e = 0; e < ne; e++) {
-    const cap = e < nb ? maxPerBall : maxPerSeg;
+    // The cue ball keeps CUE_WEIGHT× the points of another ball: the strike dot is drawn on it, so the
+    // pose should put the layout's cue ball on the photo's own cue ball rather than spread a layout
+    // error (the overview places balls within ≈ 1 cm) over it.
+    const cap = e === pr.cueIdx ? CUE_WEIGHT * maxPerBall : e < nb ? maxPerBall : maxPerSeg;
     stride[e] = cnt[e]! > cap ? cnt[e]! / cap : 1;
   }
   const seen = new Float64Array(ne);
@@ -1281,6 +667,16 @@ function selectPoints(pr: Problem, a: Assignment, maxPerBall: number, maxPerSeg:
   return sel.subarray(0, m);
 }
 
+/** Points the cue ball's silhouette keeps in a fit, relative to another ball (selectPoints). */
+const CUE_WEIGHT = 3;
+/** Position uncertainty of a ball in the overview's layout (m), 001 SC-003 (median ≤ 10 mm). */
+const LAYOUT_SIGMA = 0.005;
+/** Step for the layout sensitivity (m): sub-pixel at the nearest ball, so the fit responds linearly. */
+const LAYOUT_STEP = 0.0002;
+/** Inlier cracks a cushion line needs to count as seen (Evaluation.edgeCrossed). */
+const EDGE_LINE_SUPPORT = 15;
+/** Fewest associated crack points an LM stage needs (the 7 parameters plus redundancy). */
+const MIN_REFINE_POINTS = 12;
 const SIG_BALL = 1.0; // px, silhouette crack points
 const SIG_EDGE = 1.5; // px, cloth-edge crack points
 const CAUCHY = 2.0; // in σ units
@@ -1292,10 +688,11 @@ function residuals(pr: Problem, R0: M3, p: Float64Array, sel: Int32Array, elemOf
   const f = Math.exp(p[6]!);
   const { cx, cy, Rb, balls } = pr;
   const nb = balls.length;
-  // Per-element camera quantities, computed lazily.
-  const ne = nb + pr.segs.length;
-  const cache = new Float64Array(ne * 4);
-  const have = new Uint8Array(ne);
+  // Per-element camera quantities, computed lazily (scratch on the problem: residuals runs ≈ 10× per
+  // LM iteration).
+  const cache = pr.resCache;
+  const have = pr.resHave;
+  have.fill(0);
   let n = 0;
   for (let q = 0; q < sel.length; q++) {
     const i = sel[q]!;
@@ -1344,7 +741,8 @@ function residuals(pr: Problem, R0: M3, p: Float64Array, sel: Int32Array, elemOf
     }
   }
   // Priors.
-  out[n++] = (p[6]! - pr.logf0) / pr.sigLogF;
+  const xf = (p[6]! - pr.logf0) / pr.sigLogF;
+  out[n++] = pr.robustF ? Math.sign(xf) * Math.sqrt(Math.log1p(xf * xf)) : xf;
   out[n++] = Math.asin(Math.max(-1, Math.min(1, R[2]!))) / pr.sigRoll;
   out[n++] = C.z < 0.02 ? (0.02 - C.z) / 0.005 : C.z > 2 ? (C.z - 2) / 0.05 : 0;
   if (pr.height) out[n++] = (C.z - pr.height.mu) / pr.height.sigma;
@@ -1483,6 +881,8 @@ function refine(pr: Problem, fit0: Fit, gates: number[]): Refined {
   for (const gate of gates) {
     assign(pr, fit, gate, asg);
     const sel = selectPoints(pr, asg, 90, 160);
+    // Nothing (or almost nothing) within the gate: the seed is wrong; the priors alone would only drift.
+    if (sel.length < MIN_REFINE_POINTS) break;
     lm = levenberg(pr, fit, sel, asg.elem, 8);
     fit = lm.fit;
   }
@@ -1517,27 +917,54 @@ interface Projected {
   vis: Uint8Array;
 }
 
+/** scorePose scratch: each ball's best circle and cost, each circle's best (owning) ball and cost. */
+interface ScoreScratch {
+  ballCand: Int32Array;
+  ballCost: Float64Array;
+  candOwner: Int32Array;
+  candCost: Float64Array;
+}
+
+const scoreScratch = (nb: number, nc: number): ScoreScratch => ({ ballCand: new Int32Array(nb), ballCost: new Float64Array(nb), candOwner: new Int32Array(nc), candCost: new Float64Array(nc) });
+
 /** Visibility codes: 0 out of view, 1 centre in frame, 2 mostly hidden by a nearer ball, 3 cut by the frame edge. */
+const projTmp = new Float64Array(4);
+
 function projectAll(pr: Problem, fit: Fit, out: Projected): void {
   const nb = pr.balls.length;
+  const R = fit.R;
+  const C = fit.C;
   for (let k = 0; k < nb; k++) {
-    const [X, Y, Z] = cameraToWorldC(fit.R, fit.C, pr.balls[k]!);
-    const im = sphereImage(X, Y, Z, pr.Rb, fit.f, pr.cx, pr.cy);
+    // cameraToWorldC and sphereImage, without allocating (this runs for every hypothesis).
+    const b = pr.balls[k]!;
+    const dx = b.x - C.x;
+    const dy = b.y - C.y;
+    const dz = b.z - C.z;
+    const X = R[0]! * dx + R[1]! * dy + R[2]! * dz;
+    const Y = R[3]! * dx + R[4]! * dy + R[5]! * dz;
+    const Z = R[6]! * dx + R[7]! * dy + R[8]! * dz;
     out.vis[k] = 0;
-    if (!im) continue;
-    out.u[k] = im.u;
-    out.v[k] = im.v;
-    out.r[k] = im.r;
-    out.d[k] = im.d;
-    if (im.u < -im.r || im.u > pr.w + im.r || im.v < -im.r || im.v > pr.h + im.r) continue;
-    out.vis[k] = im.u < 0 || im.u > pr.w || im.v < 0 || im.v > pr.h ? 3 : 1;
+    if (!sphereImageTo(X, Y, Z, pr.Rb, fit.f, pr.cx, pr.cy, projTmp)) continue;
+    const u = projTmp[0]!;
+    const v = projTmp[1]!;
+    const r = projTmp[2]!;
+    out.u[k] = u;
+    out.v[k] = v;
+    out.r[k] = r;
+    out.d[k] = projTmp[3]!;
+    if (u < -r || u > pr.w + r || v < -r || v > pr.h + r) continue;
+    out.vis[k] = u < 0 || u > pr.w || v < 0 || v > pr.h ? 3 : 1;
   }
   // Mostly hidden behind a nearer ball → not expected to be seen on its own.
   for (let k = 0; k < nb; k++) {
     if (!out.vis[k]) continue;
     for (let m = 0; m < nb; m++) {
       if (m === k || !out.vis[m] || out.d[m]! >= out.d[k]!) continue;
-      if (Math.hypot(out.u[k]! - out.u[m]!, out.v[k]! - out.v[m]!) < out.r[m]! - 0.3 * out.r[k]!) {
+      const t = out.r[m]! - 0.3 * out.r[k]!;
+      const du = out.u[k]! - out.u[m]!;
+      const dv = out.v[k]! - out.v[m]!;
+      if (du >= t || -du >= t || dv >= t || -dv >= t) continue;
+      if (Math.hypot(du, dv) < t) {
         out.vis[k] = 2;
         break;
       }
@@ -1546,29 +973,50 @@ function projectAll(pr: Problem, fit: Fit, out: Projected): void {
 }
 
 /**
- * Score a pose by how many known balls land on candidate circles of the right size and colour. Balls
- * predicted on plain cloth count against it (a moved ball); balls predicted inside other blobs (packed,
- * hidden, or the same colour as the cloth) are neutral. Circles that no predicted ball explains also
- * count against it.
+ * Score a pose by how many known balls land on candidate circles of the right size and colour, one
+ * ball per circle (with 15 reds, a wrong pose could otherwise pile several reds onto one circle), and
+ * only colour-compatible pairs (as for a final match). Balls predicted on plain cloth count against it
+ * (a moved ball); balls predicted inside other blobs (packed, hidden, or the same colour as the cloth)
+ * are neutral. Circles that no predicted ball explains also count against it.
  */
-function scorePose(pr: Problem, fit: Fit, known: KnownBall[], cands: Candidate[], proj: Projected): number {
+function scorePose(pr: Problem, fit: Fit, known: KnownBall[], cands: Candidate[], proj: Projected, ss: ScoreScratch): number {
   projectAll(pr, fit, proj);
   let score = 0;
+  const { ballCand, ballCost, candOwner, candCost } = ss;
+  candOwner.fill(-1);
+  candCost.fill(Infinity);
   for (let k = 0; k < known.length; k++) {
+    ballCand[k] = -1;
     if (proj.vis[k] !== 1 && proj.vis[k] !== 3) continue;
     const rk = proj.r[k]!;
-    let best = Infinity;
+    let best = 9;
     for (let j = 0; j < cands.length; j++) {
       const c = cands[j]!;
       const ratio = c.r / rk;
       if (ratio < 0.5 || ratio > 2) continue;
       const e = Math.hypot(c.u - proj.u[k]!, c.v - proj.v[k]!) / (0.35 * rk + 3);
       if (e >= 3) continue;
-      const cost = e * e + 0.5 * colourCost(pr.cls[k]!, c.col) + 2 * Math.log(ratio) ** 2;
-      if (cost < best) best = cost;
+      const cc = pr.cc[k * pr.nCands + j]!;
+      if (cc >= 3) continue;
+      const cost = e * e + 0.5 * cc + 2 * Math.log(ratio) ** 2;
+      if (cost < best) {
+        best = cost;
+        ballCand[k] = j;
+      }
     }
-    if (best < 9) score += 1.5 - 0.12 * best;
-    else if (proj.vis[k] === 1 && !pr.camo[k] && clothAt(pr, proj.u[k]!, proj.v[k]!, rk)) score -= 0.6;
+    ballCost[k] = best;
+    const j = ballCand[k]!;
+    if (j >= 0 && best < candCost[j]!) {
+      candCost[j] = best;
+      candOwner[j] = k;
+    }
+  }
+  for (let k = 0; k < known.length; k++) {
+    if (proj.vis[k] !== 1 && proj.vis[k] !== 3) continue;
+    const j = ballCand[k]!;
+    if (j >= 0) {
+      if (candOwner[j] === k) score += 1.5 - 0.12 * ballCost[k]!;
+    } else if (proj.vis[k] === 1 && !pr.camo[k] && clothAt(pr, proj.u[k]!, proj.v[k]!, proj.r[k]!)) score -= 0.6;
   }
   for (const c of cands) if (c.r >= 3 && !explained(pr, fit, c, proj)) score -= 0.4;
   return score;
@@ -1576,7 +1024,7 @@ function scorePose(pr: Problem, fit: Fit, known: KnownBall[], cands: Candidate[]
 
 function explained(pr: Problem, fit: Fit, c: Candidate, proj: Projected): boolean {
   for (let k = 0; k < proj.vis.length; k++) if (proj.vis[k] && Math.hypot(c.u - proj.u[k]!, c.v - proj.v[k]!) < proj.r[k]! + 0.5 * c.r + 2) return true;
-  return inPocket(pr, fit, c.u, c.v) || inPocket(pr, fit, c.u, c.v + 0.8 * c.r);
+  return onPocket(pr, fit, c.u, c.v, c.r);
 }
 
 /** Closed-form level-camera pose from the cue ball (camera frame P_c) and one more ball seen along a_j. */
@@ -1659,15 +1107,24 @@ function toPose(fit: Fit, w: number, h: number): CameraPose {
 }
 
 interface Evaluation {
-  matched: { k: number; u: number; v: number; r: number; cov: number }[];
+  /** Matched balls, with the colour cost of the photo's pixels against the ball's known colour. */
+  matched: { k: number; u: number; v: number; r: number; cov: number; colour: number }[];
   visible: number;
   /** Visible balls predicted where the photo shows plain cloth. */
   missing: number;
   residualPx: number;
   edgeInliers: number;
+  /**
+   * Cushion lines of both directions carry ≥ EDGE_LINE_SUPPORT inlier cracks (a side and an end
+   * cushion): two non-parallel table lines pin the pose; parallel ones (the near and far end, seen at a
+   * grazing angle) leave it free to slide.
+   */
+  edgeCrossed: boolean;
   /** Fraction of the cloth-boundary cracks the model explains (within 2.5 px). */
   explainedFrac: number;
   unexplained: number;
+  /** Some circle nothing explains has the cue ball's colour (where a moved cue ball would show). */
+  strayCue: boolean;
   quality: number;
 }
 
@@ -1681,14 +1138,25 @@ function evaluate(pr: Problem, r: Refined, cands: Candidate[]): Evaluation {
   const absRes = new Float32Array(pr.nPts);
   let nAbs = 0;
   let edgeInliers = 0;
+  const segIn = new Int32Array(pr.segs.length);
   let explainedPts = 0;
+  // Edges seen from behind their rail are left out of the fit (seenFromOutside); their cracks are
+  // neither explained nor unexplained: they do not count in explainedFrac.
+  const behind = pr.segs.map((sg) => (seenFromOutside(sg, r.fit.C) ? segPlane(pr, r.fit, sg) : null));
+  let neutralPts = 0;
   for (let i = 0; i < pr.nPts; i++) {
     const e = r.assign.elem[i]!;
-    if (e < 0) continue;
+    if (e < 0) {
+      if (nearSeg(pr, r.fit, behind, i, BEHIND_EDGE_BAND)) neutralPts++;
+      continue;
+    }
     const res = Math.abs(r.assign.res[i]!);
     if (res < 2.5) explainedPts++;
     if (e >= nb) {
-      if (res < 2) edgeInliers++;
+      if (res < 2) {
+        edgeInliers++;
+        segIn[e - nb]! += 1;
+      }
       continue;
     }
     absRes[nAbs++] = res;
@@ -1708,54 +1176,283 @@ function evaluate(pr: Problem, r: Refined, cands: Candidate[]): Evaluation {
     for (let q = 0; q < 36; q++) bitsCount += covBits[k * 36 + q]!;
     const cov = bitsCount * 10;
     const expected = 1.27 * proj.r[k]! * ((cov * Math.PI) / 180);
-    let colourOk = false;
+    let colour = Infinity;
     if (proj.vis[k] === 1 || proj.vis[k] === 3) {
       const c = colourAt(pr, proj.u[k]!, proj.v[k]!, proj.r[k]!);
-      colourOk = c !== null && colourCost(pr.cls[k]!, c) < 3;
+      if (c) colour = colourCost(pr.cls[k]!, c);
     }
-    if ((proj.vis[k] === 1 || proj.vis[k] === 3) && colourOk && cov >= 120 && cnt[k]! >= Math.max(6, 0.35 * expected)) matched.push({ k, u: proj.u[k]!, v: proj.v[k]!, r: proj.r[k]!, cov });
+    if ((proj.vis[k] === 1 || proj.vis[k] === 3) && colour < 3 && cov >= 120 && cnt[k]! >= Math.max(6, 0.35 * expected)) matched.push({ k, u: proj.u[k]!, v: proj.v[k]!, r: proj.r[k]!, cov, colour });
     else if (proj.vis[k] === 1 && !pr.camo[k] && clothAt(pr, proj.u[k]!, proj.v[k]!, proj.r[k]!)) missing++;
   }
   // Candidates that no visible ball explains (a moved or unknown ball).
   let unexplained = 0;
-  for (const c of cands) if (c.r >= 3 && !explained(pr, r.fit, c, proj)) unexplained++;
-  const explainedFrac = explainedPts / Math.max(1, pr.nPts);
+  let strayCue = false;
+  for (let j = 0; j < cands.length; j++) {
+    const c = cands[j]!;
+    if (c.r < 3 || explained(pr, r.fit, c, proj)) continue;
+    unexplained++;
+    if (pr.cc[pr.cueIdx * pr.nCands + j]! < 3) strayCue = true;
+  }
+  const explainedFrac = explainedPts / Math.max(1, pr.nPts - neutralPts);
   const quality = matched.length - 0.6 * missing - 0.4 * unexplained - 0.1 * Math.min(10, residualPx) + 4 * explainedFrac;
-  return { matched, visible, missing, residualPx, edgeInliers, explainedFrac, unexplained, quality };
+  // edgeSegments order: four side-cushion segments (y = ±Y), then the two end cushions (x = ±X).
+  let side = false;
+  let end = false;
+  for (let q = 0; q < pr.segs.length; q++) {
+    if (segIn[q]! < EDGE_LINE_SUPPORT) continue;
+    if (q < 4) side = true;
+    else end = true;
+  }
+  return { matched, visible, missing, residualPx, edgeInliers, edgeCrossed: side && end, explainedFrac, unexplained, strayCue, quality };
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Roll completion of a pair hypothesis
+// ---------------------------------------------------------------------------------------------------
+
+/** Largest |roll| a hypothesis may have (the spec allows ±20°; margin for the fit to settle). */
+const ROLL_MAX = (35 * Math.PI) / 180;
+/** θ votes: 2° bins over ±40°, each a bit set of the voting circles (≤ 31 circles) and a θ sum. */
+const THETA_STEP = (2 * Math.PI) / 180;
+const THETA_BINS = 40;
+const voteMask = new Int32Array(THETA_BINS);
+const voteSum = new Float64Array(THETA_BINS);
+const voteCnt = new Int32Array(THETA_BINS);
+
+function popcount(x: number): number {
+  let v = x - ((x >>> 1) & 0x55555555);
+  v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
+  return (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+/** Camera-frame rays of the hypothesis circles at one focal guess (unit direction, image radius). */
+interface Rays {
+  /** Index of each hypothesis circle in the photo's candidate list. */
+  idx: Int32Array;
+  ax: Float64Array;
+  ay: Float64Array;
+  az: Float64Array;
+  r: Float64Array;
+  n: number;
+}
+
+/**
+ * The cue ball (camera-frame centre Pc) and one more ball (index j) fix the rotation only up to a
+ * turn θ about v = R·(W_j − c), the camera-frame vector between them; poseFromPair picks the level
+ * member (roll 0). Here every other circle k, read as a colour-compatible known ball m, votes for the
+ * θ that puts m on k's ray: with q = R0·(W_m − c), m's centre Pc + Rot_v(θ)·q runs on a circle about
+ * v, and k's ray crosses that circle's plane at the point of angle θ (the radial miss, in image px, is
+ * the gate). The θ that ≥ 2 distinct circles agree on gives the rolled pose, kept when its roll is
+ * within ROLL_MAX. A phone held at an angle is then hypothesised as exactly as a level one.
+ */
+function rollCompletion(pr: Problem, fit: Fit, Pc: [number, number, number], cueIdx: number, j: number, skip0: number, skip1: number, rays: Rays, out: Fit[]): void {
+  const R0 = fit.R;
+  const cue = pr.balls[cueIdx]!;
+  const bj = pr.balls[j]!;
+  const ux = bj.x - cue.x;
+  const uy = bj.y - cue.y;
+  let vx = R0[0]! * ux + R0[1]! * uy;
+  let vy = R0[3]! * ux + R0[4]! * uy;
+  let vz = R0[6]! * ux + R0[7]! * uy;
+  const vl = Math.hypot(vx, vy, vz);
+  if (vl < 1e-9) return;
+  vx /= vl;
+  vy /= vl;
+  vz /= vl;
+  voteMask.fill(0);
+  voteSum.fill(0);
+  voteCnt.fill(0);
+  const f = fit.f;
+  const nb = pr.balls.length;
+  for (let m = 0; m < nb; m++) {
+    if (m === cueIdx || m === j) continue;
+    const bm = pr.balls[m]!;
+    const wx = bm.x - cue.x;
+    const wy = bm.y - cue.y;
+    const qx = R0[0]! * wx + R0[1]! * wy;
+    const qy = R0[3]! * wx + R0[4]! * wy;
+    const qz = R0[6]! * wx + R0[7]! * wy;
+    const qv = qx * vx + qy * vy + qz * vz;
+    let e1x = qx - qv * vx;
+    let e1y = qy - qv * vy;
+    let e1z = qz - qv * vz;
+    const rho = Math.hypot(e1x, e1y, e1z);
+    if (rho < 1e-4) continue;
+    e1x /= rho;
+    e1y /= rho;
+    e1z /= rho;
+    const e2x = vy * e1z - vz * e1y;
+    const e2y = vz * e1x - vx * e1z;
+    const e2z = vx * e1y - vy * e1x;
+    const ox = Pc[0] + qv * vx;
+    const oy = Pc[1] + qv * vy;
+    const oz = Pc[2] + qv * vz;
+    const ov = ox * vx + oy * vy + oz * vz;
+    for (let k = 0; k < rays.n && k < 31; k++) {
+      if (k === skip0 || k === skip1 || pr.cc[m * pr.nCands + rays.idx[k]!]! >= 3) continue;
+      const ax = rays.ax[k]!;
+      const ay = rays.ay[k]!;
+      const az = rays.az[k]!;
+      const av = ax * vx + ay * vy + az * vz;
+      if (Math.abs(av) < 0.05) continue;
+      const sd = ov / av;
+      if (!(sd > 0.05)) continue;
+      const dx = sd * ax - ox;
+      const dy = sd * ay - oy;
+      const dz = sd * az - oz;
+      const d1 = dx * e1x + dy * e1y + dz * e1z;
+      const d2 = dx * e2x + dy * e2y + dz * e2z;
+      if ((Math.abs(Math.hypot(d1, d2) - rho) * f) / sd > 0.5 * rays.r[k]! + 4) continue;
+      const th = Math.atan2(d2, d1);
+      const b = Math.floor(th / THETA_STEP + THETA_BINS / 2);
+      if (b < 0 || b >= THETA_BINS) continue;
+      voteMask[b] = voteMask[b]! | (1 << k);
+      voteSum[b] = voteSum[b]! + th;
+      voteCnt[b] = voteCnt[b]! + 1;
+    }
+  }
+  let bestB = -1;
+  let bestVotes = 1;
+  for (let b = 0; b < THETA_BINS; b++) {
+    const votes = popcount(voteMask[b]! | (b > 0 ? voteMask[b - 1]! : 0) | (b < THETA_BINS - 1 ? voteMask[b + 1]! : 0));
+    if (votes > bestVotes) {
+      bestVotes = votes;
+      bestB = b;
+    }
+  }
+  if (bestB < 0) return;
+  let sum = 0;
+  let cnt = 0;
+  for (let b = Math.max(0, bestB - 1); b <= Math.min(THETA_BINS - 1, bestB + 1); b++) {
+    sum += voteSum[b]!;
+    cnt += voteCnt[b]!;
+  }
+  const th = sum / cnt;
+  if (Math.abs(th) < THETA_STEP) return; // the level member already is this pose
+  const R = mulM3(rodrigues(th * vx, th * vy, th * vz), R0);
+  if (Math.abs(Math.asin(Math.max(-1, Math.min(1, R[2]!)))) > ROLL_MAX) return;
+  const C = {
+    x: cue.x - (R[0]! * Pc[0] + R[3]! * Pc[1] + R[6]! * Pc[2]),
+    y: cue.y - (R[1]! * Pc[0] + R[4]! * Pc[1] + R[7]! * Pc[2]),
+    z: cue.z - (R[2]! * Pc[0] + R[5]! * Pc[1] + R[8]! * Pc[2]),
+  };
+  if (C.z < 0.015 || C.z > 2.5) return;
+  out.push({ R, C, f });
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Estimator
+// ---------------------------------------------------------------------------------------------------
 
 function fail(reason: string, t0: number, pose: CameraPose | null = null, extra: Partial<PlayerViewResult> = {}): PlayerViewResult {
   return { ok: false, pose, confidence: 0, residualPx: Infinity, matched: [], reason, ms: performance.now() - t0, ...extra };
 }
 
+/**
+ * A photo too dark to read: mean V below DARK_MEAN_V, or more than DARK_SHARE of it nearly black, or
+ * a cloth dimmer than DIM_CLOTH_V. ASSUMPTION (synthetic renders, research R-13 lighting): a lit
+ * table-level photo has mean V ≈ 0.25–0.5 even with a dark room above the far rail (≈ 40–55 % of
+ * the frame at V ≈ 0.13), and cloth V ≈ 0.3–0.55; the ×0.15 exposure test frame has mean V ≈ 0.06.
+ */
+const DARK_MEAN_V = 0.12;
+const DARK_SHARE = 0.8;
+const DIM_CLOTH_V = 0.15;
+/**
+ * Smallest main cloth region (share of the frame) worth fitting. ASSUMPTION: from 8 cm above the bed
+ * and 1.2 m behind the cue ball with a 100° lens the cloth is still ≈ 2.5 % of the frame.
+ */
+const MIN_CLOTH_AREA = 0.01;
+/**
+ * Colour cost (colourCost units: (hue difference / 14°)², 4 = another class) every ball of a
+ * near-minimal fit must stay within: ≤ 1 is a hue within 14° of the overview colour, while neighbouring
+ * pool colours (yellow / orange, red / maroon) differ by ≈ 20–25°.
+ */
+const MINIMAL_COLOUR_COST = 1;
+/**
+ * A pose is supported by the static scene when it explains this share of the cloth boundary, or puts
+ * this share of it on the cushion edges (within 2 px). ASSUMPTION (synthetic renders): a right pose puts
+ * 25–40 % of the cracks on the cushions in a view that shows them, a wrong one (mirrored layout, wrong
+ * roll) 2–5 %.
+ */
+const SOLID_EXPLAINED = 0.5;
+/** Where a player photo is taken from (spec 002 Assumptions, with margin): horizontal distance and height (m). */
+const PLAUSIBLE_CAMERA_DIST = 2;
+const PLAUSIBLE_CAMERA_HEIGHT = 0.8;
+const SOLID_EDGES = 0.2;
+/**
+ * Lens sweep for the focal hypotheses, as multiples of the 65° default: 0.446 · 1.1^i for i < 20, i.e.
+ * HFOV ≈ 110° (0.5× ultra-wide) … 26° (3× tele) in ≈ 10 % steps. The overview's focal length (a soft
+ * hint: the player may switch lens between the photos) adds three guesses around it.
+ */
+const LENS_SWEEP = Array.from({ length: 20 }, (_, i) => 0.446 * 1.1 ** i);
+
+interface Attempt {
+  res: PlayerViewResult;
+  /** Evaluation quality of the best fit (−∞ when no fit was made). */
+  quality: number;
+  /** Ball circles found on this cloth. */
+  circles: number;
+}
+
 export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
   const t0 = performance.now();
-  const { frame, table, balls, cueId, targetId, manualTaps } = input;
+  const { frame, balls, cueId, targetId, manualTaps } = input;
   const w = frame.width;
   const h = frame.height;
   const cues = balls.filter((b) => b.isCue);
   if (!(w > 0 && h > 0) || frame.data.length < w * h * 4 || cues.length !== 1 || cues[0]!.id !== cueId) return fail(PLAYER_VIEW_REASONS.noFit, t0);
   if (manualTaps && (!targetId || !balls.some((b) => b.id === targetId && !b.isCue))) return fail(PLAYER_VIEW_REASONS.noFit, t0);
+
+  // 1. Cloth candidates (chromatic or grey), most plausible first; each is tried until one fits.
+  const sc = getScratch(w, h);
+  const photo = learnPlayerCloth(frame, input.clothHint, sc);
+  const dark = photo.meanV < DARK_MEAN_V || photo.darkFrac > DARK_SHARE;
+  if (!photo.models.length) return fail(dark ? PLAYER_VIEW_REASONS.dark : PLAYER_VIEW_REASONS.noCloth, t0);
+  let best: Attempt | null = null;
+  let circles = 0;
+  for (let k = 0; k < photo.models.length; k++) {
+    // A further candidate is tried only when it is a plausible cloth next to the first (≥ ¼ of its
+    // structure score) or the first is no convincing cloth (fewer than two ball holes).
+    if (k > 0 && photo.scores[k]! < 0.25 * photo.scores[0]! && photo.scores[0]! >= 2) break;
+    const at = fitWithCloth(input, photo.models[k]!, sc, t0);
+    circles = Math.max(circles, at.circles);
+    if (!best || (at.res.ok && !best.res.ok) || (at.res.ok === best.res.ok && at.quality > best.quality)) best = at;
+    // Done when it fits. A failure with balls matched on this cloth does not prove the cloth right: under
+    // sensor noise the next candidate (a neighbouring hue or value mode) often holds the cue ball or a
+    // cleaner crack set and fits (noise σ 4: 63 → 68 of 76 envelope scenes when it is tried).
+    if (at.res.ok) break;
+  }
+  const res = best!.res;
+  // Honest reasons (Principle II): a failure on a dark photo, or on a dim cloth, is about the light;
+  // a lit photo whose surfaces enclose nothing at all (no ball, no pocket) and hold no ball circle
+  // shows no table.
+  if (!res.ok && (dark || photo.models[0]!.val < DIM_CLOTH_V)) res.reason = PLAYER_VIEW_REASONS.dark;
+  else if (!res.ok && circles < 2 && photo.enclosed.every((n) => n === 0)) res.reason = PLAYER_VIEW_REASONS.noCloth;
+  res.ms = performance.now() - t0;
+  return res;
+}
+
+/** Steps 2–6 with one cloth model. */
+function fitWithCloth(input: PlayerViewInput, cloth: ClothModel, sc: Scratch, t0: number): Attempt {
+  const { frame, table, balls, targetId, manualTaps } = input;
+  const w = frame.width;
+  const h = frame.height;
   const Rb = table.ballRadius;
   const diag = Math.hypot(w, h);
   const cx = w / 2;
   const cy = h / 2;
-  const f0 = input.focalPx && input.focalPx > 0 ? input.focalPx : w / 2 / Math.tan((PLAYER_VIEW_DEFAULT_HFOV * Math.PI) / 360);
+  const fDefault = w / 2 / Math.tan((PLAYER_VIEW_DEFAULT_HFOV * Math.PI) / 360);
+  const fHint = input.focalPx && input.focalPx > 0 ? input.focalPx : 0;
+  const f0 = fHint || fDefault;
+  let nCircles = 0;
+  const noFit = (reason: string): Attempt => ({ res: fail(reason, t0), quality: -Infinity, circles: nCircles });
 
-  // 1. Cloth.
-  const learned = learnClothBand(frame);
-  const meanV = learned.meanV;
-  let cloth = learned.model;
-  // A neutral (grey) overview cloth has no hue (ClothModel: `hue` is then meaningless): it must not
-  // steer this photo toward hue 0. Known limit: this matcher is hue-based, so a grey cloth is not
-  // read here yet (the photo then fails honestly).
-  const hint = input.clothHint && input.clothHint.kind !== 'neutral' ? input.clothHint : null;
-  if (hint && (!cloth || hueDiff(cloth.hue, hint.hue) > 35)) cloth = clothFromHint(frame, hint) ?? cloth;
-  if (!cloth || meanV < 0.05 || cloth.val < 0.12) return fail(PLAYER_VIEW_REASONS.dark, t0);
-  const sc = getScratch(w, h);
+  // 2. Evidence: the main cloth region, its boundary cracks and the ball circles on it.
   const ev = buildEvidence(frame, cloth, sc);
-  if (ev.mainArea < 0.05 * w * h) return fail(PLAYER_VIEW_REASONS.dark, t0);
-  const cands = findCandidates(frame, sc, ev.comps, ev.nCracks);
+  if (ev.mainArea < MIN_CLOTH_AREA * w * h) return noFit(PLAYER_VIEW_REASONS.noCloth);
+  const vScale = exposureScale(cloth);
+  const cands = findCandidates(frame, sc, ev.comps, ev.nCracks, vScale);
+  nCircles = cands.length;
   const px = sc.crackX.slice(0, ev.nCracks);
   const py = sc.crackY.slice(0, ev.nCracks);
 
@@ -1769,29 +1466,38 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
     Rb,
     balls: known.map((b) => ({ x: b.pos.x, y: b.pos.y, z: Rb })),
     segs: edgeSegments(table),
+    resCache: new Float64Array((known.length + 6) * 4),
+    resHave: new Uint8Array(known.length + 6),
     px,
     py,
     nPts: ev.nCracks,
     logf0: Math.log(f0),
-    sigLogF: input.focalPx ? 0.1 : 0.5,
+    sigLogF: fHint ? 0.1 : 0.5,
+    robustF: fHint > 0,
     sigRoll: ((manualTaps ? 5 : 10) * Math.PI) / 180,
     taps: [],
     mask: sc.mask,
     frame,
     cushionZ: table.cushionHeight,
     cls: known.map((b) => ballClass(b.rgb)),
+    cueIdx,
+    vScale,
+    cc: new Float64Array(0),
+    nCands: cands.length,
     camo: Uint8Array.from(known.map((b) => (b.rgb && camouflaged(b.rgb, cloth) ? 1 : 0))),
     pockets: table.pockets.map((p) => {
       const mouth = p.kind === 'corner' ? table.cornerMouth : table.sideMouth;
       return { x: p.mouthCenter.x - p.inward.x * 0.5 * mouth, y: p.mouthCenter.y - p.inward.y * 0.5 * mouth, r: 0.9 * mouth + 0.02 };
     }),
   };
+  pr.cc = new Float64Array(known.length * cands.length);
+  for (let k = 0; k < known.length; k++) for (let j = 0; j < cands.length; j++) pr.cc[k * cands.length + j] = colourCost(pr.cls[k]!, cands[j]!.col);
   const cueW = { x: known[cueIdx]!.pos.x, y: known[cueIdx]!.pos.y, z: Rb };
   const targetIdx = targetId ? known.findIndex((b) => b.id === targetId) : -1;
   const s = Math.max(w, h) / 1000;
   const gates = [24 * s, 12 * s, 6 * s, 3.5 * s].map((g) => Math.max(3, g));
 
-  // 2. Cue-ball candidates (whitest circles) or the tapped circles.
+  // 3. Cue-ball candidates (whitest circles) or the tapped circles.
   const nearestCand = (p: Vec2): number => {
     let best = -1;
     let bd = Infinity;
@@ -1808,9 +1514,8 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
   type Obs = { u: number; v: number; r: number };
   const cueObs: Obs[] = [];
   let pairList: { obs: Obs; k: number }[] = [];
-  // Focal guesses: around focalPx when the same camera took the overview, else 0.5×–2× of the 65° prior
-  // (HFOV ≈ 100° ultra-wide … 40° tele), in ~10 % steps.
-  const fMuls = input.focalPx ? [0.85, 0.92, 1, 1.08, 1.17] : Array.from({ length: 15 }, (_, i) => 0.5 * 1.1 ** i);
+  // Focal guesses: the lens sweep, plus the overview's focal length ±5 % when given.
+  const fMuls = fHint ? [...LENS_SWEEP.map((m) => (m * fDefault) / fHint), 0.95, 1, 1.05] : LENS_SWEEP;
   if (manualTaps) {
     const jc = nearestCand(manualTaps.cue);
     const jt = nearestCand(manualTaps.target);
@@ -1828,39 +1533,53 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
       .map((c, j) => ({ j, c }))
       .filter(({ c }) => c.white > 0.15 && colourCost(pr.cls[cueIdx]!, c.col) < 3)
       .sort((a, b) => b.c.white + 0.25 * Math.min(1, b.c.r / 40) - (a.c.white + 0.25 * Math.min(1, a.c.r / 40)));
-    if (!whites.length) return fail(cands.length < 2 ? PLAYER_VIEW_REASONS.tooFewBalls : PLAYER_VIEW_REASONS.noCue, t0);
+    if (!whites.length) return noFit(cands.length < 2 ? PLAYER_VIEW_REASONS.tooFewBalls : PLAYER_VIEW_REASONS.noCue);
     for (const { c } of whites.slice(0, 2)) cueObs.push(c);
   }
 
-  // 3. Hypotheses: cue circle + one more (circle, ball) pair → level pose, for each focal guess.
+  // 4. Hypotheses: cue circle + one more (circle, ball) pair → level pose and its roll completion,
+  //    for each focal guess.
   const nb = known.length;
   const proj: Projected = { u: new Float64Array(nb), v: new Float64Array(nb), r: new Float64Array(nb), d: new Float64Array(nb), vis: new Uint8Array(nb) };
+  const ss = scoreScratch(nb, cands.length);
   const hyps: Hyp[] = [];
   const tmp: Fit[] = [];
   // The 16 largest circles, each paired with every colour-compatible known ball.
   const bigCands = [...cands].sort((a, b) => b.r - a.r).slice(0, 16);
+  const rays: Rays = { idx: Int32Array.from(bigCands.map((c) => cands.indexOf(c))), ax: new Float64Array(16), ay: new Float64Array(16), az: new Float64Array(16), r: new Float64Array(16), n: bigCands.length };
   for (const co of cueObs) {
+    const coIdx = bigCands.indexOf(co as Candidate);
     const pairs = manualTaps
-      ? pairList
-      : bigCands.filter((c) => c !== co).flatMap((c) => known.map((_, k) => ({ obs: c as Obs, k })).filter(({ k }) => k !== cueIdx && colourCost(pr.cls[k]!, c.col) < 3));
+      ? pairList.map((p) => ({ ...p, ci: bigCands.indexOf(p.obs as Candidate) }))
+      : bigCands.flatMap((c, ci) => (c === co ? [] : known.map((_, k) => ({ obs: c as Obs, k, ci })).filter(({ k }) => k !== cueIdx && colourCost(pr.cls[k]!, c.col) < 3)));
     for (const fm of fMuls) {
       const f = f0 * fm;
       const cr = ballRay(co, f, cx, cy, Rb);
       if (!Number.isFinite(cr.D)) continue;
       const Pc: [number, number, number] = [cr.a[0] * cr.D, cr.a[1] * cr.D, cr.a[2] * cr.D];
+      for (let q = 0; q < bigCands.length; q++) {
+        const rq = ballRay(bigCands[q]!, f, cx, cy, Rb);
+        rays.ax[q] = rq.a[0];
+        rays.ay[q] = rq.a[1];
+        rays.az[q] = rq.a[2];
+        rays.r[q] = bigCands[q]!.r;
+      }
       for (const pp of pairs) {
         const rj = ballRay(pp.obs, f, cx, cy, Rb);
         tmp.length = 0;
         poseFromPair(cueW, Pc, rj.a, rj.D, { x: known[pp.k]!.pos.x, y: known[pp.k]!.pos.y, z: Rb }, tmp, f);
+        const nLevel = tmp.length;
+        for (let q = 0; q < nLevel; q++) rollCompletion(pr, tmp[q]!, Pc, cueIdx, pp.k, coIdx, pp.ci, rays, tmp);
         for (const fit of tmp) {
-          let score = scorePose(pr, fit, known, cands, proj);
+          let score = scorePose(pr, fit, known, cands, proj, ss);
           if (manualTaps) score -= 0.5 * ((fit.C.z - 0.2) / 0.15) ** 2;
           hyps.push({ fit, score });
         }
       }
     }
   }
-  if (!hyps.length) return fail(cands.length < 2 ? PLAYER_VIEW_REASONS.tooFewBalls : PLAYER_VIEW_REASONS.noFit, t0);
+  // No pose at all from the cue-ball candidates: in automatic mode the white circles were not the cue ball.
+  if (!hyps.length) return noFit(cands.length < 2 ? PLAYER_VIEW_REASONS.tooFewBalls : manualTaps ? PLAYER_VIEW_REASONS.noFit : PLAYER_VIEW_REASONS.noCue);
   hyps.sort((a, b) => b.score - a.score);
   const seeds: Hyp[] = [];
   for (const hy of hyps) {
@@ -1868,20 +1587,22 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
     if (seeds.every((sd) => poseDistance(sd.fit, hy.fit) > 1.5)) seeds.push(hy);
   }
 
-  // 4. Refine the best seeds; keep the one that explains the photo best.
+  // 5. Refine the best seeds; keep the one that explains the photo best.
   let best: { r: Refined; ev: Evaluation } | null = null;
   for (const sd of seeds) {
     const r = refine(pr, sd.fit, gates);
     const e = evaluate(pr, r, cands);
     if (!best || e.quality > best.ev.quality + 1e-9) best = { r, ev: e };
-    // A seed that explains everything cleanly cannot be beaten in a way that matters: stop early.
-    if (best.ev.missing === 0 && best.ev.unexplained === 0 && best.ev.matched.length >= 3 && best.ev.residualPx < 1 && best.ev.explainedFrac > 0.6) break;
+    // A seed that explains everything cleanly cannot be beaten in a way that matters: stop early. With
+    // five or more balls matched, a couple of stray circles (arcs in a packed rack) do not change that.
+    const be = best.ev;
+    if (be.missing === 0 && be.residualPx < 1 && be.explainedFrac > 0.6 && ((be.unexplained === 0 && be.matched.length >= 3) || (be.unexplained <= 2 && be.matched.length >= 5))) break;
   }
   const { r: fitR, ev: fe } = best!;
   const fit = fitR.fit;
   const pose = toPose(fit, w, h);
 
-  // 5. Confidence: matched balls × residual × propagated uncertainty of the target's image position.
+  // 6. Confidence: matched balls × residual × propagated uncertainty of the target's image position.
   const focus = targetIdx >= 0 ? targetIdx : fe.matched.length ? fe.matched[fe.matched.length - 1]!.k : cueIdx;
   let sigmaPx = Infinity;
   if (fitR.lm.A) {
@@ -1917,6 +1638,34 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
       sigmaPx = Math.sqrt(Math.max(0, tr * fitR.lm.s2));
     }
   }
+  // The layout itself is uncertain (the overview places balls within ≈ 1 cm, 001 SC-003). With the
+  // cushions out of the fit and only a few balls, the pose leans on those few positions: the target's
+  // image position is propagated from LAYOUT_SIGMA per coordinate of each matched ball, by refitting
+  // with that ball moved by a small step (the response is linear there; a full 5 mm step would push the
+  // near cue ball's silhouette 20 px off, past the Cauchy scale, and measure its rejection instead).
+  // Many balls or the cushions make the pose insensitive to one ball; three close balls do not.
+  if (Number.isFinite(sigmaPx) && fe.matched.length <= 4 && fe.edgeInliers < 20) {
+    const sel = selectPoints(pr, fitR.assign, 90, 160);
+    const focusAt = (f: Fit) => {
+      const [X, Y, Z] = cameraToWorldC(f.R, f.C, pr.balls[focus]!);
+      return sphereImage(X, Y, Z, Rb, f.f, cx, cy);
+    };
+    const base = focusAt(fit);
+    let s2 = 0;
+    for (const m of fe.matched)
+      for (const axis of [0, 1]) {
+        const b = pr.balls[m.k]!;
+        const keep = axis ? b.y : b.x;
+        if (axis) b.y += LAYOUT_STEP;
+        else b.x += LAYOUT_STEP;
+        const moved = focusAt(levenberg(pr, fit, sel, fitR.assign.elem, 6).fit);
+        if (axis) b.y = keep;
+        else b.x = keep;
+        const k = LAYOUT_SIGMA / LAYOUT_STEP;
+        s2 += base && moved ? k * k * ((moved.u - base.u) ** 2 + (moved.v - base.v) ** 2) : Infinity;
+      }
+    sigmaPx = Math.hypot(sigmaPx, Math.sqrt(s2));
+  }
   const nMatched = fe.matched.length;
   const cueMatched = fe.matched.some((m) => m.k === cueIdx);
   const targetMatched = targetIdx >= 0 && fe.matched.some((m) => m.k === targetIdx);
@@ -1926,6 +1675,7 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
   // balls by accident leaves the cushions unexplained.
   const explainedTerm = Math.max(0, Math.min(1, (fe.explainedFrac - 0.3) / 0.3));
   const inlierTerm = countTerm * fracFound * explainedTerm * Math.exp(-0.12 * fe.unexplained);
+  const residualLimit = Math.max(4, 0.006 * diag);
   const residualTerm = Math.exp(-((fe.residualPx / (0.004 * diag)) ** 2));
   const uncertaintyTerm = Number.isFinite(sigmaPx) ? Math.exp(-sigmaPx / (0.01 * diag)) : 0;
   let confidence = Math.max(0, Math.min(1, inlierTerm * residualTerm * uncertaintyTerm));
@@ -1933,14 +1683,42 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
   // Two balls suffice with a cushion edge, or when the player tapped them (R-25: the level-phone and
   // height priors close the 7th degree of freedom; confidence is capped below).
   const tappedBoth = manualTaps !== undefined && cueMatched && targetMatched;
-  const enoughBalls = nMatched >= 3 || (nMatched >= 2 && ((fe.edgeInliers >= 20 && fe.explainedFrac >= 0.55) || tappedBoth));
-  const ok = confidence >= 0.5 && fe.residualPx <= Math.max(4, 0.006 * diag) && enoughBalls && (cueMatched || targetMatched);
+  // A near-minimal fit (three balls, no cushion edge) has almost no redundancy: a wrong identity (an
+  // orange ball read as the yellow one) can fit as exactly as the right one. It counts only when every
+  // identity is clearly confirmed by colour and no ball is predicted on bare cloth (Principle II).
+  // Two balls and the cushions are enough only when the cushion lines cross (side and end) and the
+  // identities are sure, with nothing unexplained: a grazing view of parallel cushion lines let a wrong
+  // pose (camera 0.5 m off) explain 70 % of the cloth boundary in the envelope sweep.
+  const minimal = nMatched === 3 && fe.edgeInliers < 20;
+  const identitiesSure = fe.missing === 0 && fe.matched.every((m) => m.colour <= MINIMAL_COLOUR_COST);
+  const twoAndCushions = fe.edgeCrossed && fe.explainedFrac >= 0.55 && identitiesSure && fe.unexplained === 0;
+  const enoughBalls = (nMatched >= 3 && (!minimal || identitiesSure || tappedBoth)) || (nMatched >= 2 && (twoAndCushions || tappedBoth));
+  const ok = confidence >= 0.5 && fe.residualPx <= residualLimit && enoughBalls && (cueMatched || targetMatched);
+  // A fit that is not good enough to use never reports a usable confidence.
+  if (!ok) confidence = Math.min(confidence, 0.49);
   const matched = fe.matched.map((m) => ({ id: known[m.k]!.id, image: { x: m.u, y: m.v }, radiusPx: m.r }));
 
   let reason: string | undefined;
   if (!ok) {
-    if (nMatched < 2 && cands.length < 3) reason = PLAYER_VIEW_REASONS.tooFewBalls;
-    else if (fe.missing >= 2 || (fe.missing >= 1 && fe.unexplained >= 1)) reason = PLAYER_VIEW_REASONS.moved;
+    // "Moved" only from a pose the static scene supports (most of the cloth boundary explained, small
+    // residual): only then do balls predicted on bare cloth, or circles nothing explains, mean the
+    // layout changed. A pose that explains little is a failed fit, whatever it predicts.
+    // The fitted camera must also be where a player photo is taken from (spec 002 assumptions: within
+    // ≈ 1.5 m of the cue ball, 5–50 cm above the bed): from a few cm up, cushion lines are nearly
+    // parallel and a camera metres away can line them up as well.
+    const camDist = Math.hypot(fit.C.x - cueW.x, fit.C.y - cueW.y);
+    const plausible = camDist <= PLAUSIBLE_CAMERA_DIST && fit.C.z >= 0.02 && fit.C.z <= PLAUSIBLE_CAMERA_HEIGHT;
+    // And the pose must be pinned by balls that did not move: at least three. Two balls and the cushions
+    // pass only with nothing unexplained (twoAndCushions); from a few cm up, a pose 40 cm off lined two
+    // balls and crossing cushion lines up with stray circles left over (charcoal cloth, grey grid).
+    const pinned = nMatched >= 3;
+    const solid = plausible && pinned && (fe.explainedFrac >= SOLID_EXPLAINED || fe.edgeInliers >= SOLID_EDGES * pr.nPts) && fe.residualPx <= residualLimit;
+    // A cue ball found nowhere (not where the layout puts it, and no stray circle of its colour) is
+    // unseen, not moved: the player photographs the ball they are about to strike.
+    const cueAccounted = cueMatched || fe.strayCue;
+    // Fewer than three ball circles in the whole photo: it shows too few balls, whatever the fit did.
+    if (cands.length < 3 && nMatched < 3) reason = PLAYER_VIEW_REASONS.tooFewBalls;
+    else if (solid && cueAccounted && (fe.missing >= 2 || (fe.missing >= 1 && fe.unexplained >= 1))) reason = PLAYER_VIEW_REASONS.moved;
     else if (!cueMatched && !manualTaps) reason = PLAYER_VIEW_REASONS.noCue;
     else if (nMatched < 2) reason = PLAYER_VIEW_REASONS.tooFewBalls;
     else reason = PLAYER_VIEW_REASONS.noFit;
@@ -1959,12 +1737,8 @@ export function estimatePlayerView(input: PlayerViewInput): PlayerViewResult {
     if (dh > 2.0 || offLine) reason = PLAYER_VIEW_REASONS.notBehind;
   }
   return {
-    ok,
-    pose,
-    confidence,
-    residualPx: fe.residualPx,
-    matched,
-    ...(reason ? { reason } : {}),
-    ms: performance.now() - t0,
+    res: { ok, pose, confidence, residualPx: fe.residualPx, matched, ...(reason ? { reason } : {}), ms: performance.now() - t0 },
+    quality: fe.quality,
+    circles: nCircles,
   };
 }

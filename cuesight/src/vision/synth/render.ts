@@ -59,6 +59,12 @@ export interface SynthScene {
   noise?: number;
   /** Optional cue sticks (vision robustness fixtures). They occlude, but cast no shadow. */
   sticks?: SynthStick[];
+  /**
+   * Optional output (test ground truth; does not change the image): when given (length ≥ number of
+   * balls), receives each ball's visible image area in px — the share of primary-ray sub-samples that
+   * hit that ball first, so occlusion by nearer balls, sticks or rails and the frame edge are exact.
+   */
+  ballArea?: Float64Array;
 }
 
 export const BALL_COLORS: Record<string, RGB> = {
@@ -309,6 +315,9 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
   }
 
   const frame = createFrame(width, height);
+  const areaOut = scene.ballArea ?? null;
+  if (areaOut) areaOut.fill(0);
+  const areaStep = 1 / (ss * ss);
   const Rm = cam.R;
   const col: [number, number, number] = [0, 0, 0];
   const dArr = [0, 0, 0];
@@ -454,6 +463,7 @@ export function renderSyntheticTable(scene: SynthScene): Frame {
     const ly = ly0 / ll;
     const lz = lz0 / ll;
     if (hitKind === 1) {
+      if (areaOut) areaOut[ballIdx] = areaOut[ballIdx]! + areaStep;
       const b = scene.balls[ballIdx]!;
       const nx0 = px - ballX[ballIdx]!;
       const ny0 = py - ballY[ballIdx]!;
