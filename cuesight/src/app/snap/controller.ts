@@ -11,7 +11,8 @@
  *     and spin in words. When the fit fails, the reason is shown and two taps (cue ball, target ball)
  *     give the manual fallback.
  *
- * Photos are kept in memory only for this session and released on Start over / leaving Snap (FR-122).
+ * Photos are kept in memory only for this session and released on Start over / leaving Snap (FR-122);
+ * a photo still decoding or loading then is dropped when it arrives.
  */
 import { powerToSpeed, speedReference, speedWord } from '../../core/shot/power';
 import type { Ball, PocketId, Vec2 } from '../../core/types';
@@ -27,7 +28,7 @@ import { powerMeterSvg, powerText } from '../ui/power-meter';
 import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
-import { decodePhoto, frameOf, loadSample, photoFromVideo, type Photo } from './photo';
+import { decodePhoto, frameOf, loadSample, photoFromVideo, releasePhoto, type Photo } from './photo';
 import { SNAP_MESSAGES, fitCheck, snapStage, type SnapEvent, type SnapSession } from './session';
 
 export const SAMPLE_PHOTOS = { table: './samples/snap-table.png', player: './samples/snap-player.png' } as const;
@@ -198,6 +199,12 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   // Session-local data (pixels never enter the store).
   let overviewPhoto: Photo | null = null;
   let playerPhoto: Photo | null = null;
+  /**
+   * Photo intake generation (FR-122): every new photo and every Start over / leaving Snap starts a new
+   * one. A photo that finishes decoding (or loading) after its generation ended belongs to a session
+   * that is gone (or was replaced by a newer photo): it is released, never adopted.
+   */
+  let intake = 0;
   let rgbById = new Map<string, [number, number, number]>();
   /** The request in flight; a player-view fit remembers the target it is for and whether it came from taps. */
   let pending: { id: number; kind: 'still' | 'player-view'; targetId?: string | null; manual?: boolean } | null = null;
@@ -232,23 +239,28 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   }
 
   async function onFile(which: Which, f: Blob): Promise<void> {
+    const gen = ++intake;
     try {
-      const p = await decodePhoto(f, 'library');
-      if (which === 'table') setOverview(p);
-      else setPlayer(p);
+      adopt(gen, which, await decodePhoto(f, 'library'));
     } catch {
-      host.toast(SNAP_MESSAGES.decode);
+      if (gen === intake) host.toast(SNAP_MESSAGES.decode);
     }
   }
 
   async function useSample(which: Which): Promise<void> {
+    const gen = ++intake;
     try {
-      const p = await loadSample(which === 'table' ? SAMPLE_PHOTOS.table : SAMPLE_PHOTOS.player);
-      if (which === 'table') setOverview(p);
-      else setPlayer(p);
+      adopt(gen, which, await loadSample(which === 'table' ? SAMPLE_PHOTOS.table : SAMPLE_PHOTOS.player));
     } catch {
-      host.toast("The sample photos aren't available offline yet.");
+      if (gen === intake) host.toast("The sample photos aren't available offline yet.");
     }
+  }
+
+  /** Takes a decoded photo into the session it was started in, or drops it when that session ended. */
+  function adopt(gen: number, which: Which, p: Photo): void {
+    if (gen !== intake || S().mode !== 'snap') return releasePhoto(p);
+    if (which === 'table') setOverview(p);
+    else setPlayer(p);
   }
 
   async function openCamera(which: Which): Promise<void> {
@@ -289,8 +301,7 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
       const p = photoFromVideo(camVideo);
       if (!p) return;
       closeCamera();
-      if (camWhich === 'table') setOverview(p);
-      else setPlayer(p);
+      adopt(++intake, camWhich, p); // newer than any photo still decoding
     }
   });
   cam.addEventListener('keydown', (e) => {
@@ -331,8 +342,11 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   function setPlayer(p: Photo): void {
     const s = S();
     const cue = snap().layout?.find((b) => b.kind === 'cue');
-    if (!snap().layout || !cue) return host.toast(SNAP_MESSAGES.noCue);
-    if (!s.targetId || !s.plan) return host.toast('Pick the ball you want to pocket first.');
+    const why = !snap().layout || !cue ? SNAP_MESSAGES.noCue : !s.targetId || !s.plan ? 'Pick the ball you want to pocket first.' : null;
+    if (why) {
+      releasePhoto(p); // not taken: nothing keeps its pixels
+      return host.toast(why);
+    }
     playerPhoto = p;
     guide = null;
     inspect = false;
@@ -514,6 +528,8 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
   });
 
   function startOver(): void {
+    intake++; // a photo still decoding now belongs to an ended session
+    for (const p of [overviewPhoto, playerPhoto]) if (p) releasePhoto(p);
     overviewPhoto = null;
     playerPhoto = null;
     guide = null;

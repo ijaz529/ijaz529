@@ -119,6 +119,50 @@ describe('render3d gestures (pure state machine)', () => {
     expect(r.g.steering()).toBe(false);
   });
 
+  it('a pointercancel during a ball drag ends the drag (end, no tap), and the next press starts afresh', () => {
+    const r = rig({ pick: ballAt(100, 100) });
+    r.g.down({ id: 1, x: 100, y: 100 });
+    r.g.move({ id: 1, x: 112, y: 100 });
+    // The system takes the pointer (a notification, a scroll, the home gesture): back at the start point
+    // it would look like a tap, but a cancel is never one.
+    r.g.up({ id: 1, x: 100, y: 100, cancel: true });
+    expect(r.calls).toEqual([
+      ['ball', 'start', 'b1', 112, 100],
+      ['ball', 'move', 'b1', 112, 100],
+      ['release', 1],
+      ['endBall'],
+    ]);
+    expect(r.g.mode()).toBe('none');
+    expect(r.g.steering()).toBe(false);
+    // Nothing is left over: a later move of that pointer does nothing, a new press is a plain tap.
+    r.calls.length = 0;
+    r.g.move({ id: 1, x: 140, y: 100 });
+    expect(r.calls).toEqual([]);
+    r.g.down({ id: 2, x: 100, y: 100 });
+    r.g.up({ id: 2, x: 100, y: 100, ev: 'pointerup#2' });
+    expect(r.calls).toEqual([
+      ['release', 2],
+      ['tap', { kind: 'ball', id: 'b1' }, 'pointerup#2'],
+    ]);
+  });
+
+  it('a pointercancel ends an orbit or a pinch without a tap', () => {
+    const orbit = rig();
+    orbit.g.down({ id: 1, x: 50, y: 50 });
+    orbit.g.move({ id: 1, x: 70, y: 50 });
+    orbit.g.up({ id: 1, x: 50, y: 50, cancel: true });
+    expect(orbit.names()).toEqual(['custom', 'orbit', 'release']);
+    expect(orbit.g.mode()).toBe('none');
+    const pinch = rig();
+    pinch.g.down({ id: 1, x: 0, y: 0 });
+    pinch.g.down({ id: 2, x: 100, y: 0 });
+    pinch.g.up({ id: 1, x: 0, y: 0, cancel: true });
+    pinch.g.up({ id: 2, x: 100, y: 0, cancel: true });
+    expect(pinch.names()).toEqual(['endBall', 'custom', 'release', 'release']);
+    expect(pinch.g.mode()).toBe('none');
+    expect(pinch.g.steering()).toBe(false);
+  });
+
   it('without ball dragging (no listener) a drag on a ball orbits instead', () => {
     const r = rig({ pick: ballAt(100, 100), drag: false });
     r.g.down({ id: 1, x: 100, y: 100 });

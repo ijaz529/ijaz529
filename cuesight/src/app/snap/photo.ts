@@ -139,6 +139,15 @@ export async function loadSample(url: string): Promise<Photo> {
   return decodePhoto(await res.blob(), 'sample');
 }
 
+/**
+ * Frees a photo's pixels at once (FR-122): a zero-size canvas drops its backing store, so a photo that is
+ * discarded does not wait for garbage collection. The photo must not be drawn or framed afterwards.
+ */
+export function releasePhoto(p: Photo): void {
+  p.canvas.width = 0;
+  p.canvas.height = 0;
+}
+
 /** A fresh frame (copy of the pixels) for the vision worker; its buffer can be transferred. */
 export function frameOf(p: Photo): Frame {
   const img = p.canvas.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, p.width, p.height);

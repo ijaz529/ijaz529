@@ -96,6 +96,57 @@ async function spyVision(page: Page) {
 }
 const posted = (page: Page) => page.evaluate(() => (window as unknown as { __posted: { type: string; opts?: { swapAxes?: boolean; manualCorners?: unknown }; targetId?: string; manual?: boolean }[] }).__posted);
 
+/**
+ * Counts the recommendation requests sent to the planner worker and their replies (test instrumentation
+ * only): a request is sent 180 ms after a tap (debounced), and a reply to the request before can land
+ * inside that window and read as the new recommendation for a moment.
+ */
+async function trackPlanner(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __planner: { open: Set<number>; last: number } };
+    w.__planner = { open: new Set(), last: 0 };
+    const seen = new WeakSet<Worker>();
+    const orig = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
+      const msg = m as { type?: string; id?: number };
+      if (msg?.type === 'recommend' && typeof msg.id === 'number') {
+        if (!seen.has(this)) {
+          seen.add(this);
+          this.addEventListener('message', (e: MessageEvent) => {
+            const d = e.data as { type?: string; id?: number };
+            if (d?.type === 'recommendation' || d?.type === 'error') {
+              w.__planner.open.delete(d.id!);
+              w.__planner.last = performance.now();
+            }
+          });
+        }
+        w.__planner.open.add(msg.id);
+        w.__planner.last = performance.now();
+      }
+      return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
+    } as typeof orig;
+  });
+}
+/**
+ * Waits for the recommended stroke of the current target and pocket to be in the plan, with the planner
+ * quiet for 0.5 s: until then the plan carries the provisional stroke (e.g. 4.5/10), which the
+ * recommendation (2–4 s under load) then replaces, and the HUD with it.
+ */
+const recommendedPlan = (page: Page, pocket: string) =>
+  page.waitForFunction(
+    (pk) => {
+      const w = window as unknown as {
+        __planner?: { open: Set<number>; last: number };
+        __cuesight: { state: { recommended: { pending: boolean } | null; plan: { pocketId: string; strokeSource: string } | null } };
+      };
+      const s = w.__cuesight.state;
+      const quiet = !w.__planner || (w.__planner.open.size === 0 && performance.now() - w.__planner.last > 500);
+      return quiet && !!s.recommended && !s.recommended.pending && s.plan?.pocketId === pk && s.plan.strokeSource === 'recommended';
+    },
+    pocket,
+    { timeout: 30_000 },
+  );
+
 async function tablePhoto(page: Page) {
   await page.goto('/?mode=snap');
   await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
@@ -108,6 +159,7 @@ async function tablePhoto(page: Page) {
 
 test.describe('Snap two-photo guide (feature 002 US2)', () => {
   test('table photo → layout → target → player photo → guide', async ({ page }) => {
+    await trackPlanner(page);
     await tablePhoto(page);
     const s = await H(page);
     // The right number of balls, one cue ball, each where the ray-traced ground truth put it.
@@ -131,7 +183,9 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await stepIs(page, ['guide', 'manual-taps']);
     expect((await H(page)).step).toBe('guide');
     await expect(page.locator('#snap-fit')).toContainText('Fit: good');
-    // How hard: n/10 plus a speed word; where to strike: tip offset in coaching words.
+    // How hard: n/10 plus a speed word; where to strike: tip offset in coaching words. Read from the
+    // final plan (the recommended stroke), not the provisional one shown while it is worked out.
+    await recommendedPlan(page, 'TR');
     const plan = await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.plan!);
     const pw = plan.stroke.power;
     await expect(page.locator('#hud-power')).toHaveText(`${pw.toFixed(pw % 1 ? 1 : 0)}/10`);
@@ -246,6 +300,76 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await expect(page.locator('#snap-fit')).toContainText('Fit:');
     await expect(page.locator('#hud-strike')).toContainText('Strike');
     await expect(page.locator('#snap-hud')).toContainText('/10');
+  });
+});
+
+/**
+ * Decoding a 12–48 MP phone photo takes a while on a phone: slows every decode down by `ms` and counts
+ * the decodes that have finished (`__decodes`).
+ */
+async function slowDecode(page: Page, ms: number) {
+  await page.addInitScript((delay: number) => {
+    const w = window as unknown as { __decodes: number; createImageBitmap: (...a: unknown[]) => Promise<ImageBitmap> };
+    w.__decodes = 0;
+    const orig = window.createImageBitmap.bind(window) as (...a: unknown[]) => Promise<ImageBitmap>;
+    w.createImageBitmap = async (...a: unknown[]) => {
+      try {
+        const bmp = await orig(...a);
+        await new Promise((r) => setTimeout(r, delay));
+        return bmp;
+      } finally {
+        w.__decodes++;
+      }
+    };
+  }, ms);
+}
+/** Waits until `n` decodes have finished, and a little longer for what follows them to run. */
+async function decoded(page: Page, n: number) {
+  await page.waitForFunction((k) => (window as unknown as { __decodes: number }).__decodes >= k, n, { timeout: 30_000 });
+  await page.waitForTimeout(600);
+}
+const targetOf = (page: Page) => page.evaluate(() => (window as unknown as { __cuesight: { state: { targetId: string | null } } }).__cuesight.state.targetId);
+
+/**
+ * FR-122 with a photo still decoding (or the sample still loading) when the player leaves Snap or taps
+ * Start over: the photo that arrives afterwards belongs to a session that is gone. It must be dropped,
+ * not kept in memory (to come back on the next visit), and must not touch the Practice selection.
+ */
+test.describe('Snap photos that arrive after the session ended (FR-122)', () => {
+  for (const how of ['a chosen photo', 'the sample photo'] as const) {
+    test(`leaving Snap while ${how} is still decoding drops it`, async ({ page }) => {
+      await slowDecode(page, 1500);
+      await page.goto('/?mode=snap');
+      await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+      if (how === 'a chosen photo') await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+      else await page.getByRole('button', { name: 'Try it with sample photos' }).click();
+      await page.locator('.mode-switch [data-mode="practice"]').click();
+      await page.evaluate(() => (window as unknown as { __cuesight: { selectBall(id: string): void } }).__cuesight.selectBall('b1'));
+      expect(await targetOf(page)).toBe('b1');
+      await decoded(page, 1);
+      expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+      expect((await H(page)).step).toBe('intro');
+      // The Practice selection is the player's own: the late photo does not reset it.
+      expect(await targetOf(page)).toBe('b1');
+      expect(await retained(page)).toEqual({ photo: false, thumb: false });
+      // Back in Snap: a fresh start, nothing from before.
+      await page.locator('.mode-switch [data-mode="snap"]').click();
+      await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+      expect((await H(page)).step).toBe('intro');
+      expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+    });
+  }
+
+  test('Start over while another table photo is still decoding drops it', async ({ page }) => {
+    await slowDecode(page, 1500);
+    await tablePhoto(page);
+    await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+    await page.getByRole('button', { name: 'Start over' }).click();
+    await expect.poll(async () => (await H(page)).step).toBe('intro');
+    await decoded(page, 2);
+    expect((await H(page)).step).toBe('intro');
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+    expect(await retained(page)).toEqual({ photo: false, thumb: false });
   });
 });
 
