@@ -32,6 +32,58 @@ const settled = async (page: Page) => {
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
 };
 
+/**
+ * Counts the recommendation requests the page sends to the planner worker and their replies (test
+ * instrumentation only). Needed because a request is sent 180 ms after a tap (debounced), and a reply
+ * to the request before can land inside that window and read as the new recommendation.
+ */
+async function trackPlanner(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __planner: { open: Set<number>; last: number } };
+    w.__planner = { open: new Set(), last: 0 };
+    const seen = new WeakSet<Worker>();
+    const orig = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
+      const msg = m as { type?: string; id?: number };
+      if (msg?.type === 'recommend' && typeof msg.id === 'number') {
+        if (!seen.has(this)) {
+          seen.add(this);
+          this.addEventListener('message', (e: MessageEvent) => {
+            const d = e.data as { type?: string; id?: number };
+            if (d?.type === 'recommendation' || d?.type === 'error') {
+              w.__planner.open.delete(d.id!);
+              w.__planner.last = performance.now();
+            }
+          });
+        }
+        w.__planner.open.add(msg.id);
+        w.__planner.last = performance.now();
+      }
+      return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
+    } as typeof orig;
+  });
+}
+
+/**
+ * Waits for the recommended stroke of the current target and pocket to be in the plan, with no
+ * recommendation request in flight or about to be sent (the planner has been quiet for 0.5 s): the
+ * card's badge, and even the state, can show an earlier recommendation for a moment.
+ */
+const recommendedPlan = (page: Page, pocket = 'TR') =>
+  page.waitForFunction(
+    (pk) => {
+      const w = window as unknown as {
+        __planner?: { open: Set<number>; last: number };
+        __cuesight: { state: { recommended: { pending: boolean } | null; plan: { pocketId: string; strokeSource: string } | null } };
+      };
+      const s = w.__cuesight.state;
+      const quiet = !w.__planner || (w.__planner.open.size === 0 && performance.now() - w.__planner.last > 500);
+      return quiet && !!s.recommended && !s.recommended.pending && s.plan?.pocketId === pk && s.plan.strokeSource === 'recommended';
+    },
+    pocket,
+    { timeout: 30_000 },
+  );
+
 /** Taps ball b1 then the top-right pocket: the 30° cut of the default practice layout. */
 async function planB1(page: Page) {
   const ball = await screenOf(page, { ball: 'b1' });
@@ -53,6 +105,7 @@ async function planB1(page: Page) {
 
 test.describe('3D practice table (feature 002 US1)', () => {
   test.beforeEach(async ({ page }) => {
+    await trackPlanner(page);
     await page.goto('/?mode=practice');
     await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
     test.skip(!(await hook(page)), 'WebGL2 unavailable: the 2D fallback is covered by fallback2d.spec.ts');
@@ -106,6 +159,9 @@ test.describe('3D practice table (feature 002 US1)', () => {
 
   test('Play shot replays the simulated shot to the end and leaves the layout untouched', async ({ page }) => {
     await planB1(page);
+    // Replay the final plan: the recommended stroke landing during a replay is a new plan, which stops
+    // the replay first (spec edge case, tested below), so wait for it.
+    await recommendedPlan(page);
     const before = await balls(page);
     const box = await tableBox(page);
     const still = await regionStats(page, box);
@@ -145,6 +201,64 @@ test.describe('3D practice table (feature 002 US1)', () => {
     }
     expect(await balls(page)).toEqual(before);
     await expect(page.getByTestId('shot-card')).toBeVisible();
+  });
+
+  // The two tests below start the replay and act on it inside one page script, a frame apart: the
+  // software renderer (SwiftShader) can take seconds per frame under load, so polling from the test
+  // could miss a replay or outlive it. One frame after it starts, a replay is always still running (its
+  // end hold is only reached on a later frame). The recommended stroke has landed first: a new plan
+  // arriving would itself stop the replay (that is the second test); should a late state change still
+  // stop the first start, the replay is started again (at most three times) before acting on it.
+  test('a tap on the table during the replay skips straight to the planned layout (no second hold)', async ({ page }) => {
+    await planB1(page);
+    await recommendedPlan(page);
+    const before = await balls(page);
+    const r = await page.evaluate(async () => {
+      const h = (window as unknown as { __cuesight: Hook & { playShot(): Promise<void> } }).__cuesight;
+      let was = false;
+      for (let i = 0; i < 3 && !was; i++) {
+        void h.playShot();
+        await new Promise((ok) => requestAnimationFrame(ok));
+        was = h.view3d!.isPlaying();
+      }
+      // One tap on empty cloth, dispatched synchronously: the replay is over when the tap returns.
+      const c = document.querySelector<HTMLCanvasElement>('#table3d')!;
+      const box = c.getBoundingClientRect();
+      const at = { clientX: box.left + box.width / 2, clientY: box.top + 12, bubbles: true, pointerId: 41, isPrimary: true, button: 0, pointerType: 'touch' };
+      c.dispatchEvent(new PointerEvent('pointerdown', at));
+      c.dispatchEvent(new PointerEvent('pointerup', at));
+      return { was, after: h.view3d!.isPlaying() };
+    });
+    expect(r).toEqual({ was: true, after: false });
+    // The Skip button turns back into Play on the next rendered frame (slow on the software renderer).
+    await expect(page.getByRole('button', { name: 'Play shot' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId('cut')).toHaveText('30.0°');
+    expect(await balls(page)).toEqual(before);
+  });
+
+  test('a plan change during the replay stops it first and shows the new plan (spec edge case)', async ({ page }) => {
+    await planB1(page);
+    await recommendedPlan(page);
+    const before = await balls(page);
+    // Another pocket for the same ball (the planner hands back a new plan): the old trajectories must
+    // not keep replaying under the new plan's lines. The new plan reaches the 3D view on the next frame
+    // (the store renders once per frame), so two frames later the replay is over.
+    const r = await page.evaluate(async () => {
+      const h = (window as unknown as { __cuesight: Hook & { playShot(): Promise<void>; selectPocket(id: string): void } }).__cuesight;
+      let was = false;
+      for (let i = 0; i < 3 && !was; i++) {
+        void h.playShot();
+        await new Promise((ok) => requestAnimationFrame(ok));
+        was = h.view3d!.isPlaying();
+      }
+      h.selectPocket('BR');
+      for (let i = 0; i < 2; i++) await new Promise((ok) => requestAnimationFrame(ok));
+      return { was, after: h.view3d!.isPlaying() };
+    });
+    expect(r).toEqual({ was: true, after: false });
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.plan?.pocketId), { timeout: 15_000 }).toBe('BR');
+    await expect(page.getByRole('button', { name: 'Play shot' })).toBeVisible({ timeout: 15_000 });
+    expect(await balls(page)).toEqual(before);
   });
 
   test('idle: no animation frames and no GL draws without interaction (FR-109, SC-101)', async ({ page }) => {

@@ -48,6 +48,72 @@ describe('shooter-frame pocket names', () => {
       expect(new Set(list).size, `${JSON.stringify(from)} ${a.toFixed(2)}: ${list.join(', ')}`).toBe(6);
     }
   });
+  it('never names a pocket on the wrong side, never calls a corner behind the player "far" (any table, any position and facing)', () => {
+    // Wave-2 review: the collision fallback re-ranked all four corners by depth and screen x, so two
+    // corners on the player's left could come out "near left" and "near right", and a corner behind
+    // the player "far left corner".
+    for (const preset of ['pool9', 'pool8', 'pool7', 'snooker12'] as const) {
+      const t = makeTable(preset);
+      let seed = 7;
+      const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+      for (let k = 0; k < 4000; k++) {
+        const from = { x: (rnd() * 2 - 1) * (t.length / 2 - 0.03), y: (rnd() * 2 - 1) * (t.width / 2 - 0.03) };
+        const a = rnd() * Math.PI * 2;
+        const f = { x: Math.cos(a), y: Math.sin(a) };
+        const n = shooterPocketNames(t.pockets, from, f);
+        const list = t.pockets.map((p) => n[p.id as PocketId]!);
+        const at = `${preset} ${JSON.stringify(from)} ${a.toFixed(3)}: ${list.join(', ')}`;
+        expect(new Set(list).size, at).toBe(6);
+        for (const p of t.pockets) {
+          const dx = p.mouthCenter.x - from.x;
+          const dy = p.mouthCenter.y - from.y;
+          const ahead = dx * f.x + dy * f.y;
+          const right = dx * f.y - dy * f.x;
+          const bearing = Math.abs((Math.atan2(right, ahead) * 180) / Math.PI);
+          const name = n[p.id as PocketId]!;
+          if (/\bright\b/.test(name)) expect(right, `${p.id} "${name}" is on the left · ${at}`).toBeGreaterThanOrEqual(0);
+          if (/\bleft\b/.test(name)) expect(right, `${p.id} "${name}" is on the right · ${at}`).toBeLessThan(0);
+          if (/^far .* corner$/.test(name)) expect(bearing, `${p.id} "${name}" is behind · ${at}`).toBeLessThan(90);
+          if (/ahead/.test(name)) expect(bearing, `${p.id} "${name}" · ${at}`).toBeLessThanOrEqual(10);
+          if (/behind/.test(name)) expect(bearing, `${p.id} "${name}" · ${at}`).toBeGreaterThanOrEqual(170);
+        }
+      }
+    }
+  });
+  it('from a camera outside the table (Snap: the player photo is taken from behind the rail), facing the table', () => {
+    let seed = 3;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    for (let k = 0; k < 4000; k++) {
+      // Up to 0.8 m beyond the cushions, looking at a point on the bed (the balls in the photo).
+      const ang = rnd() * Math.PI * 2;
+      const from = { x: Math.cos(ang) * (table.length / 2 + 0.05 + rnd() * 0.8), y: Math.sin(ang) * (table.width / 2 + 0.05 + rnd() * 0.8) };
+      const look = { x: (rnd() * 2 - 1) * (table.length / 2 - 0.05), y: (rnd() * 2 - 1) * (table.width / 2 - 0.05) };
+      const a = Math.atan2(look.y - from.y, look.x - from.x);
+      const f = { x: Math.cos(a), y: Math.sin(a) };
+      const n = shooterPocketNames(table.pockets, from, f);
+      const list = table.pockets.map((p) => n[p.id as PocketId]!);
+      const at = `${JSON.stringify(from)} ${a.toFixed(3)}: ${list.join(', ')}`;
+      expect(new Set(list).size, at).toBe(6);
+      for (const p of table.pockets) {
+        const right = (p.mouthCenter.x - from.x) * f.y - (p.mouthCenter.y - from.y) * f.x;
+        const name = n[p.id as PocketId]!;
+        if (/\bright\b/.test(name)) expect(right, `${p.id} "${name}" · ${at}`).toBeGreaterThanOrEqual(0);
+        if (/\bleft\b/.test(name)) expect(right, `${p.id} "${name}" · ${at}`).toBeLessThan(0);
+      }
+    }
+  });
+  it('stays unique when the position or facing is not a number (a degenerate pose)', () => {
+    for (const [from, facing] of [
+      [{ x: NaN, y: 0 }, { x: 1, y: 0 }],
+      [{ x: 0, y: 0 }, { x: NaN, y: NaN }],
+      [{ x: Infinity, y: 0 }, { x: 0, y: 1 }],
+    ] as const) {
+      const n = shooterPocketNames(table.pockets, from, facing);
+      const list = table.pockets.map((p) => n[p.id as PocketId]);
+      expect(list.every(Boolean)).toBe(true);
+      expect(new Set(list).size, list.join(', ')).toBe(6);
+    }
+  });
   it('looking down the length between two corners, they split left and right instead of both "ahead"', () => {
     const n = shooterPocketNames(table.pockets, { x: table.length / 2 - 0.05, y: 0 }, { x: -1, y: 0 });
     expect(n.TL).not.toBe(n.BL);

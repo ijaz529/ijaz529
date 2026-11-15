@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { makeTable } from '../../../src/core/table';
 import { broadcastOrbit, cameraMatrices, overviewOrbit, pixelAtUnit, playerOrbit } from '../../../src/app/render3d/camera';
 import { tableGeom } from '../../../src/app/render3d/geom';
-import { project, screenRay, type V3 } from '../../../src/app/render3d/math3d';
+import { project, raySphere, screenRay, type V3 } from '../../../src/app/render3d/math3d';
+import { DRILLS } from '../../../src/app/drills';
 import { pickRay, type PickBall, type PickPocket } from '../../../src/app/render3d/picking';
 
 const table = makeTable('pool9');
@@ -55,6 +56,61 @@ describe('render3d picking', () => {
     // The ray aimed at the far ball's centre passes through the near ball first.
     expect(pickRay({ ray, balls: [behind, front], pockets, bedHalf: { x: g.hx, y: g.hy }, pxAtUnit: px })).toEqual({ kind: 'ball', id: 'front' });
     expect(pickRay({ ray, balls: [front, behind], pockets, bedHalf: { x: g.hx, y: g.hy }, pxAtUnit: px })).toEqual({ kind: 'ball', id: 'front' });
+  });
+
+  it('SC-102: every visible ball projected to the screen picks back to itself, in all three presets, portrait and landscape', () => {
+    // The same inputs Table3D.pick builds: balls at z = R, pixel scale of the canvas height.
+    for (const [w, h] of [
+      [393, 700],
+      [852, 393],
+      [1024, 1366],
+    ] as const) {
+      for (const d of DRILLS) {
+        const layout = d.build(table);
+        const cue = layout.find((b) => b.kind === 'cue')!;
+        const tgt = layout.find((b) => b.kind !== 'cue')!;
+        const aim = { x: tgt.pos.x - cue.pos.x, y: tgt.pos.y - cue.pos.y };
+        const presets = {
+          overview: overviewOrbit(g, w / h),
+          broadcast: broadcastOrbit(g, w / h),
+          player: playerOrbit(g, cue.pos, aim, tgt.pos, w / h),
+        };
+        const picks = layout.map((b) => ball(b.id, b.pos.x, b.pos.y));
+        for (const [name, o] of Object.entries(presets)) {
+          const m = cameraMatrices(o, w / h);
+          const px = pixelAtUnit(o.fovY, h);
+          for (const b of picks) {
+            const q = project(m.vp, [b.x, b.y, R], w, h);
+            if (!q || q.x < 0 || q.y < 0 || q.x > w || q.y > h) continue;
+            const ray = screenRay(m.invVP, q.x, q.y, w, h);
+            // Hidden behind a nearer ball (its centre is covered): that ball is the honest pick.
+            const tSelf = raySphere(ray, [b.x, b.y, R], R) ?? Infinity;
+            const covered = picks.some((o2) => o2 !== b && (raySphere(ray, [o2.x, o2.y, R], R) ?? Infinity) < tSelf);
+            if (covered) continue;
+            expect(pickRay({ ray, balls: picks, pockets, bedHalf: { x: g.hx, y: g.hy }, pxAtUnit: px }), `${d.id} ${name} ${w}×${h} ${b.id}`).toEqual({ kind: 'ball', id: b.id });
+          }
+        }
+      }
+    }
+  });
+
+  it('a ball is picked within 22 CSS px of its centre however small it is on screen (contract § pick; 44 px targets)', () => {
+    // Snooker in the overview on a phone: a ball is under 10 px across. A tap 21 px from its centre
+    // still selects it; one 30 px away is a tap on the cloth.
+    const sn = makeTable('snooker12');
+    const gs = tableGeom(sn);
+    const Rs = sn.ballRadius;
+    const o = overviewOrbit(gs, 393 / 700);
+    const m = cameraMatrices(o, 393 / 700);
+    const px = pixelAtUnit(o.fovY, 700);
+    const b: PickBall = { id: 'red', x: 0.3, y: 0.1, z: Rs, r: Rs };
+    const q = project(m.vp, [b.x, b.y, Rs], 393, 700)!;
+    const edge = project(m.vp, [b.x + Rs, b.y, Rs], 393, 700)!;
+    expect(Math.hypot(edge.x - q.x, edge.y - q.y), 'ball radius on screen (px)').toBeLessThan(5.5);
+    const at = (dx: number) => pickRay({ ray: screenRay(m.invVP, q.x + dx, q.y, 393, 700), balls: [b], pockets: [], bedHalf: { x: gs.hx, y: gs.hy }, pxAtUnit: px });
+    expect(at(21)).toEqual({ kind: 'ball', id: 'red' });
+    expect(at(-21)).toEqual({ kind: 'ball', id: 'red' });
+    expect(at(30)?.kind).toBe('cloth');
   });
 
   it('screen rays from an oblique camera land on the right cloth point', () => {

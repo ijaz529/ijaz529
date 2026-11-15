@@ -1,6 +1,6 @@
 /**
  * Ray picking (pure). Priority: a ball the ray actually hits (nearest first) → a ball within the
- * touch slop (closest to the ray) → a pocket → the cloth → nothing.
+ * touch slop (closest to the ray; at least 22 CSS px from its centre) → a pocket → the cloth → nothing.
  */
 import type { PocketId, Vec2 } from '../../core/types';
 import { rayAt, rayPlaneZ, rayPointDistance, raySphere, type Ray } from './math3d';
@@ -38,6 +38,8 @@ export interface PickInput {
   pocketSlopPx?: number;
   /** Ball pick radius multiplier (default 1.8 × R, like the 2D table view). */
   ballSlop?: number;
+  /** Minimum ball pick radius in CSS px (default 22: a 44 px touch target however small the ball is drawn). */
+  ballMinPx?: number;
 }
 
 export function pickRay(inp: PickInput): Pick3D {
@@ -53,13 +55,15 @@ export function pickRay(inp: PickInput): Pick3D {
     }
   }
   if (best) return { kind: 'ball', id: best.id };
-  // 2. Touch slop: closest approach within k·R + slop px (measured at the ball's distance).
+  // 2. Touch slop: closest approach within k·R + slop px, and never less than ballMinPx (measured at
+  // the ball's distance); the nearest ball wins where two slops overlap.
   const slopPx = inp.ballSlopPx ?? 12;
+  const minPx = inp.ballMinPx ?? 22;
   const k = inp.ballSlop ?? 1.8;
   let bestD = Infinity;
   for (const b of inp.balls) {
     const { t, d } = rayPointDistance(ray, [b.x, b.y, b.z]);
-    const lim = b.r * k + slopPx * inp.pxAtUnit * t;
+    const lim = Math.max(b.r * k + slopPx * inp.pxAtUnit * t, minPx * inp.pxAtUnit * t);
     if (d < lim && d < bestD) {
       bestD = d;
       best = b;

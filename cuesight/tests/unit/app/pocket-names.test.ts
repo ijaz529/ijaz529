@@ -74,6 +74,33 @@ describe('perspective pocket names', () => {
     expect(table.pockets.filter((p) => p.kind === 'side').map((p) => n[p.id]).sort()).toEqual(['left side', 'right side']);
   });
 
+  it('from a low corner view with the nearest corner below the photo: still unique, and that corner is "near"', () => {
+    // Camera 0.35 m beyond the BL corner, 0.45 m up, looking along the diagonal toward TR: the BL corner
+    // is under the camera (below the bottom edge of a 960×720 photo), the others are in view.
+    const bl = mouth('BL');
+    const tr = mouth('TR');
+    const d = { x: tr.x - bl.x, y: tr.y - bl.y };
+    const L = Math.hypot(d.x, d.y);
+    const fw = { x: d.x / L, y: d.y / L, z: -0.3 };
+    const fl = Math.hypot(fw.x, fw.y, fw.z);
+    const fwd = { x: fw.x / fl, y: fw.y / fl, z: fw.z / fl };
+    const right = { x: fwd.y, y: -fwd.x, z: 0 };
+    const rl = Math.hypot(right.x, right.y);
+    const rx = { x: right.x / rl, y: right.y / rl, z: 0 };
+    // down = fwd × right
+    const down = { x: fwd.y * rx.z - fwd.z * rx.y, y: fwd.z * rx.x - fwd.x * rx.z, z: fwd.x * rx.y - fwd.y * rx.x };
+    const C = { x: bl.x - (d.x / L) * 0.35, y: bl.y - (d.y / L) * 0.35, z: 0.45 };
+    const R = [rx.x, rx.y, rx.z, down.x, down.y, down.z, fwd.x, fwd.y, fwd.z];
+    const t = { x: -(R[0]! * C.x + R[1]! * C.y + R[2]! * C.z), y: -(R[3]! * C.x + R[4]! * C.y + R[5]! * C.z), z: -(R[6]! * C.x + R[7]! * C.y + R[8]! * C.z) };
+    const pose: Pose = { R, t, f: 700, cx: 480, cy: 360 };
+    const at = (id: PocketId) => project(pose, mouth(id));
+    expect(at('BL').y, 'the near corner is below the photo').toBeGreaterThan(720);
+    const n = namesFor(at);
+    expect(new Set(table.pockets.map((p) => n[p.id])).size).toBe(6);
+    expect(n.BL).toMatch(/^near /);
+    expect(n.TR).toMatch(/^far /);
+  });
+
   it('reads naturally from the side (long axis across the view): sides are far and near', () => {
     const screen = (id: PocketId) => {
       const m = mouth(id);

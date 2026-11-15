@@ -41,7 +41,11 @@ export interface SnapSession {
   /** Manual cloth corners in table-photo px (for a re-run), and taps in progress. */
   corners: Vec2[] | null;
   cornerTaps: Vec2[];
-  player: (PhotoInfo & { result: PlayerViewResult | null }) | null;
+  /**
+   * The player photo and its fit. `fitTargetId` is the target ball the fit (and so its confidence) was
+   * computed for; `manual` marks a fit from the two taps; `refitting` a quiet re-fit for a new target.
+   */
+  player: (PhotoInfo & { result: PlayerViewResult | null; fitTargetId?: string | null; manual?: boolean; refitting?: boolean }) | null;
   /** Manual-fallback taps on the player photo (image px). */
   taps: { cue?: Vec2; target?: Vec2 };
   error: string | null;
@@ -57,7 +61,9 @@ export type SnapEvent =
   | { type: 'cancel-corners' }
   | { type: 'layout'; balls: Ball[] }
   | { type: 'player-photo'; photo: PhotoInfo }
-  | { type: 'player-result'; result: PlayerViewResult }
+  | { type: 'player-result'; result: PlayerViewResult; targetId?: string | null; manual?: boolean }
+  /** The target changed after an automatic fit: the same photo is fitted again, the guide stays up. */
+  | { type: 'refit' }
   | { type: 'player-failed'; message: string }
   | { type: 'manual-tap'; p: Vec2 }
   | { type: 'start-manual' }
@@ -111,9 +117,11 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
       return s.layout ? { ...s, step: 'player-processing', player: { ...e.photo, result: null }, taps: {}, error: null } : s;
     case 'player-result': {
       if (!s.player) return s;
-      const player = { ...s.player, result: e.result };
+      const player = { ...s.player, result: e.result, fitTargetId: e.targetId ?? null, manual: !!e.manual, refitting: false };
       return { ...s, player, step: e.result.ok ? 'guide' : 'manual-taps', taps: {}, error: e.result.ok ? null : (e.result.reason ?? null) };
     }
+    case 'refit':
+      return s.player?.result ? { ...s, player: { ...s.player, refitting: true } } : s;
     case 'player-failed':
       return s.player ? { ...s, step: 'manual-taps', taps: {}, error: e.message } : s;
     case 'start-manual':
@@ -128,6 +136,22 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
     case 'back-to-guide':
       return s.player?.result?.ok ? { ...s, step: 'guide' } : s.player ? { ...s, step: 'manual-taps', taps: {} } : s;
   }
+}
+
+/**
+ * Whether the guide's fit (and its confidence chip) is about the target being shown:
+ * - `current`: yes; `checking`: a re-fit for it is running; `none`: no fit to show (not in the guide,
+ *   or no target picked);
+ * - `refit`: an automatic fit made for another target, so fit the same photo again;
+ * - `taps`: a fit from two taps that named another target ball, so the player taps again.
+ * The pocket and the stroke never matter: the confidence is about the target ball's position.
+ */
+export function fitCheck(s: SnapSession, targetId: string | null): 'current' | 'checking' | 'refit' | 'taps' | 'none' {
+  const p = s.player;
+  if (s.step !== 'guide' || !p?.result?.ok || !targetId) return 'none';
+  if (p.refitting) return 'checking';
+  if (p.fitTargetId === targetId) return 'current';
+  return p.manual ? 'taps' : 'refit';
 }
 
 /** The step the progress indicator highlights: 1 (table) or 2 (your view). */

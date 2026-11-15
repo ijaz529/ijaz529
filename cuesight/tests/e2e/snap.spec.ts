@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
 import { regionStats, visibleBox } from './pixels';
+import { jpegWithOrientation } from '../../src/app/snap/exif';
 
 /** Feature 002 US2: Snap, the two-photo guide, on the committed synthetic photos. */
 const dir = fileURLToPath(new URL('../fixtures/', import.meta.url));
@@ -15,7 +16,7 @@ type Hook = {
   state: { snap: Snap; plan: { targetId: string; pocketId: string; stroke: { power: number; vert: number } } | null; table: { pockets: { id: string; mouthCenter: V2 }[] } };
   practiceToScreen(p: V2): V2;
   view3d: { isAnimating?(): boolean } | null;
-  snap: { photoToScreen(p: V2): V2; photos(): { player: { width: number } | null }; guide(): { strike: { visible: boolean } | null; face: { c: V2; dot: V2; r: number } | null } | null };
+  snap: { photoToScreen(p: V2): V2; photos(): { overview: { width: number; height: number } | null; player: { width: number } | null }; guide(): { strike: { visible: boolean } | null; face: { c: V2; dot: V2; r: number } | null } | null };
 };
 const H = (page: Page) => page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.snap);
 const stepIs = (page: Page, steps: string[]) =>
@@ -67,6 +68,85 @@ async function pick(page: Page, pos: V2, pocket: string) {
   await page.waitForFunction((pk) => (window as unknown as { __cuesight: Hook & { state: { pocketId: string | null } } }).__cuesight.state.pocketId === pk, pocket);
 }
 
+/** Whether the Snap photo canvas and the table-photo thumbnail still hold any pixels (FR-122). */
+const retained = (page: Page) =>
+  page.evaluate(() => {
+    const has = (sel: string) => {
+      const c = document.querySelector<HTMLCanvasElement>(sel);
+      if (!c || !c.width || !c.height) return false;
+      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      for (let i = 3; i < d.length; i += 4) if (d[i]) return true;
+      return false;
+    };
+    return { photo: has('#snap-canvas'), thumb: has('#snap-thumb') };
+  });
+
+/** Records Snap's requests to the vision worker (type, still options, the player-view target). */
+async function spyVision(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __posted: { type: string; opts?: unknown; targetId?: string; manual?: boolean }[] };
+    w.__posted = [];
+    const orig = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
+      const msg = m as { type?: string; opts?: unknown; input?: { targetId?: string; manualTaps?: unknown } };
+      if (msg && (msg.type === 'still' || msg.type === 'player-view')) w.__posted.push({ type: msg.type, opts: msg.opts, targetId: msg.input?.targetId, manual: !!msg.input?.manualTaps });
+      return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
+    } as typeof orig;
+  });
+}
+const posted = (page: Page) => page.evaluate(() => (window as unknown as { __posted: { type: string; opts?: { swapAxes?: boolean; manualCorners?: unknown }; targetId?: string; manual?: boolean }[] }).__posted);
+
+/**
+ * Counts the recommendation requests sent to the planner worker and their replies (test instrumentation
+ * only): a request is sent 180 ms after a tap (debounced), and a reply to the request before can land
+ * inside that window and read as the new recommendation for a moment.
+ */
+async function trackPlanner(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __planner: { open: Set<number>; last: number } };
+    w.__planner = { open: new Set(), last: 0 };
+    const seen = new WeakSet<Worker>();
+    const orig = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (this: Worker, m: unknown, t?: unknown) {
+      const msg = m as { type?: string; id?: number };
+      if (msg?.type === 'recommend' && typeof msg.id === 'number') {
+        if (!seen.has(this)) {
+          seen.add(this);
+          this.addEventListener('message', (e: MessageEvent) => {
+            const d = e.data as { type?: string; id?: number };
+            if (d?.type === 'recommendation' || d?.type === 'error') {
+              w.__planner.open.delete(d.id!);
+              w.__planner.last = performance.now();
+            }
+          });
+        }
+        w.__planner.open.add(msg.id);
+        w.__planner.last = performance.now();
+      }
+      return (orig as (this: Worker, m: unknown, t?: unknown) => void).call(this, m, t as never);
+    } as typeof orig;
+  });
+}
+/**
+ * Waits for the recommended stroke of the current target and pocket to be in the plan, with the planner
+ * quiet for 0.5 s: until then the plan carries the provisional stroke (e.g. 4.5/10), which the
+ * recommendation (2–4 s under load) then replaces, and the HUD with it.
+ */
+const recommendedPlan = (page: Page, pocket: string) =>
+  page.waitForFunction(
+    (pk) => {
+      const w = window as unknown as {
+        __planner?: { open: Set<number>; last: number };
+        __cuesight: { state: { recommended: { pending: boolean } | null; plan: { pocketId: string; strokeSource: string } | null } };
+      };
+      const s = w.__cuesight.state;
+      const quiet = !w.__planner || (w.__planner.open.size === 0 && performance.now() - w.__planner.last > 500);
+      return quiet && !!s.recommended && !s.recommended.pending && s.plan?.pocketId === pk && s.plan.strokeSource === 'recommended';
+    },
+    pocket,
+    { timeout: 30_000 },
+  );
+
 async function tablePhoto(page: Page) {
   await page.goto('/?mode=snap');
   await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
@@ -79,6 +159,7 @@ async function tablePhoto(page: Page) {
 
 test.describe('Snap two-photo guide (feature 002 US2)', () => {
   test('table photo → layout → target → player photo → guide', async ({ page }) => {
+    await trackPlanner(page);
     await tablePhoto(page);
     const s = await H(page);
     // The right number of balls, one cue ball, each where the ray-traced ground truth put it.
@@ -102,9 +183,9 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await stepIs(page, ['guide', 'manual-taps']);
     expect((await H(page)).step).toBe('guide');
     await expect(page.locator('#snap-fit')).toContainText('Fit: good');
-    // How hard: n/10 plus a speed word; where to strike: tip offset in coaching words. The recommended
-    // stroke may still be on its way (it then replaces the provisional one): read the settled plan.
-    await page.waitForFunction(() => !(window as unknown as { __cuesight: { state: { recommended: { pending: boolean } | null } } }).__cuesight.state.recommended?.pending, null, { timeout: 15_000 });
+    // How hard: n/10 plus a speed word; where to strike: tip offset in coaching words. Read from the
+    // final plan (the recommended stroke), not the provisional one shown while it is worked out.
+    await recommendedPlan(page, 'TR');
     const plan = await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.state.plan!);
     const pw = plan.stroke.power;
     await expect(page.locator('#hud-power')).toHaveText(`${pw.toFixed(pw % 1 ? 1 : 0)}/10`);
@@ -126,9 +207,67 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     if (plan.stroke.vert > 0.04) expect(face!.dot.y).toBeLessThan(face!.c.y);
     if (plan.stroke.vert < -0.04) expect(face!.dot.y).toBeGreaterThan(face!.c.y);
 
-    // Leaving Snap releases the photos (FR-122).
+    // Leaving Snap releases the photos (FR-122): the session, and every pixel copy on screen (the
+    // photo canvas and the table-photo thumbnail).
+    expect(await retained(page)).toEqual({ photo: true, thumb: true });
     await page.locator('.mode-switch [data-mode="practice"]').click();
     expect((await H(page)).step).toBe('intro');
+    await expect.poll(() => retained(page)).toEqual({ photo: false, thumb: false });
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+  });
+
+  test('Start over discards both photos, including the thumbnail and the drawn photo (FR-122)', async ({ page }) => {
+    await tablePhoto(page);
+    await pick(page, gt.balls.find((b) => b.id === '1')!.pos, 'TR');
+    await page.setInputFiles('#snap-file-player', `${dir}snap-player.png`);
+    await stepIs(page, ['guide', 'manual-taps']);
+    expect(await retained(page)).toEqual({ photo: true, thumb: true });
+    await page.getByRole('button', { name: 'Start over' }).click();
+    await expect.poll(async () => (await H(page)).step).toBe('intro');
+    await expect.poll(() => retained(page)).toEqual({ photo: false, thumb: false });
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+  });
+
+  test('Snap keeps to its own detection settings, and the fit chip follows the target (item 17)', async ({ page }) => {
+    await spyVision(page);
+    await page.goto('/?mode=snap');
+    await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+    // Live's "Rotate" (swap long and short rails) is on: it belongs to the live camera, not to Snap.
+    await page.evaluate(() => ((window as unknown as { __cuesight: { state: { swapAxes: boolean } } }).__cuesight.state.swapAxes = true));
+    await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+    await stepIs(page, ['review', 'overview-error']);
+    const still = (await posted(page)).filter((m) => m.type === 'still');
+    expect(still).toHaveLength(1);
+    expect(still[0]!.opts).toMatchObject({ swapAxes: false, manualCorners: null });
+    expect((await H(page)).step).toBe('review');
+    // Live's setting is left as it was.
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: { state: { swapAxes: boolean } } }).__cuesight.state.swapAxes)).toBe(true);
+
+    await pick(page, gt.balls.find((b) => b.id === '1')!.pos, 'TR');
+    const first = await page.evaluate(() => (window as unknown as { __cuesight: { state: { targetId: string } } }).__cuesight.state.targetId);
+    await page.setInputFiles('#snap-file-player', `${dir}snap-player.png`);
+    await stepIs(page, ['guide', 'manual-taps']);
+    expect((await H(page)).step).toBe('guide');
+    await expect(page.locator('#snap-fit')).toContainText('Fit: good');
+    let fits = (await posted(page)).filter((m) => m.type === 'player-view');
+    expect(fits.map((m) => m.targetId)).toEqual([first]);
+    // Another pocket for the same ball: the fit (about the target ball) still holds, no new fit.
+    await page.evaluate(() => (window as unknown as { __cuesight: { selectPocket(id: string): void } }).__cuesight.selectPocket('BR'));
+    await page.waitForTimeout(400);
+    expect((await posted(page)).filter((m) => m.type === 'player-view')).toHaveLength(1);
+    // Another target ball on the same photo: the photo is fitted again for it, and the chip shows that fit.
+    const other = await page.evaluate((p) => {
+      const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+      return h.state.snap.layout!.reduce((a, c) => (Math.hypot(c.pos.x - p.x, c.pos.y - p.y) < Math.hypot(a.pos.x - p.x, a.pos.y - p.y) ? c : a)).id;
+    }, gt.balls.find((b) => b.id === '2')!.pos);
+    expect(other).not.toBe(first);
+    await page.evaluate((id) => (window as unknown as { __cuesight: { selectBall(id: string): void } }).__cuesight.selectBall(id), other);
+    await expect.poll(async () => (await posted(page)).filter((m) => m.type === 'player-view').map((m) => m.targetId)).toEqual([first, other]);
+    fits = (await posted(page)).filter((m) => m.type === 'player-view');
+    expect(fits[1]!.manual).toBe(false);
+    await expect.poll(async () => ((await H(page)) as Snap & { player: { fitTargetId?: string } }).player.fitTargetId, { timeout: 15_000 }).toBe(other);
+    expect((await H(page)).step).toBe('guide');
+    await expect(page.locator('#snap-fit')).toContainText(/Fit: (good|fair|low) · \d+%/);
   });
 
   test('a photo it cannot line up → reason → two taps → guide (manual fallback)', async ({ page }) => {
@@ -162,4 +301,155 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     await expect(page.locator('#hud-strike')).toContainText('Strike');
     await expect(page.locator('#snap-hud')).toContainText('/10');
   });
+});
+
+/**
+ * Decoding a 12–48 MP phone photo takes a while on a phone: slows every decode down by `ms` and counts
+ * the decodes that have finished (`__decodes`).
+ */
+async function slowDecode(page: Page, ms: number) {
+  await page.addInitScript((delay: number) => {
+    const w = window as unknown as { __decodes: number; createImageBitmap: (...a: unknown[]) => Promise<ImageBitmap> };
+    w.__decodes = 0;
+    const orig = window.createImageBitmap.bind(window) as (...a: unknown[]) => Promise<ImageBitmap>;
+    w.createImageBitmap = async (...a: unknown[]) => {
+      try {
+        const bmp = await orig(...a);
+        await new Promise((r) => setTimeout(r, delay));
+        return bmp;
+      } finally {
+        w.__decodes++;
+      }
+    };
+  }, ms);
+}
+/** Waits until `n` decodes have finished, and a little longer for what follows them to run. */
+async function decoded(page: Page, n: number) {
+  await page.waitForFunction((k) => (window as unknown as { __decodes: number }).__decodes >= k, n, { timeout: 30_000 });
+  await page.waitForTimeout(600);
+}
+const targetOf = (page: Page) => page.evaluate(() => (window as unknown as { __cuesight: { state: { targetId: string | null } } }).__cuesight.state.targetId);
+
+/**
+ * FR-122 with a photo still decoding (or the sample still loading) when the player leaves Snap or taps
+ * Start over: the photo that arrives afterwards belongs to a session that is gone. It must be dropped,
+ * not kept in memory (to come back on the next visit), and must not touch the Practice selection.
+ */
+test.describe('Snap photos that arrive after the session ended (FR-122)', () => {
+  for (const how of ['a chosen photo', 'the sample photo'] as const) {
+    test(`leaving Snap while ${how} is still decoding drops it`, async ({ page }) => {
+      await slowDecode(page, 1500);
+      await page.goto('/?mode=snap');
+      await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+      if (how === 'a chosen photo') await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+      else await page.getByRole('button', { name: 'Try it with sample photos' }).click();
+      await page.locator('.mode-switch [data-mode="practice"]').click();
+      await page.evaluate(() => (window as unknown as { __cuesight: { selectBall(id: string): void } }).__cuesight.selectBall('b1'));
+      expect(await targetOf(page)).toBe('b1');
+      await decoded(page, 1);
+      expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+      expect((await H(page)).step).toBe('intro');
+      // The Practice selection is the player's own: the late photo does not reset it.
+      expect(await targetOf(page)).toBe('b1');
+      expect(await retained(page)).toEqual({ photo: false, thumb: false });
+      // Back in Snap: a fresh start, nothing from before.
+      await page.locator('.mode-switch [data-mode="snap"]').click();
+      await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+      expect((await H(page)).step).toBe('intro');
+      expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+    });
+  }
+
+  test('Start over while another table photo is still decoding drops it', async ({ page }) => {
+    await slowDecode(page, 1500);
+    await tablePhoto(page);
+    await page.setInputFiles('#snap-file-table', `${dir}snap-overview.png`);
+    await page.getByRole('button', { name: 'Start over' }).click();
+    await expect.poll(async () => (await H(page)).step).toBe('intro');
+    await decoded(page, 2);
+    expect((await H(page)).step).toBe('intro');
+    expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos())).toEqual({ overview: null, player: null });
+    expect(await retained(page)).toEqual({ photo: false, thumb: false });
+  });
+});
+
+/**
+ * Spec edge cases "Photo orientation" and "Very large photos" (critic item 13): a portrait phone photo
+ * is stored landscape with EXIF orientation 6. Older WebKit decoders ignore the tag, and some reject the
+ * createImageBitmap options; the photo must be upright either way, and never decoded at full size where
+ * the platform can scale while decoding.
+ */
+test.describe('Snap photo decoding (portrait EXIF photo, older WebKit)', () => {
+  for (const variant of ['decoder ignores the orientation tag', 'createImageBitmap rejects options and ignores the tag'] as const) {
+    test(`a portrait photo comes out upright at the processing size: ${variant}`, async ({ page }) => {
+      await page.addInitScript((rejects: boolean) => {
+        const w = window as unknown as { __bitmaps: [number, number][]; createImageBitmap: (...a: unknown[]) => Promise<ImageBitmap> };
+        w.__bitmaps = [];
+        const orig = window.createImageBitmap.bind(window) as (...a: unknown[]) => Promise<ImageBitmap>;
+        // A decoder that does not read EXIF: the APP1 (EXIF) marker is renamed to an unknown APP15.
+        const blind = async (b: Blob) => {
+          const u = new Uint8Array(await b.arrayBuffer());
+          if (u[0] === 0xff && u[1] === 0xd8)
+            for (let i = 2; i + 4 < u.length && u[i] === 0xff; ) {
+              const m = u[i + 1]!;
+              if (m === 0xda) break;
+              if (m === 0xe1) u[i + 1] = 0xef;
+              i += 2 + ((u[i + 2]! << 8) | u[i + 3]!);
+            }
+          return new Blob([u], { type: b.type });
+        };
+        w.createImageBitmap = async (src: unknown, ...rest: unknown[]) => {
+          if (rejects && rest.length && typeof rest[rest.length - 1] === 'object') throw new TypeError('ImageBitmapOptions are not supported');
+          const bmp = await orig(src instanceof Blob ? await blind(src) : src, ...rest);
+          w.__bitmaps.push([bmp.width, bmp.height]);
+          return bmp;
+        };
+      }, variant.startsWith('createImageBitmap'));
+      await page.goto('/?mode=snap');
+      await expect(page.getByRole('button', { name: 'Take photo' })).toBeVisible();
+      // A 1600×1200 landscape JPEG, grey with a red block in its top-left corner, tagged "turn 90°
+      // clockwise to view": upright, it is 1200×1600 with the red block in the top-right corner.
+      const b64 = await page.evaluate(async () => {
+        const c = document.createElement('canvas');
+        c.width = 1600;
+        c.height = 1200;
+        const x = c.getContext('2d')!;
+        x.fillStyle = '#808080';
+        x.fillRect(0, 0, 1600, 1200);
+        x.fillStyle = '#ff0000';
+        x.fillRect(0, 0, 400, 300);
+        const blob = await new Promise<Blob>((r) => c.toBlob((b) => r(b!), 'image/jpeg', 0.92));
+        const u = new Uint8Array(await blob.arrayBuffer());
+        let s = '';
+        for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]!);
+        return btoa(s);
+      });
+      const tagged = jpegWithOrientation(new Uint8Array(Buffer.from(b64, 'base64')), 6);
+      await page.setInputFiles('#snap-file-table', { name: 'portrait.jpg', mimeType: 'image/jpeg', buffer: Buffer.from(tagged) });
+      await stepIs(page, ['review', 'overview-error']);
+      const shown = await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.photos().overview);
+      expect(shown).toEqual({ width: 720, height: 960 });
+      // The photo on screen: red at the top right, grey at the top left.
+      const at = (p: V2) =>
+        page.evaluate((pp) => {
+          const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+          const q = h.snap.photoToScreen(pp);
+          const c = document.querySelector<HTMLCanvasElement>('#snap-canvas')!;
+          const r = c.getBoundingClientRect();
+          const d = c.getContext('2d')!.getImageData(Math.round(((q.x - r.left) * c.width) / r.width), Math.round(((q.y - r.top) * c.height) / r.height), 1, 1).data;
+          return [d[0]!, d[1]!, d[2]!];
+        }, p);
+      const tr = await at({ x: 720 - 40, y: 40 });
+      const tl = await at({ x: 40, y: 40 });
+      expect(tr[0], `top right ${tr}`).toBeGreaterThan(170);
+      expect(tr[1]).toBeLessThan(90);
+      expect(Math.abs(tl[0] - tl[1]), `top left ${tl}`).toBeLessThan(40);
+      // Where the platform can scale while decoding, it does: no full-size bitmap is ever made.
+      if (!variant.startsWith('createImageBitmap')) {
+        const sizes = await page.evaluate(() => (window as unknown as { __bitmaps: [number, number][] }).__bitmaps);
+        expect(sizes.length).toBeGreaterThan(0);
+        for (const [w, h] of sizes) expect(w * h, `decoded ${w}×${h}`).toBeLessThanOrEqual(960 * 720);
+      }
+    });
+  }
 });
