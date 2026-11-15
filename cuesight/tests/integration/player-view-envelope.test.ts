@@ -810,7 +810,7 @@ describe('FR-121: balls moved since the table photo → "The balls seem to have 
     const res = run(base, render(now).frame);
     // The guide the app would draw: from the overview's layout, on the fitted pose, against the table now.
     const err = res.pose ? errorsOf(now, res.pose, knownOf(base.balls)) : null;
-    return { res, err, name: base.name };
+    return { res, err, name: base.name, base, now };
   }
   /** Moved: "moved", or an ok fit whose guide (from the old layout) is still right. Never an ok with a wrong guide. */
   const verdict = (r: ReturnType<typeof movedRun>) => (r.res.ok ? (r.err && within(r.err) ? 'okRight' : 'okWrong') : r.res.reason === PLAYER_VIEW_REASONS.moved ? 'moved' : `other: ${r.res.reason}`);
@@ -834,7 +834,8 @@ describe('FR-121: balls moved since the table photo → "The balls seem to have 
         }
       console.log(`${preset} cue ball moved: ${rows.join(', ')}`);
       expect(rows.filter((x) => x.endsWith('moved') || x.endsWith('okRight')).length).toBe(rows.length);
-    });
+      // Ten renders and fits: ≈ 5 s alone, past the 30 s default on a loaded machine (release verification).
+    }, 120_000);
 
   it('the whole layout moved 10–12 cm (the cue ball stayed): "moved" on ≥ 75 % and never an ok with a wrong guide', () => {
     const shift = (layout: SynthBall[]) => layout.map((b, i) => (i === 0 ? b : { ...b, pos: { x: b.pos.x + (i % 2 ? 0.12 : -0.1), y: Math.max(-0.6, Math.min(0.6, b.pos.y + (i % 3 === 0 ? 0.1 : -0.08))) } }));
@@ -866,6 +867,48 @@ describe('FR-121: balls moved since the table photo → "The balls seem to have 
     console.log(`target moved: ${out.join(', ')}`);
     expect(out.every((x) => x === 'moved')).toBe(true);
   });
+
+  it('the target ball moved 10–17.5 cm along the line of sight: "moved", never an ok that aims from where it was', () => {
+    // Release verification: the Snap sample's 1 ball moved 12 cm roughly along the aim gave "Fit: good ·
+    // 99 %" with the ghost ball drawn 12 cm off (the cut 12° → 17°, enough to miss the pot). Seen along
+    // the line of sight the ball moves only ≈ 1.2 radii in the photo — within the guide's image tolerance
+    // (SC-107 measures the ghost in the photo), but the shot is a different one. Its circle still
+    // overlapped where the layout puts it, so the ball was neither matched (its outline is off by that
+    // much) nor on bare cloth, and its own prediction "explained" its circle.
+    const poses = [{ d: 0.5, h: 0.3 }, { d: 0.3, h: 0.15 }, { d: 0.8, h: 0.4, yaw: 10 }, { d: 0.6, h: 0.2, roll: 10, yaw: 5 }];
+    const out: string[] = [];
+    const shifts: number[] = [];
+    for (const preset of ['pool9', 'snooker12'] as const)
+      poses.forEach((p, k) => {
+        for (const off of [0.1 + 0.025 * k, -(0.1 + 0.025 * k)]) {
+          const moveTarget = (layout: SynthBall[], ti: number) => {
+            const cue = layout[0]!.pos;
+            const tg = layout[ti]!.pos;
+            const L = Math.hypot(tg.x - cue.x, tg.y - cue.y);
+            return layout.map((b, i) => (i === ti ? { ...b, pos: { x: tg.x + (off * (tg.x - cue.x)) / L, y: tg.y + (off * (tg.y - cue.y)) / L } } : b));
+          };
+          const r = movedRun(preset, moveTarget, p);
+          // How far the move shifts the target in the photo (truth camera), in its own radii.
+          const gt = poseOf(r.base.cam, r.base.W, r.base.H);
+          const R = r.base.table.ballRadius;
+          const was = r.base.balls[r.base.targetIdx]!.pos;
+          const is = r.now.balls[r.base.targetIdx]!.pos;
+          const a = projectPoint(gt, { x: was.x, y: was.y, z: R })!;
+          const b = projectPoint(gt, { x: is.x, y: is.y, z: R })!;
+          const top = projectPoint(gt, { x: is.x, y: is.y, z: 2 * R })!;
+          const shift = Math.hypot(b.x - a.x, b.y - a.y) / Math.hypot(top.x - b.x, top.y - b.y);
+          out.push(`${preset} ${off.toFixed(3)} (${shift.toFixed(2)} R in the photo): ${verdict(r)}`);
+          shifts.push(shift);
+        }
+      });
+    console.log(`target moved along the line of sight: ${out.join(', ')}`);
+    // "moved" — except where the move shifts the target by under half its radius in the photo (a low
+    // camera far from it: 12.5 cm is 5 px there, within the circle fit's own error); the guide drawn
+    // from the old layout is then within SC-107 (okRight), never off it.
+    const bad = out.filter((x, i) => !x.endsWith('moved') && !(x.endsWith('okRight') && shifts[i]! < 0.5));
+    expect(bad, out.join('\n')).toEqual([]);
+    expect(out.filter((x) => x.endsWith('moved')).length).toBeGreaterThanOrEqual(12);
+  }, 120_000);
 
   it('the target ball is gone (pocketed since the table photo): "moved", not a guide to an empty spot', () => {
     // No circle of its colour anywhere: the evidence is the bare cloth where the layout puts it.

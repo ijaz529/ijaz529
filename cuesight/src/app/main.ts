@@ -35,6 +35,7 @@ import {
   nextCornersOut,
   nextSinceLocked,
   pickNextAllowed,
+  suggestNeedsCue,
   pillMeta,
   pillText,
   probeCamera,
@@ -1207,6 +1208,12 @@ const actions = {
     }
     const layout = currentLayout();
     if (!layout) return toast('No table yet.');
+    // No cue ball (Live: none found, or two whites too close to call): ask for it, not "no clean pot".
+    const needsCue = suggestNeedsCue(layout.balls);
+    if (needsCue) {
+      store.update((s) => (s.interaction = 'mark-cue'));
+      return toast(needsCue, 3600);
+    }
     store.update((s) => (s.suggestions = { items: [], pending: true }));
     planner.send('suggest', { type: 'suggest', layout, params: S.params, max: 3 });
   },

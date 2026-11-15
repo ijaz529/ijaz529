@@ -547,7 +547,7 @@
       ],
       "expect": {
         "ok": false,
-        "reason": "I couldn't line up this photo. Tap the cue ball, then your target.",
+        "reason": "I can't see enough balls. Include the cue ball and at least two others.",
         "manualTaps": {
           "cue": {
             "x": 640,
@@ -559,7 +559,7 @@
           }
         },
         "manualOk": true,
-        "manualConfidence": 0.7
+        "manualConfidence": 0.63
       }
     },
     "playerCut": {

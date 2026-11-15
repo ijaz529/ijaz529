@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
 import { CALIBRATION_MESSAGES } from '../../../src/app/live-logic';
 import { clothRgbOf } from '../../../src/app/snap/photo';
-import { detectionUsable, initialSnap, playerFailAction, snapAimText, snapGuideInstruction, snapReducer, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
+import { detectionUsable, initialSnap, playerFailAction, retakeInstruction, snapAimText, snapGuideInstruction, snapReducer, SNAP_MESSAGES, tapsOffered, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
 import { planShot } from '../../../src/core/shot/planner';
 import { describeSpin } from '../../../src/core/shot/power';
 import { makeTable } from '../../../src/core/table';
@@ -245,7 +245,7 @@ describe('clothRgbOf: the 3D cloth colour from the table photo’s cloth model',
 });
 
 describe('a failed player-photo fit says what to do next (PLAYER_VIEW_REASONS)', () => {
-  it('maps every reason: moved → retake the table photo; dark, grainy, no cloth → better photo (taps still offered); the rest → two taps', () => {
+  it('maps every reason: moved → retake the table photo; dark, grainy, no cloth → better photo (taps: see tapsOffered); the rest → two taps', () => {
     const want: Record<keyof typeof PLAYER_VIEW_REASONS, string> = {
       moved: 'retake-table',
       dark: 'retake-light',
@@ -277,5 +277,40 @@ describe('a failed player-photo fit says what to do next (PLAYER_VIEW_REASONS)',
     t = snapReducer(t, { type: 'manual-tap', p: { x: 100, y: 100 } });
     t = snapReducer(t, { type: 'manual-tap', p: { x: 200, y: 200 } });
     expect(t.step).toBe('player-processing');
+  });
+  it('dark or grainy: the better photo is the instruction, the taps are offered once; no cloth in view: no taps (release verification: the player looped)', () => {
+    // A dark (×0.15) or grainy (σ 20–28) photo whose two-tap fit failed with the same reason said
+    // "Tap the centre of the cue ball" again, and the no-cloth photo (a wall, the floor) asked for a tap
+    // on a cue ball that was not in it.
+    const layout: Ball[] = [
+      { id: 'cue', kind: 'cue', pos: { x: -0.5, y: 0 } },
+      { id: 'b1', kind: 'object', pos: { x: 0.3, y: 0.1 } },
+    ];
+    const player = { width: 960, height: 720, result: null } as unknown as NonNullable<SnapSession['player']>;
+    const failed = (reason: string, manual: boolean): SnapSession => ({ ...initialSnap(), step: 'manual-taps', layout, player: { ...player, manual }, error: reason, taps: {} });
+    const twoTaps = (s: SnapSession) => snapReducer(snapReducer(s, { type: 'manual-tap', p: { x: 100, y: 100 } }), { type: 'manual-tap', p: { x: 200, y: 200 } });
+    for (const reason of [PLAYER_VIEW_REASONS.dark, PLAYER_VIEW_REASONS.noisy]) {
+      // First failure (automatic fit): the taps are offered and run the fit.
+      expect(tapsOffered(failed(reason, false)), reason).toBe(true);
+      expect(twoTaps(failed(reason, false)).step, reason).toBe('player-processing');
+      // The two-tap fit failed for the same reason: the taps did not help; they are not offered again.
+      const afterTaps = snapReducer({ ...failed(reason, false), step: 'player-processing', taps: { cue: { x: 1, y: 1 }, target: { x: 2, y: 2 } } }, { type: 'player-result', result: { ok: false, pose: null, confidence: 0, residualPx: Infinity, matched: [], reason, ms: 1 }, targetId: 'b1', manual: true });
+      expect(afterTaps.step, reason).toBe('manual-taps');
+      expect(tapsOffered(afterTaps), reason).toBe(false);
+      expect(twoTaps(afterTaps).step, reason).toBe('manual-taps');
+      expect(twoTaps(afterTaps).taps, reason).toEqual({});
+    }
+    // No cloth in view: no table, so no cue ball to tap.
+    expect(tapsOffered(failed(PLAYER_VIEW_REASONS.noCloth, false))).toBe(false);
+    expect(twoTaps(failed(PLAYER_VIEW_REASONS.noCloth, false)).step).toBe('manual-taps');
+    // The reasons the taps fix keep them, also after a two-tap fit that failed (the player may tap again).
+    for (const reason of [PLAYER_VIEW_REASONS.noFit, PLAYER_VIEW_REASONS.noCue, PLAYER_VIEW_REASONS.tooFewBalls, SNAP_MESSAGES.detectionStoppedPlayer]) {
+      expect(tapsOffered(failed(reason, true)), reason).toBe(true);
+    }
+    expect(tapsOffered(failed(PLAYER_VIEW_REASONS.moved, false))).toBe(false);
+    // The instruction names what the better photo needs.
+    expect(retakeInstruction(PLAYER_VIEW_REASONS.dark)).toBe('Retake your photo with more light on the table.');
+    expect(retakeInstruction(PLAYER_VIEW_REASONS.noisy)).toBe('Retake your photo with more light on the table, holding the phone steady.');
+    expect(retakeInstruction(PLAYER_VIEW_REASONS.noCloth)).toBe('Retake your photo with the table’s cloth in view, aimed along your shot.');
   });
 });
