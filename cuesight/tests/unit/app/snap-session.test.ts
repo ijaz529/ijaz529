@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
 import { CALIBRATION_MESSAGES } from '../../../src/app/live-logic';
 import { clothRgbOf } from '../../../src/app/snap/photo';
-import { detectionUsable, initialSnap, snapAimText, snapGuideInstruction, snapReducer, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
+import { detectionUsable, initialSnap, playerFailAction, snapAimText, snapGuideInstruction, snapReducer, SNAP_MESSAGES, type SnapEvent, type SnapSession } from '../../../src/app/snap/session';
 import { planShot } from '../../../src/core/shot/planner';
 import { describeSpin } from '../../../src/core/shot/power';
 import { makeTable } from '../../../src/core/table';
@@ -18,6 +18,7 @@ import type { Ball, TableLayout } from '../../../src/core/types';
 import type { VisionResult } from '../../../src/vision/pipeline';
 import { BALL_COLORS, renderSyntheticTable, type SynthCamera } from '../../../src/vision/synth/render';
 import { processStill } from '../../../src/workers/vision.worker';
+import { PLAYER_VIEW_REASONS } from '../../../src/vision/player-view';
 
 const table = makeTable('pool9');
 const photo = { width: 960, height: 540, source: 'library' as const };
@@ -240,5 +241,41 @@ describe('clothRgbOf: the 3D cloth colour from the table photo’s cloth model',
     const blue = clothRgbOf({ hue: 215, sat: 0.6, val: 0.5 })!;
     expect(blue[2]).toBeGreaterThan(blue[0]);
     expect(clothRgbOf(null)).toBeUndefined();
+  });
+});
+
+describe('a failed player-photo fit says what to do next (PLAYER_VIEW_REASONS)', () => {
+  it('maps every reason: moved → retake the table photo; dark, grainy, no cloth → better photo (taps still offered); the rest → two taps', () => {
+    const want: Record<keyof typeof PLAYER_VIEW_REASONS, string> = {
+      moved: 'retake-table',
+      dark: 'retake-light',
+      noisy: 'retake-light',
+      noCloth: 'retake-light',
+      tooFewBalls: 'taps',
+      noCue: 'taps',
+      noFit: 'taps',
+      notBehind: 'taps',
+    };
+    for (const k of Object.keys(PLAYER_VIEW_REASONS) as (keyof typeof PLAYER_VIEW_REASONS)[]) {
+      expect(playerFailAction(PLAYER_VIEW_REASONS[k]), k).toBe(want[k]);
+    }
+    expect(playerFailAction(null)).toBe('taps');
+    expect(playerFailAction(SNAP_MESSAGES.detectionStoppedPlayer)).toBe('taps');
+  });
+
+  it("'moved': the two-tap fallback does not draw a guide from the old layout", () => {
+    const layout: Ball[] = [
+      { id: 'cue', kind: 'cue', pos: { x: -0.5, y: 0 } },
+      { id: 'b1', kind: 'object', pos: { x: 0.3, y: 0.1 } },
+    ];
+    let s: SnapSession = { ...initialSnap(), step: 'manual-taps', layout, player: { width: 960, height: 720, result: null } as unknown as SnapSession['player'], error: PLAYER_VIEW_REASONS.moved, taps: {} };
+    s = snapReducer(s, { type: 'manual-tap', p: { x: 100, y: 100 } });
+    s = snapReducer(s, { type: 'manual-tap', p: { x: 200, y: 200 } });
+    expect(s.step).toBe('manual-taps');
+    expect(s.taps).toEqual({});
+    let t: SnapSession = { ...s, error: PLAYER_VIEW_REASONS.noFit };
+    t = snapReducer(t, { type: 'manual-tap', p: { x: 100, y: 100 } });
+    t = snapReducer(t, { type: 'manual-tap', p: { x: 200, y: 200 } });
+    expect(t.step).toBe('player-processing');
   });
 });

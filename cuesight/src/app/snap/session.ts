@@ -99,6 +99,24 @@ export const SNAP_MESSAGES = {
  * The event that ends a Snap request when the vision worker itself failed (it will never reply):
  * `loaded` = the worker had answered at least once, so this is not a script that failed to load.
  */
+/**
+ * What a failed player-photo fit asks the player to do next. The reason strings are
+ * PLAYER_VIEW_REASONS (src/vision/player-view.ts); they are matched by text so the app bundle does not
+ * pull in the vision module (tests/unit/app/snap-session.test.ts checks every reason).
+ * - 'retake-table': the balls moved since the table photo, so a guide from the old layout would be
+ *   wrong (FR-121); two taps cannot help.
+ * - 'retake-light': too dark, too grainy, or no cloth in view: a better photo is the fix; the two taps
+ *   are still offered.
+ * - 'taps': no cue ball, too few balls or no fit: the two taps fit the photo.
+ */
+export type PlayerFailAction = 'retake-table' | 'retake-light' | 'taps';
+export function playerFailAction(reason: string | null | undefined): PlayerFailAction {
+  if (!reason) return 'taps';
+  if (/^The balls seem to have moved/.test(reason)) return 'retake-table';
+  if (/too dark|too grainy|find the table cloth/.test(reason)) return 'retake-light';
+  return 'taps';
+}
+
 export function visionFailedEvent(kind: 'still' | 'player-view', loaded: boolean): SnapEvent {
   if (kind === 'player-view') return { type: 'player-failed', message: loaded ? SNAP_MESSAGES.detectionStoppedPlayer : SNAP_MESSAGES.detectionLoad };
   return { type: 'overview-failed', message: loaded ? SNAP_MESSAGES.detectionStopped : SNAP_MESSAGES.detectionLoad };
@@ -173,7 +191,7 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
     case 'start-manual':
       return s.player ? { ...s, step: 'manual-taps', taps: {} } : s;
     case 'manual-tap': {
-      if (s.step !== 'manual-taps') return s;
+      if (s.step !== 'manual-taps' || playerFailAction(s.error) === 'retake-table') return s;
       if (!s.taps.cue) return { ...s, taps: { cue: e.p } };
       return { ...s, step: 'player-processing', taps: { cue: s.taps.cue, target: e.p } };
     }

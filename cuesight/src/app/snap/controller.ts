@@ -29,7 +29,7 @@ import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
 import { decodePhoto, frameOf, loadSample, photoFromVideo, releasePhoto, type Photo } from './photo';
-import { SNAP_MESSAGES, fitCheck, snapAimText, snapGuideInstruction, snapStage, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
+import { SNAP_MESSAGES, fitCheck, playerFailAction, snapAimText, snapGuideInstruction, snapStage, visionFailedEvent, type SnapEvent, type SnapSession } from './session';
 
 export const SAMPLE_PHOTOS = { table: './samples/snap-table.png', player: './samples/snap-player.png' } as const;
 
@@ -736,9 +736,17 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
         setChip(null);
         const tl = s.targetId ? (sn.layout?.find((b) => b.id === s.targetId)?.label ?? '') : '';
         const tname = !tl ? 'target ball' : /^\d+$/.test(tl) ? `${tl}-ball (your target)` : `${tl} ball (your target)`;
+        const next = playerFailAction(sn.error);
+        if (next === 'retake-table') {
+          // The layout changed since the table photo: a guide from it would be wrong, and taps cannot fix that.
+          setInstr('Retake the table photo: the balls have moved since it was taken.', 'camera', 'warn');
+          if (sn.error) warnings.push(sn.error);
+          actions = iconBtn('retake-table', 'Retake the table photo', 'camera') + iconBtn('start-over', 'Start over', 'refresh');
+          break;
+        }
         const tapText = !sn.taps.cue ? 'Tap the centre of the cue ball in your photo.' : `Now tap the centre of the ${tname}.`;
         setInstr(tapText, 'hand');
-        if (sn.error) warnings.push(`${sn.error} Next time, include a rail or a pocket and the target ball in the photo.`);
+        if (sn.error) warnings.push(next === 'retake-light' ? `${sn.error} Or tap the cue ball, then your target.` : `${sn.error} Next time, include a rail or a pocket and the target ball in the photo.`);
         actions = iconBtn('take-player', 'Retake the player-view photo', 'camera') + iconBtn('pick-player', 'Choose another player-view photo', 'image') + iconBtn('edit-layout', 'Edit the layout', 'layers') + iconBtn('start-over', 'Start over', 'refresh');
         break;
       }

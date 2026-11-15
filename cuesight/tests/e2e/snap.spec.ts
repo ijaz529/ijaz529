@@ -498,7 +498,8 @@ test.describe('Snap two-photo guide (feature 002 US2)', () => {
     expect((await H(page)).step).toBe('manual-taps');
     // Honest: no guide is drawn, the reason is shown, and the next step is spelled out.
     expect(await page.evaluate(() => (window as unknown as { __cuesight: Hook }).__cuesight.snap.guide())).toBeNull();
-    await expect(page.locator('#snap-top')).toContainText("couldn't line up");
+    // The photo shows fewer than 3 ball circles, so the reason says so (PLAYER_VIEW_REASONS.tooFewBalls).
+    await expect(page.locator('#snap-top')).toContainText("I can't see enough balls");
     await expect(page.locator('#snap-top')).toContainText('Tap the centre of the cue ball');
     // The table-photo hint from step 1 does not linger over these instructions.
     await expect(page.locator('#toast')).toBeHidden();
