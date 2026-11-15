@@ -36,7 +36,7 @@ export function suggestShots(layout: TableLayout, params: PhysicsParams, max = 3
   // Verify the leaders by simulation with the default stroke; demote kisses/misses, reward the leave.
   const verified: ShotSuggestion[] = [];
   for (const c of cands.slice(0, max * 3)) {
-    const plan = planShot(layout, { targetId: c.targetId, pocketId: c.pocketId }, params, { record: false });
+    const plan = planShot(layout, { targetId: c.targetId, pocketId: c.pocketId }, params, { record: false, advice: false }); // codes only
     const bad = plan.warnings.some(
       (w) => w.code === 'kiss' || w.code === 'ob-missed' || w.code === 'throw-uncompensable' || w.code === 'blocked-cue' || w.code === 'blocked-object',
     );

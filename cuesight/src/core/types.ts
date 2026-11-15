@@ -200,6 +200,12 @@ export interface ShotPlan {
    * (≥ params.pocketArrivalSpeed); > 10: not even at full power (unchanged meaning). The minimum the
    * app shows; the cb-short / too-soft advice and the tip quote it rounded UP to a settable half
    * step (power.ts advisePower), so the figure they quote never triggers them.
+   * Frozen cue ball: the stroke angle, and with it the minimum, changes with the power (harder
+   * throws less, so the angle grows and the object ball gets less of the speed). It is the minimum
+   * for the angle found at the played power, except when the played stroke is too soft: then the
+   * stroke is re-planned at each half step above, and minPower is the lowest power (to ≈0.06) that
+   * pots it with pace and keeps the cue ball up — advisePower of it is the first power the warning
+   * quotes — or 10.5 when no power does (the warning then says so; harder won't help).
    */
   minPower: number;
   /**
@@ -208,7 +214,8 @@ export interface ShotPlan {
    * ball stops short; between it and minPower it only just drops. Optimistic: the chain ignores the
    * backspin a rolling cue ball gives the object ball, and the simulation needs ≈6 % more cue-ball
    * speed (median of 50 random pool9 layouts, up to 12 %). The position search starts here.
-   * Always set by planShot.
+   * Always set by planShot. Frozen cue ball: for the stroke angle found at the played power, capped
+   * at minPower when that is re-planned (see minPower).
    */
   minPowerCapture?: number;
   /** @deprecated Same as minPower (kept for consumers of an earlier draft). */

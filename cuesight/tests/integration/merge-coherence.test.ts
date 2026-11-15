@@ -192,6 +192,126 @@ describe('power advice: one figure, and played at it nothing says too soft (advi
   });
 });
 
+describe('frozen cue ball: the power advice is checked power by power (frozen-advice)', () => {
+  // A frozen cue ball's stroke angle grows with the power (harder throws less), so the minimum moves
+  // with it. The advice re-plans the stroke at each half step above the played power and quotes
+  // only powers that pot it with pace and keep the cue ball up — or says that none does.
+  const RANGE = /(?:Use power|Power) (\d+(?:\.\d)?)(?:–(\d+(?:\.\d)?))?(\+)?(?: gives some pace)?(: harder throws it less|: at power (\d+(?:\.\d)?) the cue ball follows it in)?\./;
+  const CENTRE = /Centre ball gets it in (?:at|from) power (\d+(?:\.\d)?)(?:–(\d+(?:\.\d)?))?( up)?\./;
+  const POWER_WORDS = /stops (short|before)|[Pp]ower [\d.]+(\+|–| gives)/;
+  const halfSteps = (lo: number, hi: number) => Array.from({ length: Math.round((hi - lo) * 2) + 1 }, (_, i) => lo + i / 2);
+  /** Played at `power`: pots with pace (no too-soft) and the cue ball stays up. advice: false — only the codes are read. */
+  const clean = (lay: TableLayout, pocketId: PocketId, power: number, side: number, vert: number) => {
+    const p = planShot(lay, { targetId: 'b1', pocketId, stroke: { power, side, vert } }, P, { record: false, advice: false });
+    return p.obPocketed && !p.scratch && !softWarning(p);
+  };
+  const frozenLayout = (cue: { x: number; y: number }, ob: { x: number; y: number }): TableLayout => ({
+    table: T,
+    balls: [
+      { id: 'cue', kind: 'cue', pos: cue, label: 'cue' },
+      { id: 'b1', kind: 'object', pos: ob, label: '1' },
+    ],
+    source: 'virtual',
+    frozen: false,
+  });
+
+  it('every power quoted is true, and so is every "no power … gets it in" (draw, follow, side, centre ball at power 1–2)', () => {
+    let seed = 4040;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const tips = [
+      { side: 0, vert: -0.4 },
+      { side: 0, vert: 0.4 },
+      { side: 0, vert: -0.25 },
+      { side: 0, vert: 0 },
+      { side: 0.3, vert: 0 },
+      { side: -0.2, vert: -0.3 },
+    ];
+    const seen = { ranged: 0, none: 0, centre: 0, throwEnd: 0 };
+    let n = 0;
+    for (let k = 0; k < 4000 && n < 60; k++) {
+      const ob = { x: (rnd() * 2 - 1) * (T.length / 2 - 0.1), y: (rnd() * 2 - 1) * (T.width / 2 - 0.1) };
+      const a = rnd() * 2 * Math.PI;
+      const cue = { x: ob.x + 2 * R * Math.cos(a), y: ob.y + 2 * R * Math.sin(a) };
+      if (Math.abs(cue.x) > T.length / 2 - R - 0.01 || Math.abs(cue.y) > T.width / 2 - R - 0.01) continue;
+      const lay = frozenLayout(cue, ob);
+      const tip = tips[k % tips.length]!;
+      const power = [1, 1.5, 2][k % 3]!;
+      const plan = planShot(lay, { targetId: 'b1', stroke: { power, ...tip } }, P, { record: false });
+      if (!plan.makeable) continue;
+      const w = plan.warnings.find((x) => x.code === 'too-soft');
+      if (!w || /Too far/.test(w.message)) continue;
+      n++;
+      const where = `${JSON.stringify({ cue, ob })} power ${power} ${JSON.stringify(tip)} ${plan.pocketId}, minPower ${plan.minPower}: ${w.message}`;
+      expect(plan.minPowerCapture!, where).toBeLessThanOrEqual(plan.minPower);
+      const m = RANGE.exec(w.message);
+      if (m) {
+        seen.ranged++;
+        const lo = Number(m[1]);
+        const hi = m[3] ? 10 : m[2] ? Number(m[2]) : lo;
+        expect(lo, where).toBe(advisePower(plan.minPower)); // the meter's minimum and the advice agree
+        expect(lo, where).toBeGreaterThan(power);
+        for (const q of halfSteps(lo, hi)) {
+          const again = planShot(lay, { targetId: 'b1', pocketId: plan.pocketId, stroke: { power: q, ...tip } }, P, { record: false });
+          expect(again.obPocketed && !again.scratch, `at ${q}: ${where}`).toBe(true);
+          expect(softWarning(again)?.message, `at ${q}: ${where}`).toBeUndefined();
+          expect([...again.warnings.map((x) => x.message), again.tip].some((s) => POWER_WORDS.test(s)), `at ${q}: ${where}`).toBe(false);
+        }
+        // The run ends where it says: one half step past it the stroke no longer pots cleanly.
+        if (hi < 10) expect(clean(lay, plan.pocketId, hi + 0.5, tip.side, tip.vert), `past ${hi}: ${where}`).toBe(false);
+        if (m[4]?.startsWith(': harder')) seen.throwEnd++;
+      } else {
+        seen.none++;
+        expect(w.message, where).toMatch(/no power( with this [a-z ]+)? gets it in with pace/i);
+        expect(plan.minPower, where).toBe(10.5);
+        // No half step above the played power pots it cleanly with this tip, up to full power.
+        for (const q of halfSteps(Math.floor(power * 2) / 2 + 0.5, 10)) expect(clean(lay, plan.pocketId, q, tip.side, tip.vert), `at ${q}: ${where}`).toBe(false);
+        const c = CENTRE.exec(w.message);
+        if (c) {
+          seen.centre++;
+          const lo = Number(c[1]);
+          for (const q of halfSteps(lo, c[3] ? 10 : c[2] ? Number(c[2]) : lo)) expect(clean(lay, plan.pocketId, q, 0, 0), `centre at ${q}: ${where}`).toBe(true);
+        }
+      }
+    }
+    expect(n).toBe(60);
+    // Not vacuous: ranges, runs that end for lack of throw, "no power", and the centre-ball fallback.
+    expect(seen.ranged).toBeGreaterThan(20);
+    expect(seen.throwEnd).toBeGreaterThan(3);
+    expect(seen.none).toBeGreaterThan(5);
+    expect(seen.centre).toBeGreaterThan(3);
+  });
+
+  it("the verifier's chains: one step to a power that works, or no 'more power' when none does", () => {
+    // Verifier 2's frozen-chain.ts: 'Use power 4+' → at 4 'Use power 5+' → at 5 throw-uncompensable.
+    const bottomRight = frozenLayout({ x: -0.6068573321586506, y: 0.3306092833156285 }, { x: -0.5549026966094971, y: 0.30680091619491573 });
+    const br = planShot(bottomRight, { targetId: 'b1', stroke: { power: 2, side: 0, vert: 0.4 } }, P, { record: false });
+    const brw = br.warnings.find((x) => x.code === 'too-soft')!.message;
+    expect(brw).toMatch(/harder throws it less/i);
+    expect(brw).toMatch(/no power with this follow gets it in with pace/);
+    expect(brw).not.toMatch(/Use power|Power [\d.]+ gives/);
+    expect(brw).toMatch(CENTRE);
+    // TR, draw at power 1: 'Use power 2.5+' → at 2.5 'Use power 4.5+' before; now one step.
+    const topRight = frozenLayout({ x: -0.2451160266459315, y: 0.23962167347191393 }, { x: -0.1891063642501831, y: 0.25098126053810116 });
+    const tr = planShot(topRight, { targetId: 'b1', stroke: { power: 1, side: 0, vert: -0.4 } }, P, { record: false });
+    const m = RANGE.exec(tr.warnings.find((x) => x.code === 'too-soft')!.message)!;
+    expect(m).not.toBeNull();
+    const at = planShot(topRight, { targetId: 'b1', pocketId: tr.pocketId, stroke: { power: Number(m[1]), side: 0, vert: -0.4 } }, P, { record: false });
+    expect(at.obPocketed && !at.scratch).toBe(true);
+    expect(at.warnings.filter((x) => x.code !== 'frozen').map((x) => x.code)).toEqual([]);
+  });
+
+  it('advice: false (searches) keeps every code and outcome, and gives no power figure', () => {
+    const lay = frozenLayout({ x: -0.2451160266459315, y: 0.23962167347191393 }, { x: -0.1891063642501831, y: 0.25098126053810116 });
+    for (const vert of [-0.4, 0, 0.4]) {
+      const full = planShot(lay, { targetId: 'b1', stroke: { power: 1, side: 0, vert } }, P, { record: false });
+      const quick = planShot(lay, { targetId: 'b1', stroke: { power: 1, side: 0, vert } }, P, { record: false, advice: false });
+      expect(quick.warnings.map((x) => x.code)).toEqual(full.warnings.map((x) => x.code));
+      expect([quick.obPocketed, quick.scratch, quick.cueRest]).toEqual([full.obPocketed, full.scratch, full.cueRest]);
+      expect(quick.warnings.find((x) => x.code === 'too-soft')?.message).toMatch(/^(Too soft — object ball stops short|Very soft — the object ball only just drops; any roll-off will miss)\.$/);
+    }
+  });
+});
+
 describe('coaching words (merge review)', () => {
   const base = { cutDeg: 30, contact: 'short' as const, throwDeg: 0, throwShiftMm: 0, squirtDeg: 0, side: 0, scratch: false, blocked: false, makeable: true, cbReachesOb: false };
   it('a cue ball that never arrives: the tip names the ball, as the cb-short warning does', () => {

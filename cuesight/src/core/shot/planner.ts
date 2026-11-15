@@ -17,6 +17,9 @@
  *    angle, so the error is not monotonic), refined around the best sample.
  * 5. Full simulation on the real layout → paths, rest positions, scratch/kiss/miss warnings, and
  *    'cb-short' (the cue ball never gets to the object ball) or 'too-soft', checked against it.
+ *    Frozen CB too soft: the stroke angle (and so the minimum) moves with the power, so the advice
+ *    re-plans the stroke at each half step above and quotes only powers that pot it with pace and
+ *    keep the cue ball up, or says none does (PlanOptions.advice: false skips this for searches).
  * 6. Coaching in player language: the tip, the stroke's name, the direction of the throw shift.
  */
 import { straightLineState, throwAngle } from '../physics/analytic';
@@ -43,7 +46,7 @@ import { coachingTip, contactSpinOf, difficultyOf, strokeName, type ContactSpin,
 import { cutAngle, cutSide, fractionOf, ghostBall, contactPoint } from './geometry';
 import { pathBlockers } from './obstruction';
 import { mouthIntersect, pocketWindow, type PocketWindow } from './pocket-window';
-import { advisePower, POWER_SPEEDS, powerFigure, powerToSpeed } from './power';
+import { advisePower, POWER_ADVICE_STEP, POWER_SPEEDS, powerFigure, powerToSpeed } from './power';
 
 export const MAX_CUT_DEG = 88;
 export const THIN_CUT_DEG = 80;
@@ -70,6 +73,12 @@ const FROZEN_MAX_STROKE = rad(60);
 const FROZEN_SCAN_STEP = rad(2.5);
 /** Frozen CB: refinement probes around the best scan sample. */
 const FROZEN_REFINE = 8;
+/**
+ * Frozen CB, a stroke too soft at the played power: bisection steps for the lowest power that works
+ * below the first half step that does (precision POWER_ADVICE_STEP / 2^3 ≈ 0.06 of a power).
+ * A resolution choice for the minimum the app shows, not a physical constant.
+ */
+const FROZEN_MIN_BISECT = 3;
 
 /**
  * Largest throw (rad) the model gives a frozen OB with a centre-ball stroke at CB speed `v`: the
@@ -441,6 +450,14 @@ export interface PlanOptions {
    */
   aimErrorRad?: number;
   actualSquirtMassRatio?: number;
+  /**
+   * Work out the power to advise for a frozen cue ball the plan calls too soft (default true): the
+   * stroke is re-planned at each half step above the played power (≈ 20–30 ms in all, against
+   * ≈ 1 ms for the plan itself). Searches that read only the warning codes (the position search,
+   * suggestions) pass false: the warning keeps its code and gives no power figure, and minPower
+   * stays the minimum for the stroke angle at the played power.
+   */
+  advice?: boolean;
 }
 
 export function planShot(layout: TableLayout, request: ShotRequest, params: PhysicsParams, opts: PlanOptions = {}): ShotPlan {
@@ -503,9 +520,12 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
 
   // --- Impact probes (CB + OB only: throw doesn't depend on the other balls) ---------------------
   const probeBalls: Ball[] = [cue, target];
-  /** OB departure error (rad) vs `want` with the CB launched along `dir`; NaN unless the CB hits the OB first, directly. */
-  const probe = (dir: Vec2, want: Vec2): number => {
-    const st = strikeBall(dir, speed, stroke.side, stroke.vert, R, params.squirtMassRatio);
+  /**
+   * OB departure error (rad) vs `want` with the CB launched along `dir` at speed `sp` with tip
+   * (side, vert); NaN unless the CB hits the OB first, directly.
+   */
+  const probeWith = (dir: Vec2, want: Vec2, sp: number, side: number, vert: number): number => {
+    const st = strikeBall(dir, sp, side, vert, R, params.squirtMassRatio);
     const sim = simulate(table, toInit(probeBalls, cue.id, st.vel, st.omega), params, { record: false, stopOnFirstHitOf: target.id });
     const hit = sim.firstHits[target.id];
     if (!hit || hit.other !== cue.id) return NaN;
@@ -516,6 +536,16 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     }
     return angleBetween(want, fromAngle(angleOf(hit.vel)));
   };
+  const probe = (dir: Vec2, want: Vec2): number => probeWith(dir, want, speed, stroke.side, stroke.vert);
+
+  // Frozen CB: the line of centres, the stroke-angle search at a speed and tip, and the minimum
+  // power for a stroke angle (the OB gets the CB's speed times cos(offset)). The stroke search, and
+  // the advice for a stroke that is too soft (frozenCheck below), both use them.
+  const au = angleOf(geo.aimDir);
+  const searchWith = (sp: number, side: number, vert: number): SearchResult =>
+    frozenSearch(au, (a) => probeWith(fromAngle(a), geo.window.dir, sp, side, vert));
+  const misses = (x: SearchResult) => x.residual !== null && Math.abs(x.residual) > geo.window.halfRad;
+  const minFor = (offset: number, criterion: 'capture' | 'pace', vert = powerVert) => minimumPower({ ...geo, cut: Math.abs(offset) }, { vert }, params, criterion);
 
   // --- Throw-compensated aim ----------------------------------------------------------------------
   const desired = angleOf(geo.window.dir);
@@ -534,13 +564,10 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     aimDir = norm(sub(ghost, cue.pos));
     uncompensable = r.residual !== null && Math.abs(r.residual) > geo.window.halfRad;
   } else if (geo.makeable && geo.frozen) {
-    const au = angleOf(geo.aimDir);
-    const search = () => frozenSearch(au, (a) => probe(fromAngle(a), geo.window.dir));
-    const misses = (x: SearchResult) => x.residual !== null && Math.abs(x.residual) > geo.window.halfRad;
+    const search = () => searchWith(speed, stroke.side, stroke.vert);
     let r = search();
     // The stroke angle sets the OB's share of the CB's speed (cos of the offset), so the minimum
     // power changes, and with it the default stroke: re-search once at that power.
-    const minFor = (offset: number, criterion: 'capture' | 'pace') => minimumPower({ ...geo, cut: Math.abs(offset) }, { vert: powerVert }, params, criterion);
     if (strokeSource === 'default') {
       const again = defaultStroke(minFor(r.aim - au, 'pace'));
       if (again.power !== stroke.power) {
@@ -648,9 +675,73 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   const cbShort = geo.makeable && contact.stopped && !cueHitTarget;
   // Power to advise: minPower (with pace), because the bare capture minimum is optimistic, rounded
   // UP to the half step a player can set (advisePower). One figure for every message, the tip and
-  // the app's label; played at it, none of these warnings fires (it is ≥ minPower).
-  const advised = advisePower(minPower);
+  // the app's label; played at it, none of these warnings fires (it is ≥ minPower). A frozen cue
+  // ball is checked power by power instead (frozenSoftAdvice): its stroke angle, and with it the
+  // minimum, moves with the power.
+  let advised = advisePower(minPower);
   const advise = minPower > 10 ? 'Use full power.' : `Use power ${powerFigure(advised)}+.`;
+  /**
+   * Frozen CB: this stroke's tip (side, vert) played at power q exactly as planShot plans it there:
+   * the stroke-angle search at that power, the full simulation along the angle found, and the
+   * "Very soft" test with the minimum for that angle (cb-short cannot happen: no travel to the OB,
+   * and a ball that pots is never "stops short"). ok ⇔ the plan at q pots without a too-soft
+   * warning and without a scratch (a frozen follow-through often takes the cue ball in after it).
+   * The probes alone don't decide a miss: the balls stay in contact a moment, so the full
+   * simulation can still pot a ball whose departure the probe puts outside the window.
+   */
+  const frozenCheck = (q: number, side: number, vert: number): PowerCheck => {
+    const sp = powerToSpeed(q);
+    const r = searchWith(sp, side, vert);
+    const st = strikeBall(fromAngle(r.aim), sp, side, vert, R, params.squirtMassRatio);
+    const s = simulate(table, toInit(balls, cue.id, st.vel, st.omega), params, { record: false });
+    const pots = s.final[target.id]!.pocket === geo.pocket.id;
+    const scratched = s.final[cue.id]!.pocket !== null;
+    if (!pots) return { ok: false, pace: false, scratch: scratched, pots, throwMiss: misses(r) };
+    const mp = minFor(r.aim - au, 'pace', vert);
+    const a = arrivalAt(q, { ...geo, cut: Math.abs(r.aim - au) }, vert, params);
+    const pace = !(a.obMouthSpeed < params.pocketArrivalSpeed && q < mp - 1e-6 && mp <= 10);
+    return { ok: pace && !scratched, pace, scratch: scratched, pots, throwMiss: false };
+  };
+  /**
+   * Frozen CB, a stroke too soft at the played power: every half step above it, checked in turn
+   * (frozenCheck), for the first run that pots it with pace and keeps the cue ball up, so played at
+   * any figure quoted nothing says too soft (or scratch) again. Harder throws it less, so the run
+   * can end below full power, or there can be none: then it says so instead of asking for more
+   * power and, for a stroke with spin, names the centre-ball powers that work (soft centre ball
+   * gives the most throw), if any. minPower: the lowest power that works (to 1/2^FROZEN_MIN_BISECT
+   * of a step, so advisePower of it is the first figure quoted), or 10.5 when none does. At most
+   * 18 + 19 checks, and only for a frozen stroke the card calls too soft.
+   */
+  const frozenSoftAdvice = (kind: 'short' | 'very-soft'): { text: string; minPower: number } => {
+    const above = (Math.floor(stroke.power / POWER_ADVICE_STEP + 1e-9) + 1) * POWER_ADVICE_STEP;
+    const band = powerBand(above, (q) => frozenCheck(q, stroke.side, stroke.vert));
+    if (band.lo !== null) {
+      // Between a power known to be too soft (the played one, or the step below band.lo) and band.lo.
+      let a = Math.max(stroke.power, band.lo - POWER_ADVICE_STEP);
+      let b = band.lo;
+      for (let i = 0; i < FROZEN_MIN_BISECT; i++) {
+        const m = (a + b) / 2;
+        if (frozenCheck(m, stroke.side, stroke.vert).ok) b = m;
+        else a = m;
+      }
+      const why =
+        band.end === 'throw' ? ': harder throws it less' : band.end === 'scratch' ? `: at power ${powerFigure(band.endAt!)} the cue ball follows it in` : '';
+      return { text: kind === 'short' ? `Use power ${bandText(band)}${why}.` : `Power ${bandText(band)} gives some pace${why}.`, minPower: b };
+    }
+    const spin = spinPhrase(stroke);
+    const what = `power${spin} gets it in with pace${band.paceScratch ? ' without a scratch' : ''}`;
+    const none =
+      band.end === 'throw' && band.endAt !== null
+        ? `Harder throws it less (from power ${powerFigure(band.endAt)} it misses), so no ${what}.`
+        : `No ${what}.`;
+    // No power on the scale gets this stroke there with pace: minimumPower's "not even at full power".
+    if (!spin) return { text: none, minPower: 10.5 };
+    const centre = powerBand(1, (q) => frozenCheck(q, 0, 0));
+    return {
+      text: `${none} ${centre.lo !== null ? `Centre ball gets it in ${centreText(centre)}.` : "Centre ball doesn't either."}`,
+      minPower: 10.5,
+    };
+  };
   if (cbShort)
     warnings.splice(softAt + (geo.frozen ? 1 : 0), 0, {
       code: 'cb-short',
@@ -662,6 +753,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     });
   else if (geo.makeable) {
     let soft: string | null = null;
+    let kind: 'short' | 'very-soft' | null = null;
     const slow = stroke.power < Math.max(minPower, minPowerCapture) - 1e-6;
     if (!obPocketed) {
       // The simulated OB was hit and rolled to a stop on its line: no rail, jaw or ball on the way.
@@ -671,9 +763,21 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
         obStoppedShort = !objectPath.events.some((e, i) => i > k && (e.kind === 'cushion' || e.kind === 'jaw' || e.kind === 'ball'));
       }
       if (minPowerCapture > 10) soft = 'Too far: even full power may not reach the pocket.';
-      else if (obStoppedShort && slow) soft = `Too soft — object ball stops short. ${advise}`;
-    } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10)
-      soft = `Very soft — the object ball only just drops; any roll-off will miss. Power ${powerFigure(advised)}+ gives some pace.`;
+      else if (obStoppedShort && slow) kind = 'short';
+    } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10) kind = 'very-soft';
+    if (kind) {
+      const head = kind === 'short' ? 'Too soft — object ball stops short.' : 'Very soft — the object ball only just drops; any roll-off will miss.';
+      if (geo.frozen && opts.advice === false) soft = head;
+      else if (geo.frozen) {
+        const f = frozenSoftAdvice(kind);
+        soft = `${head} ${f.text}`;
+        minPower = f.minPower;
+        // Kept ≤ minPower (its contract): at the played power's stroke angle it can be the higher of
+        // the two, but the stroke pots at minPower.
+        minPowerCapture = Math.min(minPowerCapture, minPower);
+        advised = advisePower(minPower);
+      } else soft = kind === 'short' ? `${head} ${advise}` : `${head} Power ${powerFigure(advised)}+ gives some pace.`;
+    }
     if (soft) warnings.splice(softAt + (geo.frozen ? 1 : 0), 0, { code: 'too-soft', message: soft });
   }
   const softWarned = warnings.some((w) => w.code === 'too-soft' || w.code === 'cb-short');
@@ -955,6 +1059,94 @@ function frozenSearch(au: number, errAt: (a: number) => number): SearchResult {
     }
   }
   return { aim: au + s * best.t, throwRad: e0, residual: best.e };
+}
+
+/** A stroke checked at one power (planShot's frozenCheck). */
+interface PowerCheck {
+  /** Played at this power it pots with pace (no too-soft warning) and the cue ball stays up. */
+  ok: boolean;
+  /** It pots with pace (no too-soft warning), scratch or not. */
+  pace: boolean;
+  /** The cue ball goes in. */
+  scratch: boolean;
+  /** The simulated object ball drops in the pocket (perhaps "Very soft"). */
+  pots: boolean;
+  /** It misses, and no stroke angle the probes find throws it into the window at this power. */
+  throwMiss: boolean;
+}
+
+/** The first run of half-step powers at which a stroke works (powerBand). */
+interface PowerBand {
+  /** Lowest and highest power of the run; null when no power scanned works. */
+  lo: number | null;
+  hi: number | null;
+  /**
+   * With a run: 'full' — it works up to full power; 'throw' — at `endAt`, the first power past the
+   * run, it misses for lack of throw; 'scratch' — there it pots with pace but the cue ball follows
+   * it in; 'other' — it stops working there for another reason.
+   * Without one: 'throw' — from `endAt` up to full power it never pots, and at `endAt` for lack of
+   * throw; 'other' — no such tail.
+   */
+  end: 'throw' | 'scratch' | 'full' | 'other';
+  endAt: number | null;
+  /** Without a run: some power scanned pots it with pace, but with a scratch. */
+  paceScratch: boolean;
+}
+
+/**
+ * Half-step powers from `from` up to 10, checked in order until the first run of working ones ends
+ * (all of them when none works). Not stopped at the first throw miss: the full simulation, not
+ * the probes, decides whether it pots.
+ */
+function powerBand(from: number, check: (q: number) => PowerCheck): PowerBand {
+  let lo: number | null = null;
+  let hi: number | null = null;
+  let missFrom: number | null = null; // start of the run of non-potting powers that began with a throw miss
+  let paceScratch = false;
+  const n = Math.floor((10 - from) / POWER_ADVICE_STEP + 1e-9);
+  for (let k = 0; k <= n; k++) {
+    const q = from + k * POWER_ADVICE_STEP;
+    const c = check(q);
+    if (c.ok) {
+      if (lo === null) lo = q;
+      hi = q;
+      continue;
+    }
+    if (lo !== null) return { lo, hi, end: c.throwMiss ? 'throw' : c.pace && c.scratch ? 'scratch' : 'other', endAt: q, paceScratch };
+    if (c.pace && c.scratch) paceScratch = true;
+    if (c.pots) missFrom = null;
+    else if (missFrom === null && c.throwMiss) missFrom = q;
+  }
+  if (lo !== null) return { lo, hi, end: 'full', endAt: null, paceScratch };
+  return { lo, hi, end: missFrom !== null ? 'throw' : 'other', endAt: missFrom, paceScratch };
+}
+
+/** "4.5", "4.5–5.5" (the run ends below full power) or "4.5+" (it works up to full power). */
+function bandText(b: PowerBand): string {
+  const lo = powerFigure(b.lo!);
+  if (b.hi === b.lo) return lo;
+  return b.end === 'full' ? `${lo}+` : `${lo}–${powerFigure(b.hi!)}`;
+}
+
+/**
+ * The centre-ball alternative's powers: "at power 2.5", "at power 2.5–4" or "from power 2.5 up" (not
+ * "2.5+", the form the advice uses for the player's own stroke).
+ */
+function centreText(b: PowerBand): string {
+  const lo = powerFigure(b.lo!);
+  if (b.hi === b.lo) return `at power ${lo}`;
+  return b.end === 'full' ? `from power ${lo} up` : `at power ${lo}–${powerFigure(b.hi!)}`;
+}
+
+/** " with this draw" / " with this follow" / " with this side spin" / " with this spin"; "" for centre ball (strokeName's 0.04 R thresholds). */
+function spinPhrase(s: Stroke): string {
+  const side = Math.abs(s.side) >= 0.04;
+  const low = s.vert <= -0.04;
+  const high = s.vert >= 0.04;
+  if (side && (low || high)) return ' with this spin';
+  if (low) return ' with this draw';
+  if (high) return ' with this follow';
+  return side ? ' with this side spin' : '';
 }
 
 /**

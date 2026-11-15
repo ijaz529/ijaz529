@@ -215,7 +215,8 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const t0 = cap !== undefined ? performance.now() : 0;
   let timedOut = false;
   const maxEvaluations = Math.max(0, Math.floor(opts.maxEvaluations ?? FULL_EVALUATIONS));
-  const base = planShot(layout, { targetId: request.targetId, ...(request.pocketId ? { pocketId: request.pocketId } : {}) }, params, { record: false });
+  // advice: false — the search reads warning codes only, never the wording (PlanOptions.advice).
+  const base = planShot(layout, { targetId: request.targetId, ...(request.pocketId ? { pocketId: request.pocketId } : {}) }, params, { record: false, advice: false });
   const pocketId = base.pocketId;
   const landing = opts.landing ?? request.landing;
   let evaluated = 0;
@@ -255,7 +256,7 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
 
   const evaluate = (stroke: Stroke): Scored | null => {
     evaluated++;
-    const plan = planShot(layout, { targetId: request.targetId, pocketId, stroke }, params, { record: false });
+    const plan = planShot(layout, { targetId: request.targetId, pocketId, stroke }, params, { record: false, advice: false });
     if (!plan.obPocketed || plan.scratch || !plan.cueRest) {
       opts.onEvaluate?.(stroke, null);
       return null;
