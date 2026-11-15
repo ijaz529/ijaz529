@@ -122,8 +122,8 @@ own.
 - [X] T043 [US2] Implement the rectify-at-ball-height, disk/ring scoring, NMS, centroid refinement and cue-ball classification in `src/vision/ball-detect.ts`
 - [X] T044 [P] [US2] Unit tests for the tracker (EMA smoothing, association, lock state machine per data-model.md) in `tests/unit/vision/tracker.test.ts`
 - [X] T045 [US2] Implement `createTracker` in `src/vision/tracker.ts`
-- [X] T046 [US2] Integration tests for the end-to-end `processFrame` on synthetic scenes against the accuracy contract, printing per-scene errors, in `tests/integration/pipeline.test.ts`
-- [X] T047 [US2] Implement `processFrame` with pipeline state and manual-corner support in `src/vision/pipeline.ts`
+- [X] T046 [US2] Integration tests for the end-to-end pipeline (`createPipeline().process`) on synthetic scenes against the accuracy contract, printing per-scene errors, in `tests/integration/pipeline.test.ts`
+- [X] T047 [US2] Implement `createPipeline` (pipeline state, manual-corner support) in `src/vision/pipeline.ts`. The task text said `processFrame`; no function of that name was ever built
 - [X] T048 [US2] Implement the vision worker adapter (transfer buffers, error replies) in `src/workers/vision.worker.ts`
 - [X] T049 [US2] Implement camera capture (rear camera, permission errors, backpressured downscaled frames, video → display mapping) in `src/app/camera.ts`
 - [X] T050 [US2] Implement the perspective AR overlay (table outline, ball rings, plan via H0, ghost ball via HR, pocket hit targets, lock indicator) in `src/app/render/overlay.ts`
@@ -174,7 +174,7 @@ own.
   - an unreachable spot reports `reachable = false` with a safe alternative
   - the default recommendation improves next-shot quality over centre-ball
   - the heatmap is normalised to 0..1 and is higher near the next ball's natural line
-- [X] T061 [US5] Implement `recommendStroke` (grid search, robustness re-sim, scratch rejection, time budget) and `positionHeatmap` in `src/core/shot/position.ts`
+- [X] T061 [US5] Implement `recommendStroke` (grid search, robustness re-sim, scratch rejection, budget) and `positionHeatmap` in `src/core/shot/position.ts`. The original wall-clock budget broke Principle III; T072 replaced it with a deterministic evaluation count
 - [X] T062 [US5] Add the planner worker's `recommend` and `heatmap` handlers in `src/workers/planner.worker.ts`
 - [X] T063 [US5] Implement Position mode (tap landing spot), the default-recommendation refresh, and heatmap rendering and toggle in `src/app/main.ts` and `src/app/render/table-view.ts`
 
@@ -184,10 +184,51 @@ own.
 
 - [X] T064 [P] Implement the settings sheet (table preset, cloth speed, cushion bounce, shaft type, cushion width, FOV, details toggle) in `src/app/ui/controls.ts`
 - [X] T065 [P] Register the service worker in production builds and add offline handling in `src/app/main.ts`
-- [X] T066 [P] Add a performance guard test (planShot 22 balls < 50 ms; vision frame 640×480 < 100 ms in node) in `tests/integration/perf.test.ts`
+- [X] T066 [P] Add performance guard tests against the device budgets (plan < 50 ms, vision < 100 ms, position search < 1.5 s), each with a stated CI factor, and print the measured medians:
+  - `tests/integration/perf.test.ts`: planShot, 22 balls, median of 5 < 100 ms; recommendStroke, median < 3 s; suggestions on 9 balls < 2 s
+  - `tests/integration/pipeline.test.ts`: vision pipeline at 640×480, median < 150 ms
+  - `tests/integration/pipeline-420.test.ts`: the 4:2:0 rack frame < 250 ms, with ball detection ≤ 2.25× the fixture frame's
+  - The original text claimed "< 50 ms" and "< 100 ms" guards, but the only assertion was 250 ms (review finding `tests-looser-than-claimed`)
 - [X] T067 [P] Write `README.md`: what it is, run/test, architecture, "How accurate is this?", limitations, roadmap
-- [X] T068 Accessibility pass (touch targets ≥ 44 px, aria labels, colour-blind-safe redundancy) in `src/app/styles.css` and the UI modules
-- [X] T069 Run the quickstart validation (Q1–Q15) plus screenshots, and run `/speckit-analyze`. Fix inconsistencies
+- [ ] T068 Accessibility pass (touch targets ≥ 44 px, aria labels, colour-blind-safe redundancy) in `src/app/styles.css` and the UI modules. **Reopened 2026-11-15**: ball hit targets on the mini-map, overlay and 3D view, and the settings fields, are below 44 px on `fix/wave1` (review findings `touch-targets-under-44px`, `a11y-touch-targets-aria`). Close it when the wave-2 app-ui fix (`fix2a/ui`) lands with its e2e check
+- [X] T069 Run the quickstart validation (Q1–Q15) plus screenshots, and run `/speckit-analyze`. Fix inconsistencies. That analysis missed the drift the review found; see T077
+
+---
+
+## Phase 9: Review fixes (2026-11-15)
+
+**Input**: the deep code review of HEAD 95d197b (86 findings: 83 confirmed, 3 rejected), grouped into
+fix packages. Details, finding ids and what is still open: analysis.md "Post-review". The code
+packages ran under the test-first rule (Principle III): their regression tests come from each
+finding's test spec, and the commit messages record the evidence.
+
+**Wave 1** (integrated on `fix/wave1`):
+
+- [X] T070 [P] Physics: the cushion impulse acts on the full contact slip, so a rail changes top/back spin (R-08). The contact budget never skips a collision (relax sweeps, guarded drift). No per-step allocation and no `Math.hypot` in the step loop. `pocketArrivalSpeed` ASSUMPTION note. Squirt pinned to TP A.31. Files: `src/core/physics/collide.ts`, `simulate.ts`, `params.ts`; `tests/unit/core/collide.test.ts`, `simulate.test.ts`, `analytic.test.ts`
+- [X] T071 [P] Vision geometry: truncated or absent tables return `null`. Adaptive refine band; quad validation; conditioned focal estimate and a stable long/short and 0°/180° frame; grey cloth; manual corners are honest (`reason`), with relative edge alignment. Anchored lock against occluders, cloth-change hysteresis, ids unique across reconfiguration, 2R separation. Files: `src/vision/table-detect.ts`, `calibration.ts`, `homography.ts`, `pipeline.ts`, `tracker.ts`; `tests/unit/vision/calibration.test.ts`, `table-detect.test.ts`, `tracker.test.ts`, `manual-cloth.test.ts`, `tests/integration/pipeline-live.test.ts`
+- [X] T072 [P] Core shot: rail-frozen, frozen-cue-ball and corner-hanger shots planned (R-09). Snooker touching-ball rule. Throw search stays off the rail (`throw-uncompensable`). The "too soft" warning agrees with the simulation (`minPower` / `minPowerCapture`). Honest squirt and throw text (`cueAimDir`, `throwShiftDir`). Fraction labels in eighths with qualifiers. Blocked shots name another pocket. Deterministic worst-case position search (R-11), and a heatmap of zeros for the cue ball or target. Suggestions add next-shot quality. Files: `src/core/shot/*`, `src/core/types.ts`, `src/workers/planner.worker.ts`; `tests/integration/planner-edge.test.ts`, `position.test.ts`, `planner.test.ts`, `perf.test.ts`, `tests/unit/core/coach.test.ts`, `suggest.test.ts`, `geometry.test.ts`, `pocket-window.test.ts`
+- [X] T073 [P] Vision balls: honest cue pick (no cue when ambiguous). Disc-model cluster split, cloth-hued balls, glare and stick shape gate, pocket hangers, colour names (pool and snooker palettes, neutral `ball`), module scratch reused (Principle IV). Files: `src/vision/ball-detect.ts`, `src/vision/synth/render.ts`; `tests/unit/vision/ball-detect-edge.test.ts`, `ball-detect.test.ts`, `tests/integration/pipeline-420.test.ts`
+- [ ] T074 Vision balls robustness: make the disc-fit ball count stable under ±0.3 px calibration jitter, and make the touching-cluster tests check a set of jittered calibrations. **6 tests in `ball-detect-edge.test.ts` fail on `fix/wave1`**: 9-ball corner, 15-ball side, snooker end, side and corner, and 4:2:0 corner pairs at 30°. They are not weakened. Blocks Gate 3
+- [X] T075 Integration of wave 1 (`f81ad62`): the pipeline-420 guard times the ball-detection stage. The exact-calibration 640×360 case learns the cloth inside the known outline. `player-view` ignores a neutral cloth hint
+- [X] T076 [P] Docs, 001: the spec, plan, research, data model, contracts, quickstart and tasks describe the reviewed code (this revision)
+- [X] T077 Re-run the `/speckit-analyze` cross-checks and record them in analysis.md "Post-review"
+
+**Wave 2** (open on `fix/wave1`; in progress on the `fix2a/*` branches, then merged with T074 in wave 2b):
+
+- [ ] T078 App core (`src/app/main.ts`, camera, planner client):
+  - selections survive tracker id churn;
+  - live plan and overlay only while locked (2-result grace);
+  - frozen overlay needs the same ordered frame; Mark cue works on a frozen layout;
+  - "Tap the cue ball" when no ball `isCue`;
+  - stale planner replies dropped; worker failures surfaced; one camera stream;
+  - Position-mode taps; Zones refuses the cue ball and the target;
+  - the app reads `fragile`, `timedOut`, `reason`, `cueAimDir`, `throwShiftDir`, `minPowerCapture` and the frozen-plan conventions;
+  - grey cloth rendered grey (`fix2a/live`)
+- [ ] T079 App UI: settings dialog commit and validation, focus-safe re-renders, 44 px targets (closes T068), card texts (no "±-2.1 mm", throw direction), settings presets with source/ASSUMPTION notes (`fix2a/ui`)
+- [ ] T080 PWA: safe service-worker update for an open page, full precache with a build-level guard (`fix2a/platform`)
+- [ ] T081 Docs, README and 002: known limitations (cushion model, cue ball not marked when ambiguous, green on green, clusters), the v2 protocol contract, 002 quickstart (listed in analysis.md "Post-review")
+- [ ] T082 Decide the "tip" unit (¼ R vs a tip-width) and fix the "2 tip" plural (analysis.md P-F2)
+- [ ] T083 [P] Add an automated check for FR-007 (mark the cue ball, live and frozen); today it is manual (quickstart Q16)
 
 ---
 
@@ -201,6 +242,9 @@ own.
 - **US4** depends on US1 (planner) and adds the planner worker.
 - **US5** depends on US1 and US3, and on the planner worker from US4.
 - **Polish** comes last.
+- **Review fixes** (Phase 9): wave-1 packages T070–T073 touch disjoint files and run in parallel,
+  physics first for the merge. Wave 2 (T078–T081) consumes wave 1's new optional fields, and T074
+  must land before Gate 3 can pass.
 
 ```text
 Setup → Foundational ─┬─> US1 ─┬─> US3 ─┐
