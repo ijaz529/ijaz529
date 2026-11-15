@@ -836,8 +836,8 @@ interface Found {
   /** Share of the predicted silhouette that nearer balls hide (counted in `complete`). */
   occ: number;
   /**
-   * Whether the ball's rim against known cloth leaves a pair of opposite rim directions hidden (by
-   * nearer balls, touching neighbours or unknown pixels): only then can a stripe's band, which reaches
+   * Whether other balls (nearer balls, touching neighbours) wall in a pair of opposite rim directions
+   * (rim against known cloth or unknown pixels is open): only then can a stripe's band, which reaches
    * the rim at two opposite points, be out of sight (see enclosedRim).
    */
   enclosed: boolean;
@@ -1032,14 +1032,16 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
   // shows only its caps, lit toward the camera, and reads whiter than the real cue ball whose camera
   // side is in shade; on video the rest of a band between two touching neighbours blends into its caps).
   // A band reaches the silhouette's rim at two opposite points, so it can be out of sight only where
-  // the ball's rim against the cloth leaves an opposite pair hidden (enclosed: walled in by nearer balls
-  // and touching neighbours, as in a pack's back row). Such a ball is ambiguous: its whiteness is no
-  // evidence for or against any other ball, so the cue is chosen among the unambiguous candidates (a
-  // cue ball partly behind one object ball is one) with the margin over them; an ambiguous one is the
-  // cue only when no other ball that could be the cue ball is white: whole and shaded (within
-  // CUE_FILL_SLACK of the threshold). A stripe whose band reads as cloth is not one: a cue ball frozen
-  // between two touching balls (an opposite pair hidden by the contacts) next to a green stripe on green
-  // cloth reading white-ish went unflagged in 127 of 324 runs, and Live asked for taps.
+  // other balls wall in an opposite pair of rim directions (enclosed: nearer balls and touching
+  // neighbours, as in a pack's back row; a cushion or the frame edge does not, so a cue ball frozen to
+  // an object ball just inside a cushion stays in the comparison). Such a ball is ambiguous: its
+  // whiteness is no evidence for or against any other ball, so the cue is chosen among the unambiguous
+  // candidates (a cue ball partly behind one object ball is one) with the margin over them; an
+  // ambiguous one is the cue only when no other ball that could be the cue ball is white: whole and
+  // shaded (within CUE_FILL_SLACK of the threshold). A stripe whose band reads as cloth is not one: a
+  // cue ball frozen between two touching balls (an opposite pair hidden by the contacts) next to a
+  // green stripe on green cloth reading white-ish went unflagged in 127 of 324 runs, and Live asked
+  // for taps.
   let best = -1;
   let second = -1;
   let amb = -1;
@@ -1706,12 +1708,17 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
   if (kArea >= 3 && elong > 6) return; // a rail band / cue stick, not balls
 
   // Silhouette edge points: faces between a blob pixel and known cloth. Faces against unknown pixels
-  // (throat hole, frame edge, stripped stick) are not silhouette and mark the blob as truncated.
+  // (throat hole, frame edge, stripped stick) are not silhouette and mark the blob as truncated. Those
+  // against unknown pixels proper (a near cushion's shadow, a throat, the frame edge; not a stripped
+  // stick) are also kept, from the top of the edge buffer down (nOpen of them): there the rim is not
+  // walled in by a ball (enclosedRim).
   let faces = 0;
   let truncFaces = 0;
   let nEdge = 0;
+  let nOpen = 0;
   growEdge(S, cnt * 2 + 8);
-  const { edge } = S;
+  const { edge, unknown } = S;
+  const ecap = edge.length >> 1;
   for (let q = 0; q < cnt; q++) {
     const k = queue[start + q]!;
     const i = k % w;
@@ -1721,17 +1728,17 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
       const jj = nb === 2 ? j - 1 : nb === 3 ? j + 1 : j;
       if (ii >= 0 && jj >= 0 && ii < w && jj < h && label[jj * w + ii] === lab) continue;
       faces++;
-      if (ii < 0 || jj < 0 || ii >= w || jj >= h || !knownCloth(S, jj * w + ii)) {
-        truncFaces++;
-        continue;
-      }
-      if (nEdge >= S.ecap) continue;
+      const inGrid = ii >= 0 && jj >= 0 && ii < w && jj < h;
+      const cloth = inGrid && knownCloth(S, jj * w + ii);
+      if (!cloth) truncFaces++;
+      if (!cloth && !(inGrid && unknown[jj * w + ii])) continue;
+      if (nEdge + nOpen >= ecap) continue;
       // Face midpoint, in de-stretched coordinates about the blob centroid.
       const fx = (i + ii) / 2 + 0.5 - cx;
       const fy = (j + jj) / 2 + 0.5 - cy;
-      edge[nEdge * 2] = (fx * ax + fy * ay) * sinEl;
-      edge[nEdge * 2 + 1] = fx * bx + fy * by;
-      nEdge++;
+      const e = cloth ? nEdge++ : ecap - 1 - nOpen++;
+      edge[e * 2] = (fx * ax + fy * ay) * sinEl;
+      edge[e * 2 + 1] = fx * bx + fy * by;
     }
   }
   const truncated = faces > 0 && truncFaces / faces > TRUNC_FRAC;
@@ -1866,7 +1873,7 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
     if ((k > 1 || truncated) && !wideAcross(ctx, xr, yr, ax, ay, sinEl)) continue;
     pos.x = Math.max(-(table.length / 2 - ctx.R), Math.min(table.length / 2 - ctx.R, pos.x));
     pos.y = Math.max(-(table.width / 2 - ctx.R), Math.min(table.width / 2 - ctx.R, pos.y));
-    describe(ctx, start, cnt, m, n, a1, pos, lab, own, FILL.tot > 0 ? occ / FILL.tot : 0, k > 1 && enclosedRim(S.edge, nEdge, k, m, rad));
+    describe(ctx, start, cnt, m, n, a1, pos, lab, own, FILL.tot > 0 ? occ / FILL.tot : 0, k > 1 && enclosedRim(S.edge, nEdge, nOpen, k, m, rad));
   }
 }
 
@@ -1888,19 +1895,35 @@ const ENC2 = new Uint8Array(ENC_BINS);
 /**
  * Could a stripe's band be out of sight on ball m of a k-ball fit? A band (a belt about a great
  * circle) reaches the silhouette's rim at two opposite points, so it can be hidden only if two
- * opposite rim arcs, each about a band end wide, show no silhouette edge against known cloth (they are
- * behind nearer balls, against touching neighbours, or unknown). The edge faces (edge[0..nEdge),
- * de-stretched about the blob centroid) nearest to m's centre (CENT) and within 1.5 radii of it are
- * binned by direction; single-bin gaps between visible bins (sampling: about one face per px of rim)
- * count as visible and single visible bins between hidden ones (a crevice pixel) as hidden. Enclosed:
- * at least ENC_MIN consecutive directions are hidden together with their opposite.
+ * opposite rim arcs, each about a band end wide, are walled in by other balls: behind nearer balls or
+ * against touching neighbours, as in a pack, where on video the band's ends also blend into those
+ * balls' colours. The edge faces against known cloth (edge[0..nEdge)) and against unknown pixels
+ * (edge[ecap − nOpen..ecap): a near cushion's shadow, a pocket throat, the frame edge), de-stretched
+ * about the blob centroid, nearest to m's centre (CENT) and within 1.5 radii of it are binned by
+ * direction: both kinds of rim are open (no ball walls them in). Single-bin gaps between open bins
+ * (sampling: about one face per px of rim) count as open and single open bins between walled ones (a
+ * crevice pixel) as walled. Enclosed: at least ENC_MIN consecutive directions are walled in together
+ * with their opposite.
+ * Unknown rim counts as open because a cushion is no ball: a cue ball 2–8 mm inside a near cushion and
+ * frozen to an object ball has its lower rim in the cushion's shadow and an opposite arc against the
+ * frozen ball. Counted as hidden, that made the real cue ambiguous (out of the comparison), and a
+ * maroon stripe reading 0.04–0.18 white (the cue 0.21–0.45) was flagged as the cue in 120 of 1920 runs
+ * (the cue frozen near each rail, green and blue cloth, five views, RGB and YUV 4:2:0, auto, exact and
+ * 2 jittered calibrations); counted as open, in none, and the real cue is flagged in 1853 (wave-1
+ * detector 1850). The rack's white back-row stripes are walled in by balls alone (none of the 118
+ * ambiguous ones in the cue-beside-a-rack runs touches unknown pixels). A cloth-hued stripe frozen near
+ * a rail in place of the cue (green on green, blue on blue; the cue at four far spots or absent; five
+ * views, RGB, YUV and bilinear 4:2:0, auto and exact: 5760 runs) is flagged in the same 46 runs whether
+ * unknown rim is open or hidden (wave-1 detector 43): there the band reads as cloth, a separate limit.
  */
-function enclosedRim(edge: Float64Array, nEdge: number, k: number, m: number, rad: number): boolean {
+function enclosedRim(edge: Float64Array, nEdge: number, nOpen: number, k: number, m: number, rad: number): boolean {
   ENC.fill(0);
   const cu = CENT[m * 2]!;
   const cv = CENT[m * 2 + 1]!;
   const lim = 2.25 * rad * rad;
-  for (let e = 0; e < nEdge; e++) {
+  const top = edge.length / 2 - 1;
+  for (let f = 0; f < nEdge + nOpen; f++) {
+    const e = f < nEdge ? f : top - (f - nEdge);
     const x = edge[e * 2]!;
     const y = edge[e * 2 + 1]!;
     const du = x - cu;
@@ -1921,7 +1944,7 @@ function enclosedRim(edge: Float64Array, nEdge: number, k: number, m: number, ra
   const n = ENC_BINS;
   for (let i = 0; i < n; i++) ENC2[i] = ENC[i]! || (ENC[(i + n - 1) % n]! && ENC[(i + 1) % n]!) ? 1 : 0;
   for (let i = 0; i < n; i++) ENC[i] = ENC2[i]! && (ENC2[(i + n - 1) % n]! || ENC2[(i + 1) % n]!) ? 1 : 0;
-  // Longest circular run of directions hidden together with their opposite (pairs i, i + n/2).
+  // Longest circular run of directions walled in together with their opposite (pairs i, i + n/2).
   const h = n / 2;
   let run = 0;
   let best = 0;

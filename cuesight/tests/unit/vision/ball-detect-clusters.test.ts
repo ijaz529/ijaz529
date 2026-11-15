@@ -2,11 +2,12 @@
  * Touching clusters beyond ball-detect-edge's 16 scenes (spec 001 SC-003 and edge cases; Constitution
  * II, III): the mirrored snooker corner view, 3-ball rows end-on in the corner view, snooker packs on
  * 4:2:0 video, packs under exposure, cloth noise and a moved lamp, and which ball is flagged as the cue
- * beside a rack. Calibrations: the table detector's (auto), the camera's exact one, and exact corners
- * jittered as calibration error (ball-detect-helpers JITTER, or the subset named per test).
+ * beside a rack, partly behind or frozen to object balls, and frozen to one just inside a cushion.
+ * Calibrations: the table detector's (auto), the camera's exact one, and exact corners jittered as
+ * calibration error (ball-detect-helpers JITTER, or the subset named per test).
  */
 import { describe, expect, it } from 'vitest';
-import type { SynthCamera, SynthScene } from '../../../src/vision/synth/render';
+import type { RGB, SynthCamera, SynthScene } from '../../../src/vision/synth/render';
 import type { Frame } from '../../../src/vision/image';
 import {
   ALL_POSES,
@@ -25,6 +26,7 @@ import {
   gain,
   mk,
   nearestTruth,
+  pool9,
   rack,
   render,
   rowAt,
@@ -372,5 +374,77 @@ describe('cue ball frozen between two touching object balls, a green stripe on t
       .filter(([k, v]) => real[k]! < v)
       .map(([k, v]) => `${k}°: ${real[k]} < ${v}`);
     expect(short, short.join('\n')).toEqual([]);
+  }, 180_000);
+});
+
+describe('cue ball 2–8 mm from a rail, frozen to an object ball, stripes elsewhere', () => {
+  // The cue ball 2 or 8 mm inside each of the four cushions, frozen to a red stripe at −60°, 0° or
+  // +60° from the cushion's inward normal, with up to five more balls elsewhere (a maroon stripe beside
+  // the −x −y corner pocket, green, yellow and blue stripes, a red), on green and on blue cloth. Inside
+  // a near cushion the cushion hides the cue ball's lower rim (unknown pixels) and the frozen ball an
+  // opposite arc. The release candidate called such a ball walled in (a band could be out of sight)
+  // and left it out of the comparison, so the maroon stripe (white 0.04–0.18 against the real cue's
+  // 0.21–0.45) was flagged as the cue: 120 of the 1920 runs of the full sweep (these three views plus
+  // overhead and the opposite corner), all in the corner view (real cue there 261 of 384); the wave-1
+  // detector none. A cushion is no ball: its shadow now leaves the rim open. Per view (4 rails × 2 gaps
+  // × 3 angles × 2 cloths, RGB and YUV 4:2:0, auto, exact and 2 jittered calibrations: 384 runs): never
+  // an object ball, and the real cue at least as often as by the wave-1 detector (end 353, side 384,
+  // corner 352; this detector the same) less a tolerance of 4 runs (1 %).
+  const t = pool9;
+  const R = R9;
+  const L = t.length / 2;
+  const W = t.width / 2;
+  const OTHERS = [
+    { pos: { x: -1.19, y: -0.589 }, color: C.maroon!, stripe: true },
+    { pos: { x: 0.93, y: 0.196 }, color: C.green!, stripe: true },
+    { pos: { x: 0.25, y: 0.3 }, color: C.yellow!, stripe: true },
+    { pos: { x: 0.69, y: -0.4 }, color: C.red! },
+    { pos: { x: -0.38, y: -0.14 }, color: C.blue!, stripe: true },
+  ];
+  // Rail: a point on the cushion nose line and the inward normal.
+  const RAILS: [string, number, number, number, number][] = [
+    ['-y', -0.36, -W, 0, 1],
+    ['+y', 0.4, W, 0, -1],
+    ['-x', -L, 0.15, 1, 0],
+    ['+x', L, -0.2, -1, 0],
+  ];
+  const BLUE: RGB = [35, 75, 160];
+  const WAVE1: Record<string, number> = { end: 353, side: 384, corner: 352 };
+  const TOL = 4;
+  it.each(['end', 'side', 'corner'] as Pose[])('%s view: never an object ball, the real cue at least as often as by wave-1 less 1 % (green and blue cloth, RGB and YUV 4:2:0, auto, exact and 2 jittered calibrations)', async (pose) => {
+    const wrong: string[] = [];
+    const none: string[] = [];
+    let real = 0;
+    let runs = 0;
+    for (const cloth of [undefined, BLUE])
+      for (const [rail, px, py, nx, ny] of RAILS)
+        for (const gap of [0.002, 0.008])
+          for (const ang of [-60, 0, 60]) {
+            const cue = { x: px + nx * (R + gap), y: py + ny * (R + gap) };
+            const a = Math.atan2(ny, nx) + (ang * Math.PI) / 180;
+            const fz = { x: cue.x + (2 * R + 0.0002) * Math.cos(a), y: cue.y + (2 * R + 0.0002) * Math.sin(a) };
+            const clear = (p: { x: number; y: number }) => Math.hypot(p.x - cue.x, p.y - cue.y) > 0.15 && Math.hypot(p.x - fz.x, p.y - fz.y) > 0.15;
+            const sc = mk('pool9', POSES[pose]!, [{ pos: cue, color: C.cue! }, { pos: fz, color: C.red!, stripe: true }, ...OTHERS.filter((o) => clear(o.pos))], cloth ? { cloth } : {});
+            const f = render(sc);
+            for (const [nm, frame] of [
+              ['RGB', f],
+              ['YUV', yuv420(f)],
+            ] as const)
+              for (const c of calibrationSet(sc, [[0.3, 2, 58000]])) {
+                const r = detectWith(sc, frame, c);
+                const ci = cueIndex(r);
+                const tag = `${cloth ? 'blue' : 'green'} ${rail} gap ${gap * 1000} mm frozen ${ang}° ${nm} ${c.name}`;
+                runs++;
+                if (ci === 0) real++;
+                else if (ci === -1) none.push(tag);
+                else wrong.push(`${tag}: ${ci} (${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')})`);
+              }
+            // Long synchronous sweep: let the worker answer vitest's RPC between scenes.
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          }
+    console.log(`${pose}: real cue flagged in ${real} of ${runs} (wave-1 ${WAVE1[pose]}), wrong ball ${wrong.length}; none in ${none.length}: ${none.slice(0, 12).join(', ') || '-'}`);
+    expect(runs).toBe(384);
+    expect(wrong, wrong.join('\n')).toEqual([]);
+    expect(real).toBeGreaterThanOrEqual(WAVE1[pose]! - TOL);
   }, 180_000);
 });
