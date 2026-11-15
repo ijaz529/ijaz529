@@ -58,7 +58,11 @@ const TYPES: Record<string, string> = {
   '.webmanifest': 'application/manifest+json',
 };
 
-/** Serves whatever directory `site.dir` names, like a static host; everything else is a 404. */
+/**
+ * Serves whatever directory `site.dir` names, like a static host; everything else is a 404. Every file is sent
+ * with `Cache-Control: max-age=600`, as GitHub Pages (the host README.md suggests) does, so the browser's HTTP
+ * cache still holds the previous build's index.html, icons, manifest and photos when the new build installs.
+ */
 async function serve(site: { dir: string }): Promise<{ server: Server; origin: string; notFound: string[] }> {
   const notFound: string[] = [];
   const server = createServer((req, res) => {
@@ -69,7 +73,7 @@ async function serve(site: { dir: string }): Promise<{ server: Server; origin: s
       res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
       return;
     }
-    res.writeHead(200, { 'content-type': TYPES[extname(file)] ?? 'application/octet-stream', 'cache-control': 'no-cache' });
+    res.writeHead(200, { 'content-type': TYPES[extname(file)] ?? 'application/octet-stream', 'cache-control': 'max-age=600' });
     res.end(readFileSync(file));
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -172,6 +176,12 @@ test.describe('a deploy while the app is open @offline @chromium-only', () => {
 
       site.dir = dirB; // deploy B on the same origin
       await checkForUpdate(page);
+      // B is installed and waits: it has not taken the open page over by itself.
+      const lifecycle = await page.evaluate(async () => {
+        const reg = (await navigator.serviceWorker.getRegistration())!;
+        return { waiting: reg.waiting?.state ?? null, takenOver: (window as unknown as Win).__ctlChanged === true };
+      });
+      expect(lifecycle, 'the new worker waits instead of taking over the open page').toEqual({ waiting: 'installed', takenOver: false });
 
       // The page opened on A still works: its workers and the sample photo load (from A's precache).
       await recommend(page);

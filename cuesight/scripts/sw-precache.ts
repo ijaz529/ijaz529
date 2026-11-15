@@ -33,21 +33,36 @@ export function precacheList(files: string[]): string[] {
 }
 
 /**
- * A short id that changes whenever any built file name (and so, with hashed names, its content) or
- * the HTML shell changes: the service worker's cache name, so every deploy gets a fresh cache.
+ * A short id that changes whenever any built file name, the HTML shell or (with `content`, see
+ * contentDigest) any file's bytes change: the service worker's cache name. It is also what makes
+ * dist/sw.js differ between deploys, and the browser only installs a new worker when that file changes.
  */
-export function buildId(list: string[], shell = ''): string {
-  return createHash('sha256').update(list.join('\n')).update('\0').update(shell).digest('hex').slice(0, 10);
+export function buildId(list: string[], shell = '', content = ''): string {
+  return createHash('sha256').update(list.join('\n')).update('\0').update(shell).update('\0').update(content).digest('hex').slice(0, 10);
+}
+
+/**
+ * A hash of the bytes of every listed file under `dir`. The bundle's names are content-hashed, but the
+ * public files (Snap sample photos, manifest, icons) keep their names when they change. A file that is
+ * not on disk is skipped here (verifyPrecache reports it).
+ */
+export function contentDigest(dir: string, list: string[]): string {
+  const h = createHash('sha256');
+  for (const f of list) {
+    const p = join(dir, f.replace(/^\.\//, ''));
+    h.update(f).update('\0').update(existsSync(p) ? readFileSync(p) : '').update('\0');
+  }
+  return h.digest('hex');
 }
 
 /** Replaces both placeholders in the service worker source; throws if either is missing. */
-export function injectPrecache(swSource: string, list: string[], shell = ''): string {
+export function injectPrecache(swSource: string, list: string[], shell = '', content = ''): string {
   if (!swSource.includes(ASSETS_PLACEHOLDER) || !swSource.includes(ID_PLACEHOLDER)) {
     throw new Error(`sw.js must contain "${ASSETS_PLACEHOLDER}" and "${ID_PLACEHOLDER}"`);
   }
   return swSource
     .replace(ASSETS_PLACEHOLDER, `const BUILD_ASSETS = ${JSON.stringify(list)};`)
-    .replace(ID_PLACEHOLDER, `const BUILD_ID = '${buildId(list, shell)}';`);
+    .replace(ID_PLACEHOLDER, `const BUILD_ID = '${buildId(list, shell, content)}';`);
 }
 
 /** The precache list written into a built sw.js ([] if there is none). */
@@ -110,7 +125,7 @@ export function swPrecache(): Plugin {
       const sw = resolve(outDir, 'sw.js');
       if (!existsSync(sw)) throw new Error(`${sw} is missing: public/sw.js must be copied into the build (offline support)`);
       const list = precacheList([...files, ...walk(publicDir)]);
-      const written = injectPrecache(readFileSync(sw, 'utf8'), list, shell);
+      const written = injectPrecache(readFileSync(sw, 'utf8'), list, shell, contentDigest(outDir, list));
       writeFileSync(sw, written);
       // Guard: the worker must list exactly the files on disk. In an outDir that was not emptied, files
       // left over from an earlier build are ignored (they are not this build's).

@@ -2,9 +2,11 @@
 // - Precache: the shell plus every file of the build (BUILD_ASSETS: the JS/CSS chunks, both worker scripts, the
 //   icons, the manifest and the Snap sample photos), written into dist/sw.js at build time by
 //   scripts/sw-precache.ts, because on a first visit the chunks load before this worker controls the page and the
-//   sample photos may never be fetched online. Install fails if any of them is missing, so a broken deploy never
-//   replaces a working one.
-// - Updates: a new deploy changes this file (its file list and BUILD_ID, which also hashes index.html), so the
+//   sample photos may never be fetched online. Every file is revalidated with the server (not taken from the HTTP
+//   cache, which may hold the previous build's shell). Install fails if any of them is missing or the shell is not
+//   this build's, so a broken or half-propagated deploy never replaces a working one.
+// - Updates: a new deploy changes this file (its file list and BUILD_ID, which hashes index.html and the bytes of
+//   every listed file, so a new sample photo under the same name is a new version too), so the
 //   browser installs the new worker next to the running one, and it WAITS. An open page keeps running the build it
 //   loaded, and that build creates its planner/vision workers and fetches its photos lazily, by its own hashed file
 //   names. The page offers "Reload" instead (src/app/sw-update.ts), which posts 'skip-waiting'; otherwise the new
@@ -23,9 +25,30 @@ const SHELL = ['./', './index.html'];
 /** Where this worker records, when it takes over from an older build, the clients open then and the caches they need. */
 const KEEP = './__cuesight-sw/older-build-clients';
 
+/** The build's own files a shell references (Vite writes its hashed output as ./assets/...); other markup is ignored. */
+const shellRefs = (html) => [...html.matchAll(/\b(?:src|href)=["']?(\.\/assets\/[^"'\s>]+)/g)].map((m) => m[1]);
+
 self.addEventListener('install', (e) => {
   // No skipWaiting() here: an open page must keep the worker (and the cache) of its own build. See 'message'.
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll([...SHELL, ...BUILD_ASSETS])));
+  // cache 'no-cache': revalidate every file with the server. Static hosts send max-age (GitHub Pages: 600 s), so the
+  // browser's HTTP cache still holds the previous build's index.html (and icons, manifest, photos) when this installs.
+  // Then the shell must be this build's: one still referencing another build's chunks (a CDN edge that has not got
+  // the new index.html yet) would run that build under this worker, and its lazily created workers would 404 once
+  // the older cache goes. Fail the install instead; the browser tries again on its next update check.
+  // Everything is fetched and checked before anything is written: a deploy that changes only this file keeps the
+  // cache name (BUILD_ID hashes the file list and index.html), and the running build's cache must stay intact.
+  const reqs = [...SHELL, ...BUILD_ASSETS].map((u) => new Request(u, { cache: 'no-cache' }));
+  e.waitUntil(
+    Promise.all(reqs.map((r) => fetch(r))).then((res) => {
+      const failed = reqs.filter((_, i) => !res[i].ok).map((r) => r.url);
+      if (failed.length) throw new TypeError(`precache: ${failed.join(', ')} failed`);
+      return Promise.all(SHELL.map((_, i) => res[i].clone().text())).then((html) => {
+        const foreign = [...new Set(html.flatMap(shellRefs))].filter((f) => !BUILD_ASSETS.includes(f));
+        if (foreign.length) throw new Error(`index.html is not this build's: it references ${foreign.join(', ')}`);
+        return caches.open(CACHE).then((c) => Promise.all(reqs.map((r, i) => c.put(r, res[i]))));
+      });
+    }),
+  );
 });
 
 self.addEventListener('message', (e) => {

@@ -89,7 +89,7 @@ describe('web app manifest', () => {
     // The precache list is written into dist/sw.js at build time from every built and public file
     // (scripts/sw-precache.ts; checked on a real build in tests/unit/sw-precache.test.ts).
     const sw = readFileSync('public/sw.js', 'utf8');
-    expect(sw).toContain('c.addAll([...SHELL, ...BUILD_ASSETS])');
+    expect(sw).toContain("[...SHELL, ...BUILD_ASSETS].map((u) => new Request(u, { cache: 'no-cache' }))");
     const list = precacheList(readdirSync('public', { recursive: true, withFileTypes: true }).filter((d) => d.isFile()).map((d) => relative('public', join(d.parentPath, d.name))));
     for (const i of m.icons) expect(list).toContain(`./${i.src}`);
   });
