@@ -130,13 +130,18 @@ describe('shot card texts', () => {
   it('a not-makeable plan never shows a negative tolerance ("±-2.1 mm")', () => {
     const plan = planShot(layoutOf('blocked'), { targetId: 'b5', pocketId: 'BM' }, params);
     expect(plan.makeable).toBe(false);
-    expect(plan.toleranceMm).toBeLessThan(0); // the planner's value (core) is still signed
-    const { el } = stubEl();
-    renderShotCard(el, plan, ctx({ showDetails: true }));
-    expect(el.innerHTML).toContain('Contact tolerance');
-    expect(el.innerHTML).not.toMatch(/±-/);
-    expect(el.innerHTML).toMatch(/<dt>Contact tolerance<\/dt><dd>—<\/dd>/);
-    expect(el.innerHTML).toMatch(/<dt>Aim tolerance<\/dt><dd>—<\/dd>/);
+    // Wave 1 clamps the core's tolerance at 0 past a 90° cut (this one is 143°); the card must still
+    // print no margin for it, nor for a signed value (an older planner's ±-2.1 mm).
+    expect(plan.cutAngleDeg).toBeGreaterThan(90);
+    expect(plan.toleranceMm).toBe(0);
+    for (const p of [plan, { ...plan, toleranceMm: -2.1, toleranceDeg: -0.15 }]) {
+      const { el } = stubEl();
+      renderShotCard(el, p, ctx({ showDetails: true }));
+      expect(el.innerHTML).toContain('Contact tolerance');
+      expect(el.innerHTML).not.toMatch(/±-|±0\.0/);
+      expect(el.innerHTML).toMatch(/<dt>Contact tolerance<\/dt><dd>—<\/dd>/);
+      expect(el.innerHTML).toMatch(/<dt>Aim tolerance<\/dt><dd>—<\/dd>/);
+    }
   });
 
   it('the details give the tip offset in millimetres next to the tip words', () => {
@@ -163,24 +168,35 @@ describe('shot card texts', () => {
       ['straight', -0.25, 3],
     ];
     const words: Record<string, string> = {};
+    const corrOf = (html: string) => /class="corr">(.*?)<\/p>/s.exec(html)?.[1] ?? '';
     for (const [drill, side, power] of cases) {
       const lay = layoutOf(drill);
       const plan = planShot(lay, { targetId: 'b1', pocketId: 'TR', stroke: { power, side, vert: 0 } }, params);
       const { el } = stubEl();
       renderShotCard(el, plan, ctx());
-      const text = `${/class="corr">(.*?)<\/p>/s.exec(el.innerHTML)?.[1] ?? ''} ${plan.tip}`;
+      const corr = corrOf(el.innerHTML);
+      const text = `${corr} ${plan.tip}`;
       const cue = lay.balls.find((b) => b.kind === 'cue')!.pos;
       const ob = lay.balls.find((b) => b.id === 'b1')!.pos;
       let want: string;
+      // Wave-1 wording (coach.ts throwSentence): "the ghost ball is shifted 1.2 mm thicker" /
+      // "… shifted 1.6 mm to the left of full ball" (the ghost ball shown already includes it).
       if (plan.cutAngleDeg < 1) {
         const aim = plan.aimDir;
         const d = { x: plan.ghost.x - plan.ghostUncorrected.x, y: plan.ghost.y - plan.ghostUncorrected.y };
         want = aim.x * d.y - aim.y * d.x > 0 ? 'left' : 'right';
-        expect(text).toContain(`mm ${want} of full ball`);
+        expect(text).toMatch(new RegExp(`shifted [\\d.]+ mm to the ${want} of full ball`));
       } else {
         want = playedCut(cue, ob, plan.ghost) < playedCut(cue, ob, plan.ghostUncorrected) ? 'thicker' : 'thinner';
-        expect(text).toMatch(new RegExp(`aim [\\d.]+ mm ${want}`));
-        expect(text).not.toMatch(new RegExp(`aim [\\d.]+ mm ${want === 'thicker' ? 'thinner' : 'thicker'}`));
+        expect(text).toMatch(new RegExp(`shifted [\\d.]+ mm ${want}`));
+        expect(text).not.toMatch(new RegExp(`shifted [\\d.]+ mm ${want === 'thicker' ? 'thinner' : 'thicker'}`));
+      }
+      // The card's own correction (shown when the tip leaves the throw out) names the stroke's english
+      // the way the tip does: outside english for a thicker shift, no "side-spin" on a centre-ball hit.
+      if (/shifted/.test(corr)) {
+        expect(corr).not.toMatch(/already moved/);
+        if (want === 'thicker' && side !== 0) expect(corr).toContain('Outside english throws the object ball thin');
+        if (side === 0) expect(corr).not.toMatch(/[Ss]ide-spin/);
       }
       words[`${drill} ${side}`] = want;
     }
@@ -188,6 +204,18 @@ describe('shot card texts', () => {
     expect(words['cut30 -0.25']).toBe('thicker');
     expect(words['cut30 0']).toBe('thinner');
     expect(words['straight 0.25']).not.toBe(words['straight -0.25']);
+    // Not vacuous: the 30° cut with a touch of outside english (throw under the tip's 1° threshold)
+    // gets its correction from the card.
+    const soft = planShot(layoutOf('cut30'), { targetId: 'b1', pocketId: 'TR', stroke: { power: 3, side: -0.25, vert: 0 } }, params);
+    const { el } = stubEl();
+    renderShotCard(el, soft, ctx());
+    expect(corrOf(el.innerHTML)).toMatch(/Outside english throws the object ball thin here, so the ghost ball is shifted [\d.]+ mm thicker\./);
+    // A centre-ball hit thrown left or right (a near-straight cut's own throw) is not called side-spin throw.
+    const straight = planShot(layoutOf('straight'), { targetId: 'b1', pocketId: 'TR', stroke: { power: 3, side: 0, vert: 0 } }, params);
+    const centre = { ...straight, throwDeg: 0.4, throwShiftMm: 0.4, throwAim: 'left' as const, throwShiftDir: 'left' as const, tip: 'Straight-in with follow.' };
+    const c = stubEl();
+    renderShotCard(c.el, centre, ctx());
+    expect(corrOf(c.el.innerHTML)).toContain('Throw: the ghost ball is shifted 0.4 mm to the left of full ball.');
   });
 });
 

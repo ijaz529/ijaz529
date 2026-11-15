@@ -98,6 +98,29 @@ describe('planner client: stale replies are dropped (the stale-result rule)', ()
     expect(workers.length).toBe(2);
   });
 
+  it('a restarted worker gets the evaluation-budget figures of the one it replaced (same budget, same stroke)', () => {
+    const rec = (w: FakeWorker) => w.last('recommend') as Extract<PlannerIn, { type: 'recommend' }>;
+    client.recommend('k1', msg('b1'));
+    vi.advanceTimersByTime(180);
+    const w0 = workers[0]!;
+    expect(rec(w0).perEvalMs).toBeUndefined(); // nothing measured yet: the first worker measures
+    w0.reply(recReply(rec(w0).id, { perEvalMs: { '4': 3.5 } }));
+    // A superseded reply still carries valid figures (they describe the device, not the request).
+    client.recommend('k2', msg('b2'));
+    vi.advanceTimersByTime(180);
+    client.recommend('k3', msg('b3'));
+    w0.reply(recReply(rec(w0).id, { perEvalMs: { '4': 3.5, '10': 6.25 } }));
+    vi.advanceTimersByTime(180);
+    expect(rec(w0).perEvalMs).toEqual({ '4': 3.5, '10': 6.25 });
+    // b3's search is still running when b4 is asked for: the worker is restarted, the figures are not lost.
+    client.recommend('k4', msg('b4'));
+    vi.advanceTimersByTime(180);
+    expect(w0.terminated).toBe(true);
+    const w1 = workers[1]!;
+    expect(rec(w1).request.targetId).toBe('b4');
+    expect(rec(w1).perEvalMs).toEqual({ '4': 3.5, '10': 6.25 });
+  });
+
   it('asking again for the same key while it is scheduled or in flight keeps that request', () => {
     client.recommend('k', msg('b1'));
     vi.advanceTimersByTime(100);
@@ -199,8 +222,11 @@ describe('recommendationOutcome: what the app shows for a recommendation', () =>
     expect(recommendationOutcome(recReply(1, { reachable: false }), true)).toEqual({ stroke, toast: 'That spot can’t be reached safely — showing the best stroke found.' });
   });
   it('flags a fragile stroke (needs precise pace)', () => {
+    // Core `fragile` (types.ts): no candidate was verified against ±6/±12 % speed errors — one
+    // scratched OR missed at some speed, or the budget ran out first. So the toast may not claim a
+    // scratch (or any certainty): it says the pace may matter and what could happen.
     const m = { ...recReply(1), fragile: true } as RecommendationReply;
-    expect(recommendationOutcome(m, false).toast).toBe('This stroke needs precise pace: a little harder or softer can scratch.');
+    expect(recommendationOutcome(m, false).toast).toBe('This stroke may need precise pace: a little harder or softer could miss or scratch.');
     expect(recommendationOutcome(m, false).stroke).toEqual(stroke);
   });
   it('falls back to the basic stroke when nothing was found', () => {

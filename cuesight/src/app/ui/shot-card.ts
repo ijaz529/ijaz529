@@ -196,7 +196,8 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     const off = ctx.cbDistance && ctx.ballRadius ? squirtOffsetText(plan.squirtDeg, plan.stroke.side, ctx.cbDistance, ctx.ballRadius) : null;
     corrections.push(off ? `Squirt: aim the cue ${off} (${Math.abs(plan.squirtDeg).toFixed(1)}°)` : `Aim the cue ${Math.abs(plan.squirtDeg).toFixed(1)}° ${plan.squirtDeg > 0 ? 'right' : 'left'} of the blue line (squirt)`);
   }
-  if (!noStroke && Math.abs(plan.throwDeg) >= 0.1 && plan.throwAim && !tipThrow) corrections.push(throwSentence(plan).replace(/ \(the ghost ball shown is already moved\)\.$/, '.'));
+  // The stroke's side names the cause: outside english for a thicker shift, no "side-spin" on a centre-ball hit.
+  if (!noStroke && Math.abs(plan.throwDeg) >= 0.1 && plan.throwAim && !tipThrow) corrections.push(throwSentence({ ...plan, side: p.side }));
   const minPower = Number.isFinite(plan.minPower) ? plan.minPower : null;
   const powerStr = power.toFixed(power % 1 ? 1 : 0);
   const phrase = plan.fractionPhrase ?? `${plan.fractionLabel}-ball`;

@@ -8,10 +8,13 @@
  *  - a superseded recommendation still being computed (one stroke search, up to ~1.5 s) is abandoned
  *    by restarting the worker when nothing else waits on it, so the latest request starts at once;
  *  - `error` replies and a worker that fails to load or to deliver a message clear what was pending
- *    (`onFailure`), so no spinner waits forever; a failed worker is dropped and recreated on the next send.
+ *    (`onFailure`), so no spinner waits forever; a failed worker is dropped and recreated on the next send;
+ *  - the worker's evaluation-budget figures (`perEvalMs`, from every recommendation reply) are kept
+ *    here and sent with each recommendation, so a restarted worker searches with the same budget and
+ *    the same request still gets the same stroke.
  */
 import type { Stroke } from '../core/types';
-import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut } from '../workers/protocol';
+import { PROTOCOL_VERSION, type PlannerIn, type PlannerOut, type PlannerPerEvalMs } from '../workers/protocol';
 
 export type PlannerKind = 'recommend' | 'suggest' | 'heatmap';
 type Msg<K extends PlannerIn['type']> = Omit<Extract<PlannerIn, { type: K }>, 'v' | 'id'>;
@@ -49,6 +52,8 @@ export function createPlannerClient(o: PlannerClientOptions) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   /** A sent recommendation whose reply has not arrived yet (the worker is busy with it). */
   let computing: number | null = null;
+  /** Per-evaluation cost by ball count measured by a planner worker of this page (outlives restarts). */
+  const perEvalMs: PlannerPerEvalMs = {};
 
   function drop(): void {
     const w = worker;
@@ -95,6 +100,8 @@ export function createPlannerClient(o: PlannerClientOptions) {
   function onMessage(m: PlannerOut): void {
     switch (m.type) {
       case 'recommendation': {
+        // Budget figures are valid whatever the reply's fate (even a superseded request measured them).
+        if (m.perEvalMs && typeof m.perEvalMs === 'object') Object.assign(perEvalMs, m.perEvalMs);
         if (m.id === computing) computing = null;
         if (m.id !== latest.recommend) return;
         const key = keyById.get(m.id);
@@ -150,7 +157,7 @@ export function createPlannerClient(o: PlannerClientOptions) {
         timer = undefined;
         // Still computing a superseded stroke and nothing else waits on this worker: start afresh.
         if (computing !== null && latest.suggest === undefined && latest.heatmap === undefined) drop();
-        const id = post('recommend', captured);
+        const id = post('recommend', Object.keys(perEvalMs).length ? { ...captured, perEvalMs: { ...perEvalMs } } : captured);
         computing = id;
         keyById.set(id, key);
       }, o.debounceMs ?? 180);
@@ -180,9 +187,10 @@ export function recommendationOutcome(m: RecommendationReply, hasLanding: boolea
   const found = m.evaluated > 0 && Number.isFinite(m.score);
   // Nothing evaluated: the shot itself is not makeable, which the shot card already says.
   if (!found) return { stroke: null, toast: hasLanding && m.evaluated > 0 ? 'No stroke reaches that spot cleanly — showing the basic stroke.' : null };
-  // `fragile` is an optional Recommendation field of newer planners: reachable only with precise pace.
-  const fragile = 'fragile' in m && (m as { fragile?: unknown }).fragile === true;
+  // `fragile` (core types.ts): no candidate was verified against ±6/±12 % speed errors — one scratched
+  // or missed at some speed, or the budget ran out first. So: "may", and both ways it can go wrong.
+  const fragile = m.fragile === true;
   if (hasLanding && !m.reachable) return { stroke: m.stroke, toast: 'That spot can’t be reached safely — showing the best stroke found.' };
-  if (fragile) return { stroke: m.stroke, toast: 'This stroke needs precise pace: a little harder or softer can scratch.' };
+  if (fragile) return { stroke: m.stroke, toast: 'This stroke may need precise pace: a little harder or softer could miss or scratch.' };
   return { stroke: m.stroke, toast: null };
 }

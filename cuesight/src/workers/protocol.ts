@@ -39,13 +39,20 @@ export type VisionOut =
   | (V & { type: 'error'; id?: number; message: string; buffer?: ArrayBuffer });
 
 // --- Planner worker ------------------------------------------------------------------------------
+/**
+ * Optional (non-breaking v2 extension): the planner worker's per-evaluation cost in ms by ball count
+ * (keys are counts, e.g. { "4": 1.2 }), returned with every recommendation and sent back with the
+ * next request, so a restarted worker keeps the evaluation budget of the one it replaced.
+ */
+export type PlannerPerEvalMs = Record<string, number>;
+
 export type PlannerIn =
-  | (V & { type: 'recommend'; id: number; layout: TableLayout; request: ShotRequest; params: PhysicsParams })
+  | (V & { type: 'recommend'; id: number; layout: TableLayout; request: ShotRequest; params: PhysicsParams; perEvalMs?: PlannerPerEvalMs })
   | (V & { type: 'suggest'; id: number; layout: TableLayout; params: PhysicsParams; max: number })
   | (V & { type: 'heatmap'; id: number; layout: TableLayout; nextBallId: string; excludeIds: string[]; params: PhysicsParams; cols: number; rows: number });
 
 export type PlannerOut =
-  | (V & { type: 'recommendation'; id: number } & Recommendation)
+  | (V & { type: 'recommendation'; id: number; perEvalMs?: PlannerPerEvalMs } & Recommendation)
   | (V & { type: 'suggestions'; id: number; items: ShotSuggestion[] })
   | (V & { type: 'heatmap'; id: number; cols: number; rows: number; values: Float32Array })
   | (V & { type: 'error'; id?: number; message: string });
