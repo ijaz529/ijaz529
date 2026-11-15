@@ -5,7 +5,9 @@
 **Created**: 2026-11-14
 
 **Status**: Implemented (v1). Clarifications amended on 2026-11-15 after the code review (see
-"Session 2026-11-15" below and analysis.md "Post-review").
+"Session 2026-11-15" below and analysis.md "Post-review"), and the requirements updated to the
+wave-2 app on `fix2b/app` (the lock gate, the kept selection, the camera and calibration messages,
+the power gauge).
 
 **Input**: User description: "Pool / snooker real-time shot guide. I point the camera at a table and it
 shows me where, and on exactly which line, I have to hit the cue ball to pocket a particular target
@@ -27,9 +29,10 @@ Expanded by `docs/MASTER_PROMPT.md`.
   medium, medium-firm, firm, hard, power). Estimated cue-ball speed is secondary detail. The m/s band
   of each word is in research.md R-12.
 - Q: How should spin be communicated? → A: A tip position drawn on a cue-ball face, plus words ("½ tip
-  low, ¼ tip right"). One "tip" is ¼ of the ball radius of offset from centre (max 2 tips, the ½ R
-  miscue limit). *Amended 2026-11-15:* this line used to say "one tip-width", but ¼ R (≈ 7 mm on a
-  pool ball) is about one cue-tip radius, half a tip-width. See the 2026-11-15 session.
+  below centre, ¼ tip right"). One "tip" is ¼ of the ball radius of offset from centre, about 7 mm on
+  a pool ball (max 2 tips, the ½ R miscue limit), and the card details give the offset in mm too.
+  *Amended 2026-11-15:* this line used to say "one tip-width", but ¼ R is about one cue-tip radius,
+  half a tip-width. See the 2026-11-15 session.
 - Q: What does the app do when the phone moves after the player locks a layout? → A: The locked layout
   stays and is shown on the top-down map. The camera overlay is hidden until the table is re-acquired.
 - Q: What if no camera is available or permission is denied? → A: The player gets the virtual practice
@@ -39,18 +42,20 @@ Expanded by `docs/MASTER_PROMPT.md`.
 
 These answers record what the reviewed implementation does, and they flag the open decisions.
 
-- Q: What does "1 tip" of spin mean? → A: The implemented unit is ¼ R of tip offset: ≈ 7 mm on a
-  pool ball, about one cue-tip radius. So the natural-roll height 0.4 R reads "1½ tip high" and the
-  miscue limit reads "2 tip high" (the missing plural is a known wording bug). Most players mean a
-  tip-width (a 13 mm tip ≈ 0.45 R on a pool ball, ≈ 0.37 R on a snooker ball).
-  - **Open decision**: keep ¼ R or switch to tip-widths (analysis.md P-F2).
-  - Until it is decided, the shot card also gives the offset in mm (wave 2a).
+- Q: What does "1 tip" of spin mean? → A: ¼ R of tip offset: ≈ 7 mm on a pool ball, about one
+  cue-tip radius. So the natural-roll height 0.4 R reads "1½ tips above centre" and the 0.5 R miscue
+  limit is 2 tips ("2 tips above centre"). Many players mean a tip-width (a 13 mm tip ≈ 0.45 R on a
+  pool ball, ≈ 0.37 R on a snooker ball).
+  - **Decided (wave 2b, T082): keep ¼ R.** With tip-widths the miscue limit would be about 1 tip and
+    the small offsets the planner uses would have no words. The shot card's details give the offset
+    in mm as well ("11 mm below centre"), so it reads either way.
 - Q: Do the speed words follow MASTER_PROMPT §5? → A: No, deliberately. The words from the power
   clarification above stand, and their m/s bands are in research.md R-12. The scale tops out at
   7.0 m/s, so break speeds (≥ 8 m/s) are out of scope.
 - Q: How precise is the fractional-aim label? → A: The nearest eighth of a ball (⅞ … ⅛). It is
-  prefixed "thin" or "thick" when the real cut is more than 2° away from that eighth. "full" needs
-  97 % overlap, and "thin" means below 1/16 overlap. The exact cut angle is always shown as well.
+  prefixed "thin" or "thick" when the real cut is more than 1.5° away from that eighth, and the phrase
+  says the same ("a touch thinner than ½-ball"). "full" needs 97 % overlap, and "thin" means below
+  1/16 overlap. The exact cut angle is always shown as well.
 - Q: What if the cue ball touches the object ball? → A: There is no ghost ball. The object ball
   leaves along the line of centres, turned only by throw (at most ≈ 5° with default physics).
   - The plan gives the stroke angle that throws it toward the pocket, and is not makeable when even
@@ -59,12 +64,12 @@ These answers record what the reviewed implementation does, and they flag the op
     foul.
 - Q: What if the cue ball cannot be told apart (none visible, or two whites too close to call)? →
   A: Vision marks no ball as the cue ball, and the player is asked to tap it (edge case below).
-  On `fix/wave1` the app shows "Waiting for the cue ball and target…" instead of the tap prompt
-  (open, wave 2).
 - Q: What does "most reliable stroke" (FR-020) mean? → A: The stroke whose worst outcome is best,
   over the nominal speed and ±6 % / ±12 % speed errors. Any scratch or miss at those speeds rules a
-  stroke out. When no stroke survives, the best one is still offered, marked speed-sensitive (the
-  `fragile` flag; the app shows it from wave 2) (research.md R-11).
+  stroke out. The survivors are also mis-hit with the tip, the aim and the shaft a little off, and
+  half of the worst of those counts. When no stroke survives, the best one is still offered, marked
+  speed-sensitive (the `fragile` flag; the card says "Speed-sensitive — small changes in pace may
+  change the result.") (research.md R-11).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -222,6 +227,13 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 - Balls touching each other or frozen to a cushion → each ball is still detected separately. A plan
   with the object ball frozen to the rail is still computed.
 - Cue ball not found, or several white-ish candidates → the player is asked to tap the cue ball.
+  The hint says 'No cue ball found — tap “Cue ball”, then tap the cue ball.', or, with two whites too
+  close to call (both "white?"), 'Two white balls — tap “Cue ball”, then tap the one you play with.'.
+  Tapping an object ball keeps it as the target and asks for the cue ball first (toast "I can’t find
+  the cue ball — tap it first." or "Two white balls — tap the one you play with first."). While the
+  *Cue ball* tool is on, the hint reads "Tap the cue ball.", also when vision found a cue ball and
+  after a frame change that keeps the tool on. Marking the cue ball works on a frozen layout too
+  (FR-007).
 - The cue ball touching the object ball → the plan warns that the balls are frozen. It aims the
   stroke along the line of centres plus throw, not at a ghost ball (on snooker: not makeable, a push
   stroke).
@@ -230,6 +242,14 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 - The phone moves while frozen → the locked layout stays; the overlay is hidden until re-acquired.
 - Snooker table with 15+ reds → planning stays responsive and suggestions stay within the time budget.
 - Device rotated or app backgrounded → camera resumes; the locked layout persists in the session.
+- A corner pocket of the locked table is outside the frame → the status pill reads "Table locked — a
+  corner pocket is out of view" (or "… corner pockets are out of view"). Balls in those pockets may be
+  missed.
+- The camera works but table detection fails → the camera message is titled "Table detection is off"
+  (otherwise "Camera unavailable"). If the detection worker never loaded: "Table detection couldn’t
+  start — it may not be available offline yet. Reconnect and tap “Try again”, or use the practice
+  table." After a failure mid-session (the worker crashed, or 3 live errors in a row): "Table
+  detection stopped working. Tap “Try again” to restart it, or use the practice table."
 
 ## Requirements *(mandatory)*
 
@@ -243,6 +263,20 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   whatever the cloth colour.
 - **FR-003**: The system MUST provide manual calibration by tapping the four playing-surface corners, and
   a control to swap which side is the long rail.
+  - After four taps the app says "Corners set — checking…", then "Calibrated from your four corners."
+    once a result confirms them. Taps that cannot form a table outline are refused at once and
+    calibrate mode stays on. The other outcomes: "Those four taps aren’t the cloth corners — tap them
+    again." (a quad refused locally, vision reason `bad-quad`, or the first result's `moved`, i.e.
+    under 80 % cloth); "Couldn’t tell the cloth from its surroundings — tap the 4 cloth corners again,
+    or use Snap." (`cloth-unknown`); "The phone moved — recalibrate, or tap Calibrate to go back to
+    automatic detection." (`moved` on later results).
+  - Rotate, setting corners and clearing corners keep the live selection (target, marked cue ball,
+    pocket, landing): it is found again where the camera sees it once the new frame is locked, with
+    "Kept your selection.". If it is not found within 15 results, the toast says "The selection was
+    cleared: the table frame changed.". A single Rotate on a table that was detected the right way
+    round gives a wrong frame, in which the balls are not found. A field-of-view or table change in
+    Settings still clears the selection ("Selection cleared — the table frame changed."). A frozen
+    layout keeps its own selection until "Go live" in the new frame.
 - **FR-004**: The system MUST detect ball positions on the table, identify the cue ball, and correct for
   ball height so that positions refer to where each ball touches the cloth.
 - **FR-005**: The system MUST smooth detections over time and show a detection-quality indicator
@@ -255,7 +289,9 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 
 - **FR-009**: The player MUST be able to select a target ball and a pocket by tapping them, on either the
   camera image or the top-down map. The system MUST auto-select the best pocket when the player picks
-  only a ball.
+  only a ball. A ball's pick radius is at least 22 CSS px on the 2D table, the mini-map, the overlay
+  and the 3D table; a ball reached only through that floor yields to a pocket mouth nearer the tap,
+  and a ball within its natural radius always wins (data-model.md, Selection).
 - **FR-010**: For a selected shot the system MUST compute and display:
   - the ghost-ball position and the cue-ball aim line,
   - the contact point,
@@ -265,6 +301,15 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
   correction for side spin, and display both in degrees.
 - **FR-012**: The system MUST recommend power (1–10 plus a speed word, with estimated cue-ball speed as
   detail). The power MUST be enough for the object ball to reach the pocket.
+  - The power gauge marks the minimum, and a dashed arc from `minPowerCapture` to `minPower` "only
+    just drops" ("Minimum X; from Y it only just drops"). Past 10 it reads "Needs more than full power
+    for pace"; for a frozen cue ball, or any plan where no power works, "No power gets it in with
+    pace", with no tick and Min power "none".
+  - Every advice figure is `minPower` rounded up to the half step, the same figure as the meter's.
+  - While a frozen cue ball's power advice is being worked out (in the planner worker), or if it
+    fails, the card shows the too-soft headline ("Too soft — object ball stops short." / "Very soft
+    — …") with no power minimum: no tick and no "Minimum x" on the meter, and the details list is
+    hidden until the figure is known. The plan is spoken only once it has its figure.
 - **FR-013**: The system MUST recommend spin as a tip position on a cue-ball diagram, described in tips
   and words, within the safe miscue limit.
 - **FR-014**: The system MUST predict the cue ball's path for the chosen power and spin, including
@@ -288,6 +333,12 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 - **FR-020**: The player MUST be able to set a desired cue-ball landing spot. The system MUST recommend
   the most reliable power and spin to get there without scratching, or report that the spot can't be
   reached and offer the closest safe alternative.
+  - The fallback toasts: "None of the strokes tried pots this ball without a scratch — showing the
+    basic stroke." (with a landing spot: "No stroke reaches that spot cleanly — showing the basic
+    stroke."), "That spot can’t be reached safely — showing the best stroke found." and, for a fragile
+    stroke, "This stroke may need precise pace: a little harder or softer could miss or scratch."
+  - They are shown only while the recommended stroke is on show. When the player has set their own
+    stroke, no toast appears; the card's notes still apply after "Use recommended".
 - **FR-021**: Without a chosen landing spot, the default recommendation MUST favour cue-ball positions
   that leave an easy next shot.
 - **FR-022**: The system MUST show a position-zone heatmap for a chosen next ball on request.
@@ -296,15 +347,29 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 
 - **FR-023**: The camera overlay MUST be drawn in perspective on the cloth and stay aligned as the phone
   moves while the table is locked. A top-down mini-map MUST always show the same plan.
+  - The live plan and overlay are computed and drawn only on a locked table. A 2-result grace after
+    a lock absorbs a single missed quad. A new table frame (Rotate, corners set or cleared, a table or
+    field-of-view change) gets no grace from the old frame's lock: nothing is planned, drawn or
+    restored until it locks itself.
+  - A frozen plan is drawn on the camera view only through a live calibration with the same ordered
+    corners.
 - **FR-024**: The overlay MUST use a colour-blind-safe palette with redundant encodings (line styles and
   labels).
+  - With side spin (|squirt| ≥ 0.1°) a faint "Cue stick" line (#F4F6FB at 60 %, dash 18/7, labelled
+    "Cue stick") is drawn behind the cue ball along the cue's own line, on the full 2D table and the
+    camera overlay (not on the mini-map).
+  - Table labels use the card tile's words: "30° · ½-ball hit", "36° · ⅜+ ball", "Frozen · stroke 12°
+    left", "Not makeable".
 - **FR-025**: Camera frames MUST be processed on the device and MUST never be stored or sent over a
   network.
 - **FR-026**: After first load, the app MUST work offline and be installable to the home screen.
 - **FR-027**: When camera access is denied or unavailable, the system MUST explain why and offer the
   virtual practice table.
 - **FR-028**: Physical parameters (cloth friction, cushion bounce, shaft type: standard or
-  low-deflection) MUST be adjustable in settings, with sensible defaults.
+  low-deflection) MUST be adjustable in settings, with sensible defaults. The presets carry source or
+  ASSUMPTION notes (data-model.md). Cushion width is 2–10 cm in 0.5 cm steps and the field of view
+  40–110°; empty or out-of-range values are rejected in the dialog and on load. Enter saves; Esc,
+  Cancel and × discard.
 
 ### Key Entities
 

@@ -7,7 +7,8 @@ These are the public contracts of `core/` and `vision/` that `workers/` and `app
 - `app/` also imports small helpers that are not listed here: the `vec.ts` helpers, `clampTip`,
   `stunVert`, `POCKET_NAMES`, and `applyH` / `invert3`. The source signatures are authoritative.
 
-**Revised 2026-11-15** to match the code on `fix/wave1`. The earlier version listed a
+**Revised 2026-11-15** to match the code on `fix/wave1`, then again for `fix2b/app` (the merged
+recommender, the frozen power advice, the coaching vocabulary). The earlier version listed a
 `processFrame` that does not exist, the wrong `pocketWindow`, `strikeBall`, `detectTable`,
 `calibrationFromCorners`, `detectBalls` and `positionHeatmap` signatures, and a `budgetMs` option.
 New optional fields are marked *optional*. Entity fields are in [data-model.md](../data-model.md).
@@ -74,41 +75,85 @@ mouthIntersect(from: Vec2, dir: Vec2, pocket): { mouthHit: Vec2; t: number }
 ghostBall(ob: Vec2, obDir: Vec2, R): Vec2;  contactPoint(ob, obDir, R): Vec2
 cutAngle(cue: Vec2, ghost: Vec2, obDir: Vec2): number      // radians, 0..π
 cutSide(cue, ghost, obDir): 1 | -1 | 0                     // + = OB departs CCW of the CB line
-fractionOf(cutRad): { fraction: number; label: string }    // eighths with "thin "/"thick " qualifiers (data-model.md)
+fractionOf(cutRad): { fraction: number; label: string; phrase: string }
+  // eighths with "thin "/"thick " qualifiers beyond 1.5° (FRACTION_EXACT_DEG) of the eighth's cut, for
+  // the label and the phrase alike ("thin ⅜" / "a touch thinner than ⅜-ball"); data-model.md
 pathBlockers(from: Vec2, to: Vec2, balls: Ball[], clearance: number, ignore: string[]): Ball[]   // nearest first
 powerToSpeed(power): number; speedToPower(v): number; speedWord(power): string   // R-12
-describeSpin(stroke: { side, vert }): string                // "½ tip low, ¼ tip right"; 1 tip = 0.25 R (data-model.md)
+POWER_ADVICE_STEP = 0.5; advisePower(minPower): number    // minPower rounded UP to the half step (≥ 1): the one advice figure
+powerFigure(power): string                                  // "4", "4.5", "3.4" (one decimal at most)
+TIP_FRACTION = 0.25; tipsText(frac): string                 // 1 tip = 0.25 R: "¼ tip" … "2 tips" (plural above one)
+describeSpin(stroke: { side, vert }): string                // "½ tip below centre, ¼ tip right", "centre ball"
+paceDiamonds(obMouthSpeed, tableLength, params): number; speedReference(…): string | null   // "pocket speed + 2 diamonds"
 shotGeometry(table, balls, cue: Ball, target: Ball, pocket: PocketSpec, params = DEFAULT_PHYSICS): ShotGeometry
   // geometry only (no simulation); params sets the frozen-ball throw bound; used by suggestions
 minimumPower(geo, stroke: { vert }, params, criterion: 'capture' | 'pace' = 'capture'): number   // 10.5 = not even at 10
-planShot(layout, request: ShotRequest, params, opts?: { recommended?: Stroke; record?: boolean; names?: Partial<Record<PocketId, string>> }): ShotPlan
+planShot(layout, request: ShotRequest, params, opts?: PlanOptions): ShotPlan
+  // PlanOptions = { recommended?: Stroke (used when the request has no stroke), record?: boolean,
+  //   names?: Partial<Record<PocketId, string>>, aimErrorRad?, actualSquirtMassRatio? (robustness probes),
+  //   advice?: boolean (default record !== false: on for a shown plan, off for search plans) }
 suggestShots(layout, params, max = 3): ShotSuggestion[]
 recommendStroke(layout, request, params, opts?: RecommendOptions): Recommendation
   // RecommendOptions = { landing?: Vec2,
-  //   maxEvaluations?: number   (default FULL_EVALUATIONS = 228; the result is a function of it),
+  //   maxEvaluations?: number   (default FULL_EVALUATIONS = 324; the result is a function of it),
   //   timeCapMs?: number        (optional wall-clock safety net; result.timedOut when it fires),
   //   budgetMs?: number         (@deprecated alias of timeCapMs),
-  //   onEvaluate?: (stroke, score | null) => void   (test hook) }
+  //   onEvaluate?: (stroke, score | null) => void   (test hook: every planned grid stroke, half steps included) }
+  // FULL_EVALUATIONS = 10 × 18 grid + 2 × 18 half steps + WALK_RESERVE (= 12 × (4 + 5) = 108); both exported
+contactSpinOf(v, w): ContactSpin                            // 'stun' | 'draw' | 'follow' | 'roll' | 'overspin' | 'short' (never reaches)
+strokeName({ contact, contactRatio, cutDeg, vert, side }): string | null   // "Draw", "Stun", "Follow, right english"; null if it never arrives
+squirtOffsetText(squirtDeg, side, cbDistance, R?): string | null   // "about ⅓ of a ball (17 mm) right of the ghost ball"
+throwSentence({ throwDeg, throwShiftMm, throwAim | shiftDir, side? }): string
+  // "Throw ≈ 1.2° pushes the object ball thick, so the ghost ball is shifted 1.3 mm thinner."; a full-ball
+  // hit says "Throw: …" without side and "Side-spin throw: …" with it
 nextShotQuality(layout, cuePos: Vec2, excludeIds: string[], onlyBallId?: string, params?): number   // 0..1
 postShotLayout(layout, plan: { targetId, otherPaths }): TableLayout
 positionHeatmap(layout, nextBallId: string, cols: number, rows: number, excludeIds: string[] = [], params?: PhysicsParams): Float32Array
 coachingTip(t: TipInput): string;  difficultyOf(toleranceDeg): Difficulty
+  // TipInput aliases: throwAim / shiftDir (throwAim wins), minPower / needPower; TipInput.minPower is
+  // the figure the tip quotes (planShot passes advisePower(ShotPlan.minPower))
 ```
 
 **Behaviour contracts (tested)**:
 
 - `planShot`:
   - Device budget: < 50 ms for 22 balls. CI guard: median of 5 runs < 100 ms
-    (`tests/integration/perf.test.ts`); measured 7.1 ms on 2026-11-15.
-  - The `too-soft` warning never contradicts the simulation.
+    (`tests/integration/perf.test.ts`); measured 7.1–20 ms on 2026-11-15, depending on the load.
+  - The `too-soft` warning never contradicts the simulation. `cb-short` replaces it when both the
+    analytic chain and the simulation say the cue ball stops before the object ball; the two are
+    never emitted together.
   - A blocked or not-makeable plan names the best other clear pocket when there is one.
   - Frozen and corner-hanger plans follow the conventions in data-model.md.
-- `recommendStroke`:
+  - **Frozen power advice** (`advice`, on by default for a plan with `record` on): for a frozen cue
+    ball played too softly, the stroke is replanned at every half step above the played power. Only
+    the first run of powers that pots with pace and keeps the cue ball up is quoted ("A", "A–B" or
+    "A+"), with the reason the run ends (throw, or a scratch at X). With no such run there is no
+    power advice, a "no power … gets it in with pace" sentence, the centre-ball powers for a stroke
+    with spin, `minPower` 10.5 and `noWorkingPower`. `minPower` is otherwise the lowest working
+    power (to about 0.06), and `minPowerCapture` is capped at it. The replans cost about 8–70 ms on
+    a desktop (more on a phone), against about 1 ms for the plan itself; search plans
+    (`record: false`) skip them and say `adviceSkipped`.
+  - With `adviceSkipped`, the too-soft warning has no figure and `minPower` is the minimum at the
+    played power's stroke angle, **not** the power to play: callers must not show it as a minimum.
+    Get the full plan from the planner worker's `plan` message (002 worker-protocol-v2.md).
+- `recommendStroke` (research.md R-11):
   - With `timeCapMs` unset, the same inputs and `maxEvaluations` give the same result: it is
     deterministic and does not depend on device speed.
-  - `score` is the worst-case robust score (research.md R-11) and is finite whenever some stroke
-    pots the ball.
-  - `fragile: true` when no candidate survived the ±6/±12 % speed check.
+  - The budget is spent in this order: the grid (coarse to fine); the half steps at the soft end
+    (default objective only, and only while `WALK_RESERVE` still fits after them, so a budget below
+    grid + half steps + 108 gives whole-number powers); the speed check down the ranking until 5
+    strokes pass; those survivors' tip, aim and shaft probes; then the polish finalists (the best
+    centre-line strokes and the two softest powers), each checked in full. Only fully checked
+    strokes compete with each other.
+  - Any scratch or miss at ±6/±12 % speed disqualifies a stroke. The tip, aim and shaft probes
+    count at half weight, and every cue-ball scratch they see is recorded in `risks`.
+  - `score` is that robust score (the probe blend when the probes ran), including the coaching
+    penalties (pace, travel, side; `TOO_SOFT_PENALTY` and `NO_SIDE_PENALTY` make a too-soft stroke
+    and side on a near-straight shot without a landing spot last resorts). It is finite whenever
+    some stroke pots the ball.
+  - `fragile: true` when no candidate survived the speed check (or the budget ran out first).
+  - `risks` absent means "not known": a fragile stroke, or a budget that ran out before the probes.
+    It is never `[]` for a fragile stroke.
   - `reachable` is true when any potting stroke ends within 15 cm of the landing spot.
 - `positionHeatmap`:
   - The values are row-major, with rows along +y from −W/2 + R. The cells cover the area that
@@ -151,7 +196,7 @@ renderSyntheticTable(scene: SynthScene): Frame                 // test fixtures 
 - Ball centres: median error ≤ 10 mm, p95 ≤ 25 mm, with automatic and with exact calibration.
   - Worst measured median on the 9-ball fixture on 2026-11-15: 6.3 mm (end view, RGB) and 6.4 mm
     (end view, 4:2:0).
-  - **Not met on `fix/wave1`** for touching clusters: the 9-ball diamond corner view, the 15-ball
+  - **Not met on `fix/wave1` nor on `fix2b/app`** for touching clusters (pending the vision branch): the 9-ball diamond corner view, the 15-ball
     triangle side view, the snooker pack in the end, side and corner views, and 4:2:0 touching
     pairs at 30° in the corner view. 6 tests in `ball-detect-edge.test.ts` fail (analysis.md,
     "Post-review").

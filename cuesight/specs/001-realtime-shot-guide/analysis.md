@@ -6,8 +6,10 @@ v1.0.0, and the code and tests.
 
 **Corrected 2026-11-15.** The code review that followed found this pass too optimistic. The
 original findings below are kept as a record, with their corrections marked. The coverage table and
-metrics now describe `fix/wave1`. The review, and a fresh cross-check of the revised artifacts
-against the code, are in [Post-review (2026-11-15)](#post-review-2026-11-15).
+metrics now describe `fix/wave1` (two rows are marked as updated for `fix2b/app`). The review, and a
+fresh cross-check of the revised artifacts against the code, are in
+[Post-review (2026-11-15)](#post-review-2026-11-15); the status after wave 2 is in
+[Post-wave-2](#post-wave-2-2026-11-15-fix2bapp--00f722d).
 
 ## Findings (2026-11-14 pass)
 
@@ -36,7 +38,7 @@ artifacts themselves. See P-C1 … P-C8 below.
 | FR-004 balls, cue, parallax | T043, T073 | `ball-detect.test.ts`: the assertion is median ≤ 10 mm and p95 ≤ 25 mm. The worst measured median on the 9-ball fixture is 6.3 mm (end view; 4:2:0 end view 6.4 mm). `ball-detect-edge.test.ts` covers clusters, hangers, glare, sticks, cue ambiguity and names. **6 cluster cases fail** (P-C1) |
 | FR-005 smoothing and quality | T045, T071 | `tracker.test.ts`, `pipeline-live.test.ts` |
 | FR-006 freeze | T051 | `camera.spec.ts` |
-| FR-007 mark cue ball | T051, T083 | **No automated test.** Manual: quickstart Q16. Broken on a frozen layout (open, T078) |
+| FR-007 mark cue ball | T051, T083 | *Updated for `fix2b/app`:* `camera.spec.ts` (frozen layout), `live-logic.test.ts` (`applyCueOverride`, the "Tap the cue ball." hint). Quickstart Q16 for the live path by hand |
 | FR-008 practice table | T033 | `virtual.spec.ts`, `practice3d.spec.ts` (drag). Adding and removing balls is not automated |
 | FR-009 tap ball/pocket, auto pocket | T029, T033, T051 | `planner.test.ts`, e2e |
 | FR-010 aim geometry | T023–T024, T029, T072 | `geometry.test.ts` (eighth labels within 2°), `pocket-window.test.ts` (corner hangers), `planner-edge.test.ts` (rail-frozen, frozen cue ball) |
@@ -56,7 +58,7 @@ artifacts themselves. See P-C1 … P-C8 below.
 | FR-025 on-device only | T048–T049 | `offline.spec.ts`: zero requests to any other origin |
 | FR-026 offline and installable | T004, T065 | `offline.spec.ts`: offline reload, Practice and Snap work offline. Installability is checked by hand only |
 | FR-027 camera-denied fallback | T051 | `camera.spec.ts` |
-| FR-028 tunable physics | T010, T064 | `physicsFor` is exercised with the default settings only (`ui-components.test.ts`, `snap-guide.test.ts`). The preset mapping is not asserted |
+| FR-028 tunable physics | T010, T064, T079 | *Updated for `fix2b/app`:* `settings.test.ts` asserts every preset combination of `physicsFor` and the settings ranges and validation |
 
 ## Metrics (updated 2026-11-15, `fix/wave1`)
 
@@ -247,3 +249,49 @@ severity.
    mind.
 3. Decide the tip unit (T082) before any copy work on spin text.
 4. Apply the README and 002 edits listed above (T081).
+
+## Post-wave-2 (2026-11-15, `fix2b/app` = 00f722d)
+
+Wave 2a (`fix2a/*`) and wave 2b (`fix2b/base`, `plan-ui`, `live-snap`, integration and a final
+verify) landed the app side on top of the wave-1 merge (`fix1b/merge`). This pass re-checks the
+open items above against the code on `fix2b/app`. The README and 002 edits (T081) were applied in
+the same docs pass.
+
+<!-- RELEASE: the test counts below are the README "Test status" figures; update both together. -->
+**Tests on `fix2b/app`**: `npx vitest run` 887 tests in 61 files, 881 pass and 6 fail (the same
+`ball-detect-edge.test.ts` cases as P-C1). `npm run e2e` 125 tests, all passing. `tsc --noEmit` is
+clean.
+
+| ID | Status on `fix2b/app` | Evidence |
+|---|---|---|
+| P-C1 | **Open** (CRITICAL; Gate 3). The 6 cluster and pair tests still fail. T074 belongs to the vision branch, which changes `src/vision` separately | `ball-detect-edge.test.ts` |
+| P-C2 | **Resolved**. The live plan and overlay are drawn only on a locked table, with a 2-result grace that a new table frame does not inherit (`live-logic.ts` `liveGate`, `nextSinceLocked`). A frozen plan is drawn only through a live calibration with the same ordered corners (`framesMatch`). With no cue ball the hint asks for a tap | `live-logic.test.ts`, `camera.spec.ts` |
+| P-C3 | **Resolved**. 22 CSS px pick floor on every table view, with the ball-vs-pocket rule; 44 px controls and fields. T068 is closed | `ui.spec.ts`, `render3d-picking.test.ts` |
+| P-C4 | **Resolved**. `physicsFor` presets carry source and ASSUMPTION notes; lively cushion e0 is 0.9, inside the cited 0.75–0.9 | `settings.ts`, `settings.test.ts` |
+| P-C8 | **Resolved**. A new version waits and offers "Reload"; the precache covers the whole build (icons, manifest, sample photos), revalidates every file and refuses a shell from another build; older caches are kept for open pages | `sw-precache.test.ts`, `sw-update.test.ts`, `update.spec.ts`, `offline.spec.ts` |
+| P-F2 | **Resolved** (decision). 1 tip = ¼ R is kept (2 tips = the 0.5 R miscue limit), the plural is fixed, and the card details add the offset in mm. spec.md, data-model.md and the 002 quickstart say so | `power-tips.test.ts`, `shot-card.ts` `tipOffsetMm` |
+| P-F5 | **Resolved**. The wrong `fractionOf` comment example is gone; the comment's examples (38.7° "⅜", 35.7° "thick ⅜") match the code, and the threshold is now 1.5° for label and phrase | `geometry.ts`, `geometry.test.ts` |
+| P-F6 | **Resolved** by this docs pass (README, `docs/ios.md`, specs/002) | — |
+| P-E1 | **Resolved** in part. The frozen-layout path of FR-007 is automated; the live path shares `applyCueOverride` and is unit-tested | `camera.spec.ts`, `live-logic.test.ts` |
+| P-U1 | **Resolved**. `reset` now calls `pipeline.reset()`, which keeps the id counter | `vision-worker.test.ts` |
+
+New cross-checks of this pass (the artifacts against `fix2b/app`):
+
+| ID | Category | Severity | Location | Summary | Status |
+|---|---|---|---|---|---|
+| W-1 | Drift | — | data-model.md, core-api.md, research.md R-11 | The merged recommender (probes at half weight, `risks`, half steps, `TOO_SOFT_PENALTY`, `NO_SIDE_PENALTY`, `FULL_EVALUATIONS` 324), the frozen power advice (`advice`, `adviceSkipped`, `noWorkingPower`), `cb-short`, `fractionPhrase`, `strokeName`, `obPocketSpeed`, `throwAim` and the 1.5° fraction rule were missing | **Resolved** (this pass) |
+| W-2 | Drift | — | worker-protocol.md, 002 worker-protocol-v2.md | Budget bound 228 (now 324), `reset` restarting ids, no `plan` message, no `perEvalMs`, no `risks` | **Resolved** (this pass) |
+| W-3 | Drift | — | spec.md FR-003, FR-009, FR-012, FR-020, FR-023, FR-024, FR-028, edge cases | The kept selection, the calibration and camera-failure words, the pick floor, the power gauge, the fallback toasts, the lock gate, the cue-stick style and the settings ranges were not specified | **Resolved** (this pass) |
+| W-4 | Coverage gap | LOW | FR-008, FR-023, FR-026 | Add/remove balls, overlay alignment while moving, and installability are still covered only in part (P-E2) | Open, low priority |
+
+**Metrics for this pass**: 28 FR, 8 SC. 27/28 FRs have an automated test (FR-024 by design review), 3
+of them only in part (W-4). Tasks: 82/83 done (all 69 original tasks; 13/14 of Phase 9); T074 is the
+one open task. Constitution: I, II, V, VI and VII are met; III and IV are met with the exceptions
+documented in plan.md Complexity Tracking (`timeCapMs`; simulation output records); Gate 3 is not met
+while P-C1 stands.
+
+**Next actions**:
+1. Do not merge to `main` while P-C1 stands: land the vision branch's T074 fix first.
+2. After that merge, update the README "Test status" line and the counts above, and re-run the e2e
+   suite (the recommended strokes depend on the measured device budget, so e2e tests must not pin
+   exact recommended strokes).

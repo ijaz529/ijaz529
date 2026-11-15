@@ -3,6 +3,11 @@
 All 001 entities ([001 data-model](../001-realtime-shot-guide/data-model.md)) are unchanged. Units
 are SI internally.
 
+**Revised 2026-11-15** to match `fix2b/app`. The TypeScript sources of truth are
+`src/app/render3d/index.ts`, `src/app/render3d/camera.ts`, `src/app/render3d/gestures.ts`,
+`src/app/snap/session.ts`, `src/app/snap/guide.ts`, `src/vision/player-view.ts` and
+`src/workers/protocol.ts`.
+
 ## Coordinate frames
 
 | Frame | Definition |
@@ -10,7 +15,7 @@ are SI internally.
 | **Table** | As in 001. Origin at the playing-surface centre, `+x` along the long rail, `+y` toward the top long rail, `+z` up from the bed. A ball centre is at `z = R` |
 | **Camera** (player photo) | OpenCV convention, matching `vision/synth/render.ts` `CameraModel.R` rows: `x` right, `y` down, `z` forward. `X_c = R·X_w + t`. The camera centre is `C = −Rᵀt` |
 | **Image** | Pixels of the processed frame (after orientation and downscale). Origin top-left. `u = f·X_c/Z_c + cx`, `v = f·Y_c/Z_c + cy` |
-| **Client** | CSS pixels in page coordinates, as returned by `getBoundingClientRect` plus the scroll offset. This is what `Table3D.toScreen` returns |
+| **Client** | CSS pixels in client (viewport) coordinates, like `PointerEvent.clientX/Y`: `getBoundingClientRect()`-based, with no scroll offset. This is what `Table3D.toScreen` returns and `pick` takes |
 | **Shooter** | `aimDir` (unit, table plane). `right = (aimDir.y, −aimDir.x)` and `up = ẑ`. `side > 0` is right english and `vert > 0` is follow |
 
 ## Scene3DData (input to the 3D view)
@@ -25,7 +30,8 @@ are SI internally.
 | `landing` | Vec2 \| null | landing marker (001 US5) |
 | `heatmap` | `{ cols, rows, values: Float32Array }` \| null | row-major, 0..1, over the bed |
 | `stroke` | Stroke \| null | cue-stick tip offset and pull-back. Defaults to `plan.stroke` |
-| `clothRgb` | `[r,g,b]`? | 0..255. Defaults to the brand felt `#0E6B4F` |
+| `clothRgb` | `[r,g,b]`? | 0..255. Defaults to the brand felt `#0E6B4F`. Snap passes the table photo's cloth (`snap/photo.ts` `clothRgbOf`); a grey (neutral) cloth model is drawn grey, never with its meaningless hue |
+| `riskPockets` | PocketId[]? | pockets where the recommended stroke scratches under a small error (`Recommendation.risks`): dashed rings |
 
 `setData` is cheap: it stores a reference, marks the scene dirty and renders on the next animation
 frame. The renderer never mutates the data.
@@ -47,27 +53,37 @@ frame. The renderer never mutates the data.
 | Preset | Eye / orbit parameters |
 |---|---|
 | `overview` | pitch 90°, fov 30°. Yaw aligns the long axis with the viewport's long axis (landscape: +x right, like 2D). Distance fitted with ≈ 3.5 % margin, minus UI insets |
-| `player` | eye ≈ cue − 0.55·aimDir + 0.30·ẑ, fov 50° (landscape) or 58° (portrait). The look point lies on z = R along the aim line, keeping the ghost ball in view and the cue ball low in the frame. Without a plan, aimDir = cue → table centre |
+| `player` | eye 0.5 m behind the cue ball along −aimDir (`PLAYER_BACK`), 0.21 m above the bed (`PLAYER_EYE_HEIGHT`) and at least 7 cm above the cue's rail-clearing line (so beyond the rail when the ball is frozen to it), fov 50° (landscape) or 58° (portrait). To keep the pocket, the object ball's path and the ghost ball in view it may back off by up to 0.38 m, widen the fov by up to 17° and turn toward the pocket. The look point lies on z = R. Without a plan, aimDir = cue → table centre. In this view the cue takes three idle practice strokes (1.8 s each) after the stroke, the cue ball or the view changes, then rests at address; none with reduced motion |
 | `broadcast` | elevated 3/4 view, fov 38°. Landscape: yaw ≈ −112°, pitch ≈ 34°. Portrait: yaw ≈ 196°, pitch ≈ 40°. Distance fitted |
 
-Flights interpolate (target, yaw, pitch, log distance, fovY) over 240–600 ms with
-`cubic-bezier(.2,.8,.2,1)`, or instantly with reduced motion.
+Flights interpolate (target, yaw, pitch, log distance, fovY) over 720 ms with an ease-in-out cubic,
+or instantly with reduced motion.
 
 ## Pick3D
 
-`{ kind: 'ball', id } | { kind: 'pocket', id } | { kind: 'cloth', pos } | null`. The priority is
-exact sphere hit → screen tolerance (22 CSS px) → pocket capture disc (radius mouth/2 + R) → bed
-→ `null` (R-19).
+`{ kind: 'ball', id } | { kind: 'pocket', id } | { kind: 'cloth', pos } | null`. The priority
+(`render3d/picking.ts`, R-19):
+1. an exact sphere hit, nearest first;
+2. a ball whose closest approach to the ray is within its natural radius, 1.8·R + 12 CSS px at the
+   ball's distance (the nearest ball wins);
+3. a ball reached only through the 22 CSS px floor yields to a pocket mouth that is nearer the tap on
+   screen (the same rule as the 2D table and the camera overlay);
+4. a pocket capture disc on the bed: centred 2 cm from the mouth centre into the pocket, radius
+   0.75 × the mouth width, and at least 22 CSS px;
+5. a bed point, else `null`.
 
 ## Gesture state machine (3D canvas)
+
+The pure state machine `src/app/render3d/gestures.ts` (tests: `tests/unit/app/render3d-gestures.test.ts`):
 
 ```text
 idle ──pointerdown──▶ pending(start, t0, hitBall?)
 pending ──moved ≥ 8 px & hitBall──▶ ball-drag   (onBallDrag 'start' … 'move' … 'end')
 pending ──moved ≥ 8 px & !hitBall──▶ orbit     (camera → 'custom', onCameraChange)
 pending ──2nd pointer──▶ pinch-pan             (zoom by distance ratio, pan by midpoint)
-pending ──up < 8 px & < 350 ms──▶ tap           (onTap(pick)); 2 taps on empty ≤ 300 ms, ≤ 24 px → lastPreset
-any ──pointercancel / lost capture──▶ idle      (ball-drag emits 'end' at the last position)
+pending ──up < 8 px & < 350 ms──▶ tap           (onTap(pick)); a 2nd tap on empty cloth ≤ 320 ms, ≤ 30 px → lastPreset
+wheel ──▶ custom, zoom × exp(dy·0.0015)         (Ctrl + wheel, a trackpad pinch: exp(dy·0.01))
+any ──pointercancel / lost capture──▶ idle      (never a tap; ball-drag emits 'end' at the last position)
 ```
 
 ## Playback (R-17)
@@ -78,7 +94,7 @@ any ──pointercancel / lost capture──▶ idle      (ball-drag emits 'end'
 |---|---|---|
 | `ballId` | string | |
 | `t[]`, `x[]`, `y[]` | Float64Array | one entry per recorded point. Points at events get the event's exact time; others are spread by arc length with a constant display deceleration (R-17) |
-| `q[]` | Float64Array (4 per point) | cumulative rolling rotation: displacement `d` → `|d|/R` about `ẑ × d̂` |
+| `q[]` | Float64Array (4 per point) | cumulative rolling rotation: displacement `d` → `\|d\|/R` about `ẑ × d̂` |
 | `start` | s | 0 for the cue ball; the first `ball` event time for others |
 | `end` | s | the time the ball stops or enters the pocket mouth |
 | `pocket` | `{ id, x, y, depth }` \| null | drop animation after `end` |
@@ -101,19 +117,24 @@ any ──pointercancel / lost capture──▶ idle      (ball-drag emits 'end'
 ### Playback state machine
 
 ```text
-idle ──playShot(plan)──▶ playing(rate = max(1, T/4))
-playing ──t ≥ T──▶ holding(600 ms) ──▶ idle (restore Scene3DData layout; promise resolves)
-playing|holding ──stopPlayback() / tap / Escape / setData with a new plan──▶ idle (restore; promise resolves)
+idle ──playShot(plan, {slow?})──▶ lead-in(0.5 s strike) ──▶ playing(rate = max(1, T/4); ½ with slow)
+playing ──t ≥ T──▶ holding(3.5 s; 6.3 s with reduced motion) ──▶ idle (restore Scene3DData layout; promise resolves)
+lead-in|playing|holding ──stopPlayback() / tap / Skip / Escape / setData with a new plan──▶ idle (restore; promise resolves)
 ```
+
+With recorded trajectories (`Trajectory.times`, `Trajectory.spins`), the replay passes every
+recorded point at its simulated time (scaled by the rate) and shows sliding from the recorded spins;
+hand-built tracks match their event points within 1 µm (`EVENT_MATCH_M`).
 
 ## Cue stick pose
 
 | Quantity | Value |
 |---|---|
-| Axis | along `aimDir`, through the strike point (`strikePoint3` in `scene-data.ts`, the same convention as `vision/player-view.strikePoint`) |
+| Axis | through the strike point (`strikePoint3` in `scene-data.ts`, the same convention as `vision/player-view.strikePoint`) |
+| Axis direction | `ShotPlan.cueDir` (`cueAimDir` is the same vector; `render/plan-draw.ts` `stickDir`): the cue's own squirt-corrected line, while the drawn ball path stays `aimDir` |
 | Tip gap behind the strike point | `cueGap(power) = 0.05 + 0.03·power` m (display mapping, not physics) |
-| Elevation | small minimum (`MIN_CUE_ELEVATION`), raised only to clear the rail behind the cue ball (max 60°) |
-| Visibility | when a plan exists and no playback is running |
+| Elevation | small minimum (`MIN_CUE_ELEVATION` = 4°), raised only to clear the rail behind the cue ball (max 60°) |
+| Visibility | when a plan (or a target) exists, outside the Top view and below 70° of camera pitch; in a replay only during the strike |
 
 ## Player view (vision)
 
@@ -126,7 +147,7 @@ table photo's tracked balls).
 
 | Field | Type | Rule |
 |---|---|---|
-| `frame` | Frame | RGBA, long side ≤ 1600 px (the app sends 1280) |
+| `frame` | Frame | RGBA, long side ≤ 1600 px (the app sends 960, `snap/photo.ts` `SNAP_MAX_DIM`; the test fixtures are 1280) |
 | `table` | TableSpec | same preset as the table photo |
 | `balls` | KnownBall[] | ≥ 1, exactly one with `isCue` |
 | `cueId` | string | must match the `isCue` ball |
@@ -186,58 +207,81 @@ is visible when `(P − C)·(P − c) < 0`.
 | Miscue ring and centre cross | 3D circle and arcs on the sphere, projected | dashed ring, thin cross |
 | Cue-ball inset | 2.5× crop around the projected cue-ball outline | same drawing |
 | Power | `plan.stroke.power`, `speedWord`, `minPower` | numerals + word + `renderPowerMeter` |
-| Confidence | `PlayerViewResult.confidence` | chip: "Fit: good / fair / low" + percentage |
-| Hidden or off-frame parts | visibility tests | dashed and labelled "hidden", or an edge arrow plus a message |
+| Confidence | `PlayerViewResult.confidence` | chip: "Fit: good / fair / low" + percentage, for the target the fit was made for (`SnapSession.player.fitTargetId`) |
+| Hidden parts | `PlayerGuide.hidden { aim, objectPath, cuePath }`: the stretches that another ball (`GuideInput.others`, the other balls of the layout) hides from the camera | drawn dashed and labelled "hidden", never dropped; a message says so. Line under the cue ball or the target itself is not "hidden" |
+| Off-frame parts | visibility tests | an edge arrow plus a message |
+| Aim label | `PlayerGuide.aimLabel { text, at, r, warn } \| null`: the photo label of a plan with **no ghost ball** (a frozen cue ball) | `planLabel`'s words ("Frozen · stroke 12° left") at the stroke line's end when that end is in the photo, otherwise on the cue ball; "Not makeable" (`warn`) on the cue ball. Null when the ghost ball carries the label or no anchor is in the photo. `at` and `r` are image px; `guide.ts` `aimLabelAnchor(aimLabel, mapping)` gives the canvas circle (centre by `toScreen`, radius by the mapping's scale), and `snap/draw.ts` places the label there, clear of the "Strike here" label |
+
+`guide.ts` builds no HUD text. The Snap HUD's aim line and the guide instruction come from
+`snap/session.ts` `snapAimText` and `snapGuideInstruction` (a frozen cue ball: "Frozen: stroke N° to
+the left/right of the line of centres"), and the HUD meter from `ui/power-meter.ts`, as on the card.
 
 ## SnapSession (state machine)
 
+*Revised 2026-11-15* to `src/app/snap/session.ts`. The steps (`SnapStep`) and the events that move
+between them:
+
 ```text
-idle
- ──table photo chosen──▶ overview-captured        (frame decoded; 'still' sent)
-overview-captured                                  (sub-status: processing → review | error)
- ──still result received──▶ overview-captured(review)   (outline + balls on the photo; player may edit)
- ──detection failed──▶ overview-captured(error)          (offers Tap corners / Retake)
- ──corners tapped──▶ overview-captured(processing)      (still re-run with manual corners)
- ──Confirm (after optional edits)──▶ layout-confirmed
-layout-confirmed
- ──tap target (+pocket)──▶ target-chosen           (plan computed; prompt for player photo)
-target-chosen
- ──player photo chosen──▶ player-captured          ('player-view' sent)
-player-captured
- ──result ok──▶ guided
- ──result !ok──▶ manual-taps                       (reason shown)
-manual-taps
- ──tap cue, tap target──▶ player-captured          ('player-view' with manualTaps) ──▶ guided
-guided
- ──change target/pocket/stroke──▶ guided           (re-plan, redraw on the same photo)
- ──new player photo──▶ player-captured
- ──Edit layout──▶ layout-confirmed                 (player photo kept; refit on return)
-any ──Start over / leave Snap──▶ idle              (photos released)
-any ──Retake table photo──▶ idle → overview-captured
+intro ──overview-photo──▶ overview-processing          (photo decoded; 'still' sent)
+overview-processing
+ ──overview-result, detectionUsable──▶ review          (outline + balls; fix the layout, pick the target)
+ ──overview-result, no calibration──▶ overview-error   (the reason in words, see below)
+ ──overview-failed──▶ overview-error                   (the vision worker failed)
+overview-error ──start-corners──▶ corners ──4 corner-taps──▶ overview-processing   ('still' with the taps)
+corners ──4 implausible taps──▶ overview-error         (refused locally, nothing sent)
+corners ──cancel-corners──▶ review (a layout exists) | overview-error
+review ──layout──▶ review                              (edited layout)
+review ──player-photo──▶ player-processing             ('player-view' sent)
+player-processing ──player-result ok──▶ guide
+player-processing ──player-result !ok, player-failed──▶ manual-taps   (reason shown)
+manual-taps ──manual-tap (cue), manual-tap (target)──▶ player-processing   ('player-view' with manualTaps)
+guide ──refit──▶ guide (player.refitting)              (a new target: the same photo is fitted again)
+guide ──edit-layout──▶ review ──back-to-guide──▶ guide | manual-taps
+any ──reset (Start over, leaving Snap)──▶ intro        (photos released)
 ```
 
-| Field | Type | Present from |
+| Field | Type | Notes |
 |---|---|---|
-| `state` | the states above | always |
-| `overview` | `{ frame: Frame; bitmapUrl?: string; vision: VisionResult }` | overview-captured |
-| `layout` | Ball[] (edited) | layout-confirmed |
-| `manualCorners` | Vec2[4] \| null | overview-captured (error) |
-| `targetId`, `pocketId` | string, PocketId? | target-chosen |
-| `plan` | ShotPlan | target-chosen |
-| `player` | `{ frame: Frame; result: PlayerViewResult \| null }` | player-captured |
-| `taps` | `{ cue?: Vec2; target?: Vec2 }` | manual-taps |
-| `error` | string \| null | any |
+| `step` | `SnapStep` | the steps above |
+| `overview` | `PhotoInfo & { vision: VisionResult \| null }` \| null | the table photo's size and source (`camera`, `library`, `sample`) and its detection |
+| `layout` | Ball[] \| null | the detected, then edited, layout |
+| `corners`, `cornerTaps` | Vec2[] \| null, Vec2[] | tapped cloth corners (table-photo px) and the taps in progress |
+| `player` | `PhotoInfo & { result; fitTargetId?; manual?; refitting? }` \| null | the player photo and its fit. `fitTargetId`: the target the fit (and its confidence) was made for; `manual`: a fit from the two taps; `refitting`: a quiet re-fit for a new target |
+| `taps` | `{ cue?: Vec2; target?: Vec2 }` | manual-fallback taps (image px) |
+| `error` | string \| null | the player-facing message |
+
+- `player-result` carries `{ result, targetId, manual }`. `fitCheck(session, targetId)` says whether
+  the fit on show is for the current target: `current`, `checking`, `refit` (an automatic fit for
+  another target: fit again), `taps` (a two-tap fit for another target: tap again) or `none`. The
+  pocket and the stroke never matter.
+- `detectionUsable(v)` = the result has a calibration. A table found without balls still opens the
+  review ("I found the table but no balls…"). A table cut off by the border that vision cannot
+  complete has no calibration.
+- Messages (`SNAP_MESSAGES`):
+  - no table: "The whole table must be in the photo — step back or turn the phone and retake it. All
+    four corners already in view? Tap them.";
+  - `bad-quad`, or four implausible taps: "Those four taps aren’t the cloth corners — tap them
+    again.";
+  - `cloth-unknown`: "Couldn’t tell the cloth from its surroundings — tap the four cloth corners
+    again, or retake the photo.";
+  - `moved` on a still (a loose quad) opens the review with "Your four corners don’t quite match the
+    cloth — check the layout, or tap the corners again.";
+  - a failed vision worker: the detection-failure texts of the spec's Snap edge cases
+    (`visionFailedEvent`).
 
 Invariants:
-- Photos live only in this object and the worker. Leaving `snap` mode sets `state = idle` and drops
-  every frame (FR-122).
-- The pure transition function `snapReducer(session, event) → session` is unit-tested.
+- Photo pixels live only in the Snap controller and the worker, never in this state. Returning to
+  `intro` (Start over, leaving Snap) drops every photo, and a photo that finishes decoding after that
+  is dropped too (FR-122).
+- The pure transition function `snapReducer(session, event) → session` is unit-tested
+  (`tests/unit/app/snap-session.test.ts`).
 
 ## Worker protocol v2 (summary)
 
 See [contracts/worker-protocol-v2.md](./contracts/worker-protocol-v2.md). New: `still` →
-`still` (VisionResult) and `player-view` → `player-view` (PlayerViewResult). Every v1 message keeps
-its shape with `v: 2`.
+`still` (VisionResult) and `player-view` → `player-view` (PlayerViewResult) on the vision worker, and
+the optional `plan` → `plan` (the full ShotPlan with a frozen cue ball's power advice) and `perEvalMs`
+on the planner worker. Every v1 message keeps its shape with `v: 2`.
 
 ## Design tokens ("Midnight Felt", `:root` in `src/app/styles.css`)
 
@@ -271,7 +315,9 @@ export function icon(name: IconName, size?: number): SVGSVGElement;
 // src/app/ui/sheet.ts
 export function createSheet(el: HTMLElement, opts?: { peek?: number }): { expand(): void; collapse(): void; isExpanded(): boolean };
 // src/app/ui/power-meter.ts
-export function renderPowerMeter(power: number, minPower: number | null): HTMLElement;
+export function renderPowerMeter(power: number, minPower: number | null, opts?: MeterOptions): HTMLElement;
+// MeterOptions (frozen, no working power, …) and the minimum come from meterOptions(plan) and
+// meterMinPower(plan): the one reader of a plan's power figures for the card and the Snap HUD.
 // src/app/ui/spin-ball.ts
 export function renderSpinBall(side: number, vert: number, size?: number): HTMLElement;
 // src/app/ui/fraction-glyph.ts
@@ -303,15 +349,15 @@ Kept from 001 (regression contract):
 
 | Item | Value |
 |---|---|
-| `capacitor.config.json` | `appId` (default `app.cuesight.ios`; CI overrides `PRODUCT_BUNDLE_IDENTIFIER` with `vars.IOS_BUNDLE_ID`), `appName: "CueSight"`, `webDir: "dist"`, `backgroundColor: "#070B14"`, `ios.contentInset: "never"`, no `server.url` |
-| Deployment target | iOS 15.0 (Capacitor 8 template) |
+| `capacitor.config.ts` | `appId` (default `com.cuesight.app`; `CUESIGHT_APP_ID` overrides it at `cap sync`, and CI overrides `PRODUCT_BUNDLE_IDENTIFIER` with `vars.IOS_BUNDLE_ID`), `appName: "CueSight"`, `webDir: "dist"`, `backgroundColor: "#070B14"`, `ios.contentInset: "never"`, no `server.url`, no plugins |
+| Deployment target | iOS 16.0 (`IPHONEOS_DEPLOYMENT_TARGET`; the UI's CSS container queries need WKWebView 16) |
 | `CFBundleDisplayName` | `CueSight` |
-| `NSCameraUsageDescription` | "CueSight uses the camera to see the table and the balls so it can show you the shot. Photos and video stay on your phone." |
-| `NSPhotoLibraryUsageDescription` | "Choose a photo of your table to plan a shot. Photos stay on your phone." |
+| `NSCameraUsageDescription` | "CueSight uses the camera to see the table and guide your shot. Frames never leave your phone." |
+| `NSPhotoLibraryUsageDescription` | "CueSight opens the table photos you choose to plan a shot. Photos never leave your phone." |
 | `ITSAppUsesNonExemptEncryption` | `false` |
 | Orientations | portrait, landscape left/right (iPhone); all (iPad) |
 | Launch screen | `#070B14` background with the centred logo |
-| Build numbers | `MARKETING_VERSION` = `package.json` version; `CURRENT_PROJECT_VERSION` = `${run_number}${run_attempt}` |
+| Build numbers | `MARKETING_VERSION` = `package.json` version; build number = `<run number>.<run attempt>` (`scripts/ios-testflight.sh`; `BUILD_NUMBER` overrides it) |
 
 ### CI secrets and variables (names of record)
 
@@ -319,6 +365,7 @@ Kept from 001 (regression contract):
 |---|---|---|
 | `APP_STORE_CONNECT_KEY_ID` | secret | API key ID (10 characters) |
 | `APP_STORE_CONNECT_ISSUER_ID` | secret | issuer UUID |
-| `APP_STORE_CONNECT_KEY_P8` | secret | base64 of `AuthKey_<KEYID>.p8` |
-| `APPLE_TEAM_ID` | secret | 10-character team ID |
-| `IOS_BUNDLE_ID` | repository variable | bundle ID registered in App Store Connect |
+| `APP_STORE_CONNECT_KEY_P8` | secret | `AuthKey_<KEYID>.p8`: the PEM text as is, or its base64 |
+| `APPLE_TEAM_ID` | secret (or repository variable) | 10-character team ID |
+| `IOS_BUNDLE_ID` | repository variable, optional | bundle ID registered in App Store Connect (default `com.cuesight.app`) |
+| `XCODE_VERSION` | repository variable, optional | pins Xcode (default: the newest installed) |

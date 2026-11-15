@@ -1,7 +1,7 @@
 # Implementation Plan: Real-Time Shot Guide
 
 **Branch**: `001-realtime-shot-guide` | **Date**: 2026-11-14, revised 2026-11-15 after the code
-review | **Spec**: [spec.md](./spec.md)
+review and again for the wave-2 app (`fix2b/app`) | **Spec**: [spec.md](./spec.md)
 
 **Input**: Feature specification from `/specs/001-realtime-shot-guide/spec.md`
 
@@ -63,9 +63,16 @@ Firefox and Safari. Installable PWA.
 - Overlay at ≥ 30 fps (rAF).
 - Vision at ≥ 10 Hz at 640 px processing width.
 - A single-shot plan with full simulation in < 50 ms (target < 10 ms).
+  - The main-thread plan skips the frozen power advice (`PlanOptions.advice: false`): measured median
+    ≤ 1 ms and max 1.2–6 ms on 2–16 balls, against 11–22 ms median and up to 73 ms with the advice
+    (desktop). The advice runs in the planner worker (`plan` message) once the input settles; the
+    full plan replaces the quick one about 120 ms plus the worker's time later. Under SwiftShader CI
+    load that is seconds: up to 2.3 s to post plus up to 3.0 s in the worker.
+  - The search plans (position search, suggestions) skip the advice too.
 - Position search in < 1.5 s. It is bounded by an evaluation count that the planner worker sizes
-  once per device, so the result does not depend on device speed. Suggestions for 15 balls in
-  < 2 s.
+  once per device (at most 324, `FULL_EVALUATIONS`), so the result does not depend on device speed.
+  The measured figures travel with each request (`perEvalMs`), so a restarted worker keeps the same
+  budget. Suggestions for 15 balls in < 2 s.
 - CI guards are looser than the device budgets, to absorb shared-runner noise:
   - planShot with 22 balls: median < 100 ms;
   - vision pipeline at 640×480: median < 150 ms;
@@ -86,12 +93,12 @@ TypeScript including tests.
 
 | # | Principle | How this plan complies | Status |
 |---|---|---|---|
-| I | Physics Fidelity | Physics constants live in `core/physics/params.ts`, each with a source or an ASSUMPTION note (`pocketArrivalSpeed` gained its note in the review fixes). Planner and vision tunables carry ASSUMPTION notes in place. The analytic rules are in `core/physics/analytic.ts`. Tests pin the 90° rule, the 30° rule, throw (TP A.14), squirt (TP A.31, 2.40°/1.64°), natural roll at 2/5 R, rolling distance, the cushion behaviour of R-08 and no energy gain | ✅ core. ⚠️ app: the `settings.ts` physics presets have no notes (open, analysis.md P-C4) |
-| II | Honest Uncertainty | Every plan carries a margin of error, a difficulty label and warnings (blocked, scratch, too soft, not-makeable, throw-uncompensable). Vision reports quality and lock state. It returns no calibration and no balls on frames without a usable quad, flags no cue ball when it is ambiguous, and gives manual corners a reason when they are not locked. **Target:** the live overlay and plan are shown only while the table is locked, with a 2-result grace | ⚠️ vision ✅. App gating on `locked` is open on `fix/wave1`: the plan is still drawn on `unstable` frames (wave 2, `fix2a/live`) |
+| I | Physics Fidelity | Physics constants live in `core/physics/params.ts`, each with a source or an ASSUMPTION note (`pocketArrivalSpeed` gained its note in the review fixes). Planner and vision tunables carry ASSUMPTION notes in place, and so do the app's settings presets (`settings.ts` `physicsFor`; lively cushions e0 0.9, inside 0.75–0.9). The analytic rules are in `core/physics/analytic.ts`. Tests pin the 90° rule, the 30° rule, throw (TP A.14), squirt (TP A.31, 2.40°/1.64°), natural roll at 2/5 R, rolling distance, the cushion behaviour of R-08 and no energy gain | ✅ |
+| II | Honest Uncertainty | Every plan carries a margin of error, a difficulty label and warnings (blocked, scratch, too soft, cb-short, not-makeable, throw-uncompensable). Vision reports quality and lock state. It returns no calibration and no balls on frames without a usable quad, flags no cue ball when it is ambiguous, and gives manual corners a reason when they are not locked. The live plan and overlay are computed and drawn only on a locked table (a 2-result grace after a lock absorbs a single missed quad; a new table frame gets no grace from the old one). A frozen plan is drawn only through a live calibration with the same ordered corners. The card says when a recommended stroke is speed-sensitive, when the search was cut short, and when its scratch risk was not checked | ✅ |
 | III | Test-First, Deterministic Core | `core` and `vision` are pure over typed arrays. A synthetic ray-traced renderer gives ground truth. Tests are written with each module. `recommendStroke` is bounded by a deterministic evaluation count (`maxEvaluations`), not by the clock | ✅, with one documented exception (Complexity Tracking: the optional `timeCapMs` safety net) |
 | IV | Real-Time Budget | Vision runs in a worker. Position, suggest and heatmap searches run in a planner worker. Backpressured frame submission (one frame in flight). Table detection uses a pre-allocated scratch (`TableScratch`). Ball detection reuses module-level typed arrays across frames (≈ 40–50 KB of heap per call, none of it per pixel). The simulator's step loop allocates only output records | ✅, with one documented exception (Complexity Tracking: simulation output records) |
-| V | Privacy by Architecture | No `fetch` in app code. The service worker precaches the built app (asset list injected at build time) and serves it offline. Frames stay in memory, in workers. `tests/e2e/offline.spec.ts` checks for zero external requests and an offline reload | ✅ (safe update of an open page after a deploy: wave 2, `fix2a/platform`) |
-| VI | Player-First Language | `core/shot/coach.ts` maps physics to coaching phrases. Palette is Okabe–Ito with dash patterns. Virtual table works without a camera. Touch targets ≥ 44 px | ⚠️ some targets are below 44 px on `fix/wave1` (T068 reopened; wave 2, `fix2a/ui`). The "tip" unit is half the tip-width players mean (analysis.md P-F2) |
+| V | Privacy by Architecture | No `fetch` for user data: the only `fetch` in app code is the same-origin bundled sample photo. The service worker precaches the build's own files (shell, chunks, workers, icons, manifest, sample photos) from a list written at build time; the build id hashes every listed file's bytes; each install revalidates with the server and checks that the shell belongs to the build; a new version never takes over an open page ("Reload"). No user data. Frames stay in memory, in workers. `tests/e2e/offline.spec.ts` checks for zero external requests and an offline reload; `tests/e2e/update.spec.ts` checks a deploy under an open page | ✅ |
+| VI | Player-First Language | `core/shot/coach.ts` maps physics to coaching phrases. Palette is Okabe–Ito with dash patterns. Virtual table works without a camera. Touch targets ≥ 44 px (ball picks have a 22 px radius floor), checked by `tests/e2e/ui.spec.ts`. One tip = ¼ R, decided and kept, with mm in the card details (T082) | ✅ |
 | VII | Simplicity | Zero runtime deps. Layering enforced by folder and import direction (`core` imports nothing from `vision` or `app`) | ✅ |
 
 Post-design re-check (after Phase 1, 2026-11-14): ✅ no violations.
@@ -103,6 +110,13 @@ analysis.md "Post-review" for the review's evidence.
 - II and VI still have open app-side items.
 - All the open items are scheduled for wave 2.
 - Gate 3 (merge) is **not met**: 6 vision unit tests fail.
+
+Post-wave-2 re-check (2026-11-15, `fix2b/app`):
+- I, II, V and VI are now met on the app side too (rows above): the preset notes, the lock gate,
+  the safe service-worker update and the 44 px targets landed, and the tip unit is decided.
+- III and IV are met with the exceptions below.
+- Gate 3 is **still not met**: the same 6 `ball-detect-edge.test.ts` cases fail (T074), pending the
+  vision branch. See analysis.md "Post-wave-2".
 
 ## Project Structure
 
@@ -154,17 +168,24 @@ src/
 │   ├── pipeline.ts             # createPipeline(): anchored lock, manual corners, 2R separation
 │   └── synth/render.ts         # Ray-traced synthetic table renderer (fixtures + fake camera)
 ├── workers/
-│   ├── protocol.ts             # Versioned message types (contracts/worker-protocol.md)
+│   ├── protocol.ts             # Versioned message types (v2: 002 contracts/worker-protocol-v2.md)
 │   ├── vision.worker.ts
-│   └── planner.worker.ts
+│   ├── planner.worker.ts
+│   └── eval-budget.ts          # Per-device evaluation budget of the stroke search
 └── app/
     ├── main.ts                 # Bootstrapping, mode switch, wiring
     ├── store.ts                # Tiny observable app state
+    ├── live-logic.ts           # Pure Live rules: lock gate, hints, calibration words, kept selection
+    ├── planner-client.ts       # Planner worker client: stale rule, restarts, full-plan requests
+    ├── pocket-names.ts         # View-relative pocket names
+    ├── announce.ts             # Screen-reader announcements of a plan
+    ├── sw-update.ts            # Service-worker registration and the "Reload" prompt
     ├── camera.ts               # getUserMedia + backpressured frame capture
-    ├── settings.ts             # Persisted settings (guarded localStorage)
+    ├── settings.ts             # Persisted settings (guarded localStorage), physics presets
     ├── drills.ts               # Practice-table layouts
     ├── render/
-    │   ├── palette.ts          # Okabe–Ito colours + dash styles
+    │   ├── palette.ts          # Okabe–Ito colours + dash styles (and the "Cue stick" style)
+    │   ├── plan-draw.ts        # Shared plan geometry and labels for every view
     │   ├── overlay.ts          # Perspective AR overlay on the camera view
     │   └── table-view.ts       # Top-down table (mini-map + virtual table)
     ├── ui/
@@ -179,7 +200,8 @@ tests/
 ├── integration/…               # pipeline on synthetic renders, planner on layouts
 └── e2e/…                       # Playwright (virtual table + fake camera)
 
-scripts/make-fake-camera.ts     # Renders synthetic table frames → tests/fixtures/table.y4m
+scripts/make-fake-camera.ts     # Renders synthetic table frames → tests/fixtures/table.y4m (npm run fixtures)
+scripts/sw-precache.ts          # Writes the precache list and build id into dist/sw.js
 scripts/screenshots.cjs         # README screenshots (fake camera)
 public/                         # manifest.webmanifest, sw.js, icon.svg
 index.html
@@ -205,7 +227,7 @@ Documented exceptions (added 2026-11-15; the earlier "nothing to justify" was wr
 
 | Principle | Exception | Why it is needed | Bound / safeguard |
 |---|---|---|---|
-| IV (no allocation in per-step loops) | `simulate()` allocates its **output records** inside the step loop: one `SimEvent` per event, trajectory points when `record` is on, and at most n `FirstHit` records | These are the result itself. Pre-sized output buffers would need a guessed event count or a resize path, and would not change the cost: allocation scales with events, not with steps | Bounded by the event count, not the step count. Searches run with `record: false`. Per-step and fallback helpers read doubles from a pre-allocated buffer, so nothing is boxed per step. Guarded by `simulate.test.ts`: ≈ 3 M steps trigger ≤ 3 GC collections, and a lint test bans `Math.hypot` |
+| IV (no allocation in per-step loops) | `simulate()` allocates its **output records** inside the step loop: one `SimEvent` per event, trajectory points when `record` is on (with each point's time and spin, `mark()`), and at most n `FirstHit` records | These are the result itself. Pre-sized output buffers would need a guessed event count or a resize path, and would not change the cost: allocation scales with events, not with steps | Bounded by the event count, not the step count. Searches run with `record: false`. Per-step and fallback helpers read doubles from a pre-allocated buffer, so nothing is boxed per step. Guarded by `simulate.test.ts`: ≈ 3 M steps trigger ≤ 3 GC collections, and a lint test bans `Math.hypot` |
 | III (no timing dependencies in core) | `recommendStroke` reads `performance.now()` **only when** the caller passes the optional `timeCapMs` safety net. The planner worker passes 1500 ms | Principle IV's < 1.5 s search budget must hold even when the worker's per-device evaluation count under-estimates the cost (a heavy layout, a throttled CPU) | Off by default, so the core is deterministic in tests and for any caller that does not set it. When the cap fires, the result says `timedOut: true`, so the app can call the search partial. The evaluation count, not the clock, is the primary budget |
 
 Not exceptions, but recorded for honesty:
