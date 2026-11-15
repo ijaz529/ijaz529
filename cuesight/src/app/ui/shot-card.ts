@@ -8,11 +8,12 @@ import { squirtOffsetText, throwSentence } from '../../core/shot/coach';
 import type { ShotPlan, WarningCode } from '../../core/types';
 import type { AppState } from '../store';
 import { fractionShort, fractionTile, frozenStroke, hasStroke, isFrozenPlan } from '../render/plan-draw';
-import { BALL_NAMED } from '../render/palette';
+import { BALL_NAMED, BALL_NEUTRAL } from '../render/palette';
+import { tagText } from './ball-tags';
 import { fractionGlyphSvg, type CutSide } from './fraction-glyph';
 import { iconMarkup } from './icons';
 import { writeHtml } from './patch';
-import { powerMeterSvg, powerText } from './power-meter';
+import { meterMinPower, meterOptions, powerMeterSvg, powerText } from './power-meter';
 import { spinBallSvg, spinText } from './spin-ball';
 
 export { fractionShort, fractionTile } from '../render/plan-draw';
@@ -55,6 +56,11 @@ export interface CardContext {
   fragile?: boolean;
   searchCutShort?: boolean;
   risksUnknown?: boolean;
+  /**
+   * The table's ball set, so a chip letters a colour-named ball as the 2D table and the 3D tags do
+   * (pool: its number, snooker: R/Y/G/Br/Bl/P/Bk). Unknown (undefined): the colour's initial.
+   */
+  snooker?: boolean;
 }
 
 /** The card's notes on a recommendation, from store.recommended (empty unless the plan plays it). */
@@ -74,12 +80,24 @@ export const REC_NOTES = {
 
 /** The tip for a pocket that cannot be made and has no other pocket to offer (never "Try another pocket"). */
 export const NO_OTHER_POCKET = 'No other pocket is clear for this ball: pick another ball or play a safety.';
+/** The same tip when a warning on the card already says NO_OTHER_POCKET (the planner's blocked note). */
+export const PICK_ANOTHER = 'Pick another ball, or tap Suggest a shot.';
+
+/** A ball vision could not name: the neutral label 'ball' (or none). */
+const unnamed = (label: string): boolean => {
+  const l = label.trim().toLowerCase();
+  return !l || l === 'ball';
+};
+/** How the card and the announcer name a ball: "Ball 3", "Ball red"; an unnamed one "Unnamed ball" (never "Ball ball"). */
+export function ballWords(label: string): string {
+  return unnamed(label) ? 'Unnamed ball' : `Ball ${label}`;
+}
 
 /** A row of ball buttons (the same flow as tapping a ball on the table). */
-function ballPicker(balls: NonNullable<CardContext['balls']>): string {
+function ballPicker(balls: NonNullable<CardContext['balls']>, snooker?: boolean): string {
   if (!balls.length) return '';
   return `<div class="picker" role="group" aria-label="Pick the ball to pocket"><span class="picker-k">Or pick a ball</span><div class="picker-row">${balls
-    .map((b) => `<button type="button" class="pick-ball" data-card-act="ball" data-id="${esc(b.id)}" aria-label="Ball ${esc(b.label)}">${ballChip(b.label, b.color, b.stripe)}<span>${esc(b.label)}</span></button>`)
+    .map((b) => `<button type="button" class="pick-ball" data-card-act="ball" data-id="${esc(b.id)}" aria-label="${esc(ballWords(b.label))}">${ballChip(b.label, b.color, b.stripe, snooker)}<span>${esc(b.label)}</span></button>`)
     .join('')}</div></div>`;
 }
 
@@ -123,20 +141,28 @@ export function marginText(plan: Pick<ShotPlan, 'toleranceMm'>): string {
 /** Two letters where colour names share an initial (blue, black, brown), as the ball tags write them. */
 const CHIP_TWO: Record<string, string> = { blue: 'Bl', black: 'Bk', brown: 'Br' };
 
-/** The chip's letter: the number, a colour's initial (Bl/Bk/Br), nothing for a ball vision could not name ('ball'). */
-export function chipLetter(label: string): string {
+/**
+ * The chip's letter: the number, nothing for a ball vision could not name ('ball'); with the table
+ * known, the 3D tags' text (ball-tags.ts tagText: on a pool table a colour's number, "yellow stripe"
+ * → 9; snooker R/Y/G/Br/Bl/P/Bk); with it unknown, the colour's initial (Bl/Bk/Br where shared).
+ */
+export function chipLetter(label: string, snooker?: boolean): string {
   if (/^\d+$/.test(label)) return label;
   const word = label.trim().toLowerCase().split(/\s+/)[0] ?? '';
   if (!word || word === 'ball') return '';
+  if (snooker !== undefined) return tagText({ kind: 'object', label, id: label }, snooker);
   return CHIP_TWO[word] ?? word.charAt(0).toUpperCase();
 }
 
-/** A tiny pool-ball chip: the ball colour, a white number disc, a band for stripes. */
-export function ballChip(label: string, color?: string, stripe?: boolean): string {
+/**
+ * A tiny pool-ball chip: the ball colour, a white number disc, a band for stripes. An unnamed ball
+ * without a colour is neutral grey (BALL_NEUTRAL, as on the 2D table), never the cue ball's ivory.
+ */
+export function ballChip(label: string, color?: string, stripe?: boolean, snooker?: boolean): string {
   const isCue = label === 'cue' || label === 'white' || label === 'white?';
-  const short = isCue ? '' : chipLetter(label);
+  const short = isCue ? '' : chipLetter(label, snooker);
   const word = label.trim().toLowerCase().split(/\s+/)[0] ?? '';
-  const bg = isCue ? '#F4F1E8' : (color ?? BALL_NAMED[word] ?? '#E9E6DC');
+  const bg = isCue ? '#F4F1E8' : (color ?? BALL_NAMED[word] ?? (unnamed(label) ? BALL_NEUTRAL : '#E9E6DC'));
   const style = stripe ? `--ball:${esc(bg)};background:#F4F1E8` : `--ball:${esc(bg)};background:${esc(bg)}`;
   return `<span class="ball-chip${stripe ? ' stripe' : ''}${isCue ? ' cue' : ''}" style="${style}" aria-hidden="true">${short ? `<i>${esc(short)}</i>` : ''}</span>`;
 }
@@ -179,7 +205,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
       `<div class="card empty">
       <span class="empty-icon">${iconMarkup('hand', 26)}</span>
       <div class="empty-text"><p class="hint">${esc(ctx.hint)}</p>${ctx.status ? `<p class="sub">${esc(ctx.status)}</p>` : ''}</div>
-    </div>${ctx.pockets?.length ? pocketPicker(ctx.pockets) : ballPicker(ctx.balls ?? [])}`,
+    </div>${ctx.pockets?.length ? pocketPicker(ctx.pockets) : ballPicker(ctx.balls ?? [], ctx.snooker)}`,
       cardFocusKey,
     );
     return;
@@ -229,14 +255,21 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
   // The stroke's side names the cause: outside english for a thicker shift, no "side-spin" on a centre-ball hit.
   const throwAim = plan.throwAim ?? plan.throwShiftDir ?? null;
   if (!noStroke && Math.abs(plan.throwDeg) >= 0.1 && throwAim && !tipThrow) corrections.push(throwSentence({ ...plan, throwAim, side: p.side }));
-  const minPower = Number.isFinite(plan.minPower) ? plan.minPower : null;
-  // The meter's "only just drops" band (minPowerCapture..minPower); a frozen cue ball's minimum moves
-  // with the power (its warning names the powers that work), so it gets no band.
-  const meterOpts = { frozen, ...(!frozen && plan.minPowerCapture !== undefined ? { capture: plan.minPowerCapture } : {}) };
-  // Frozen, the stroke angle off the line of centres plays the cut's part (no ghost ball, cut 0).
+  // The meter's minimum and its "only just drops" band (minPowerCapture..minPower); a frozen cue ball's
+  // minimum moves with the power (its warning names the powers that work), so it gets no band, and
+  // past 10 no power works ("No power gets it in with pace", never "more than full power").
+  const minPower = meterMinPower(plan);
+  const meterOpts = meterOptions(plan);
+  // Frozen, the stroke angle off the line of centres plays the cut's part (no ghost ball, cut 0). At the
+  // peek with a headline warning the tile's captions step aside (styles.css), so the numeral's own row
+  // says it: "FROZEN" over "12° stroke left" (.fz-k is the caption again for sight only; .fz-side is
+  // read there, where the line below it is hidden).
   const fz = frozen ? frozenStroke(plan, plan.ghost) : null;
   const frozenMsg = plan.warnings.find((w) => w.code === 'frozen')?.message ?? 'Frozen: the object ball goes along the line of centres.';
-  const tip = !plan.makeable && plan.alternatives.length === 0 ? NO_OTHER_POCKET : plan.tip;
+  // Not makeable and no other pocket: never "Try another pocket". When a warning shown on the card
+  // already says so (the planner's blocked note), the tip says what to do instead, not the same again.
+  const noAlt = !plan.makeable && plan.alternatives.length === 0;
+  const tip = noAlt ? (shown.some((w) => w.message.includes(NO_OTHER_POCKET)) ? PICK_ANOTHER : NO_OTHER_POCKET) : plan.tip;
   const powerStr = power.toFixed(power % 1 ? 1 : 0);
   const phrase = plan.fractionPhrase ?? `${plan.fractionLabel}-ball`;
   const spinWords = describeSpin(p);
@@ -246,7 +279,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
         fz
           ? `<div class="hero-stat cut frozen">
         <div class="k">Frozen</div>
-        <div class="hero-main"><div class="v num" data-testid="cut">${fz.deg}°</div></div>
+        <div class="hero-main"><span class="fz-k" aria-hidden="true">Frozen</span><div class="v num" data-testid="cut">${fz.deg}°</div><span class="fz-side">${fz.side === 'straight' ? 'straight' : `stroke ${fz.side}`}</span></div>
         <div class="s" title="${esc(frozenMsg)}"><span class="t">${fz.side === 'straight' ? 'straight' : `stroke ${fz.side}`}</span><span class="sr-only"> (${fz.side === 'straight' ? 'stroke straight through the line of centres' : `stroke ${fz.deg}° ${fz.side} of the line of centres`}; no ghost ball)</span></div>
       </div>`
           : `<div class="hero-stat cut">
@@ -273,12 +306,12 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     : `<div class="hero blocked">
       <ul class="warnings" aria-label="Why it is not makeable">${chips(shown)}</ul>
       <div class="blocked-acts">${ctx.altPocket ? `<button type="button" class="btn primary" data-card-act="alt" data-pocket="${esc(ctx.altPocket.id)}">${iconMarkup('target', 18)}<span>Try the ${esc(ctx.altPocket.name)}</span></button>` : ''}<button type="button" class="btn secondary" data-card-act="suggest">${iconMarkup('sparkles', 18)}<span>Suggest a shot</span></button></div>
-      <span class="sr-only">${frozen ? 'Balls frozen together' : 'Cut'} <span data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>${frozen ? '' : `, ${esc(phrase)}`}. No stroke: this shot is not makeable.<span hidden data-testid="power">${powerStr}<small>/10</small></span><span hidden data-testid="spin">${esc(spinWords)}</span></span>
+      <span class="sr-only">${frozen ? `Balls frozen together.<span hidden data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>` : `Cut <span data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>, ${esc(phrase)}.`} No stroke: this shot is not makeable.<span hidden data-testid="power">${powerStr}<small>/10</small></span><span hidden data-testid="spin">${esc(spinWords)}</span></span>
     </div>`;
   const html = `
   <article class="card shot${plan.makeable ? '' : ' not-makeable'}${head && plan.makeable ? ' has-warn' : ''}" data-testid="shot-card" aria-label="Shot plan">
     <header class="shot-head">
-      <h2 class="title">${ballChip(ctx.targetLabel, ctx.targetColor, ctx.targetStripe)}<span class="sr-only">Ball </span><span class="target-label${/^\d+$/.test(ctx.targetLabel) ? ' sr-only' : ''}">${esc(ctx.targetLabel)}</span>${iconMarkup('arrow-right', 18, 'arrow')}<span class="pocket-name">${esc(ctx.pocketName)}</span></h2>
+      <h2 class="title">${ballChip(ctx.targetLabel, ctx.targetColor, ctx.targetStripe, ctx.snooker)}<span class="sr-only">${unnamed(ctx.targetLabel) ? 'Unnamed ' : 'Ball '}</span><span class="target-label${/^\d+$/.test(ctx.targetLabel) ? ' sr-only' : ''}">${esc(ctx.targetLabel)}</span>${iconMarkup('arrow-right', 18, 'arrow')}<span class="pocket-name">${esc(ctx.pocketName)}</span></h2>
       <div class="chip diff diff-${diffClass}" title="${plan.makeable ? `Hit the contact point within ${esc(marginText(plan))} (aim ±${plan.toleranceDeg.toFixed(2)}°)` : 'Not makeable'}" data-testid="difficulty">${plan.makeable ? `${esc(plan.difficulty)} · ${esc(marginText(plan))}` : `${iconMarkup('alert', 14)}not makeable`}</div>
     </header>
     ${head && plan.makeable ? `<p class="head-warn warn-${head.code}">${iconMarkup('alert', 16)}<span>${esc(head.message)}</span></p>` : ''}
@@ -300,7 +333,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
       <div><dt>CB speed</dt><dd>${powerToSpeed(power).toFixed(1)} m/s</dd></div>
       <div><dt>CB speed at contact</dt><dd>${plan.cbSpeedAtContact.toFixed(2)} m/s</dd></div>
       <div><dt>OB speed</dt><dd>${plan.obSpeed.toFixed(2)} m/s</dd></div>
-      <div><dt>Min power</dt><dd>${plan.minPower > 10 ? (frozen ? 'none' : '>10') : plan.minPower.toFixed(1)}</dd></div>
+      <div><dt>Min power</dt><dd>${minPower === null ? '—' : minPower > 10 ? (meterOpts.frozen ? 'none' : '>10') : minPower.toFixed(1)}</dd></div>
     </dl>`
         : ''
     }

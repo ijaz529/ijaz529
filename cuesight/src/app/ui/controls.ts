@@ -130,17 +130,27 @@ export interface StrokeActions {
   useRecommended(): void;
 }
 
+/** A pushed value waits at most this long (ms) for its frame (a software-rendered frame can take seconds). */
+export const PER_FRAME_MAX_MS = 40;
+
 /**
- * Calls `fn` at most once per animation frame, with the latest value pushed, and at once on flush.
- * A fast slider drag fires several input events per frame and each one replans on the main thread
- * (a soft frozen-ball plan with its power advice costs 12–75 ms); only the last value of a frame
- * matters.
+ * Calls `fn` at most once per animation frame, with the latest value pushed — on the next frame or
+ * after PER_FRAME_MAX_MS, whichever comes first — and at once on flush. A fast slider drag fires
+ * several input events per frame and each one replans on the main thread (a soft frozen-ball plan
+ * with its power advice costs 12–75 ms); only the last value matters. The timer keeps the replan from
+ * waiting on a slow frame (SwiftShader under load: 0.5–1.8 s), which a plain rAF did.
+ * `pending()`: a value is waiting (the control must not be reset to the store's older value meanwhile).
  */
-export function perFrame<T>(fn: (v: T) => void, raf: (cb: () => void) => unknown = (cb) => (typeof requestAnimationFrame === 'function' ? requestAnimationFrame(cb) : setTimeout(cb, 16))) {
+export function perFrame<T>(
+  fn: (v: T) => void,
+  raf: (cb: () => void) => unknown = (cb) => (typeof requestAnimationFrame === 'function' ? requestAnimationFrame(cb) : setTimeout(cb, 16)),
+  timeout: (cb: () => void, ms: number) => unknown = (cb, ms) => setTimeout(cb, ms),
+) {
   let pending: { v: T } | null = null;
-  let scheduled = false;
+  /** The schedule of the waiting value: whichever of its frame and its timer fires first runs it. */
+  let token: object | null = null;
   const run = () => {
-    scheduled = false;
+    token = null;
     const p = pending;
     pending = null;
     if (p) fn(p.v);
@@ -148,12 +158,17 @@ export function perFrame<T>(fn: (v: T) => void, raf: (cb: () => void) => unknown
   return {
     push(v: T): void {
       pending = { v };
-      if (!scheduled) {
-        scheduled = true;
-        raf(run);
-      }
+      if (token) return;
+      const t = {};
+      token = t;
+      const fire = () => {
+        if (token === t) run();
+      };
+      raf(fire);
+      timeout(fire, PER_FRAME_MAX_MS);
     },
     flush: run,
+    pending: (): boolean => pending !== null,
   };
 }
 
@@ -191,7 +206,9 @@ export function buildStrokeControls(el: HTMLElement, actions: StrokeActions) {
   el.querySelector('[data-act="rec"]')!.addEventListener('click', actions.useRecommended);
   return {
     update(stroke: Stroke, mine: boolean, recommended: Stroke | null): void {
-      if (document.activeElement !== range) {
+      // Not while a dragged value waits to be sent: the store still holds the older power, and writing
+      // it back would make the thumb jump back for a frame (a touch drag need not focus the range).
+      if (document.activeElement !== range && !send.pending()) {
         range.value = String(stroke.power);
         out.value = String(stroke.power);
         fill();
@@ -240,6 +257,9 @@ export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: st
     writeHtml(el, `<section class="suggest"><h2>${iconMarkup('sparkles', 16)}Best shots</h2><p class="none">${iconMarkup('info', 16)}No clean pot on this layout. Consider a safety or a bank.</p></section>`);
     return;
   }
+  // Chips letter a colour-named ball as the table's 2D view and 3D tags do (pool numbers, snooker
+  // letters); a state without its table (unknown set) keeps the colour's initial.
+  const snooker = s.table ? s.table.id === 'snooker12' : undefined;
   const html = `<section class="suggest" aria-labelledby="sugg-title"><h2 id="sugg-title">${iconMarkup('sparkles', 16)}Best shots</h2><ol>${s.suggestions.items
     .map((x, i) => {
       const look = ballLook(s, x.targetId);
@@ -247,7 +267,7 @@ export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: st
       // The chip already shows a numbered ball's number: the text says it only to screen readers. The
       // margin is in mm of contact, the shot card's unit.
       const numbered = /^\d+$/.test(label);
-      return `<li><button type="button" class="sugg" data-i="${i}"><span class="rank" aria-hidden="true">${i + 1}</span>${ballChip(label, look.color, look.stripe)}<span class="sugg-main">${numbered ? `<span class="sr-only">Ball ${esc(label)} </span>` : `<b>${esc(label)}</b> `}→ ${esc(pocketName(x.pocketId, x.targetId))}</span><span class="chip diff diff-${x.difficulty.replace(' ', '-')}">${x.difficulty} · ${esc(marginText(x))}</span>${iconMarkup('chevron-right', 18, 'go')}</button></li>`;
+      return `<li><button type="button" class="sugg" data-i="${i}"><span class="rank" aria-hidden="true">${i + 1}</span>${ballChip(label, look.color, look.stripe, snooker)}<span class="sugg-main">${numbered ? `<span class="sr-only">Ball ${esc(label)} </span>` : `<b>${esc(label)}</b> `}→ ${esc(pocketName(x.pocketId, x.targetId))}</span><span class="chip diff diff-${x.difficulty.replace(' ', '-')}">${x.difficulty} · ${esc(marginText(x))}</span>${iconMarkup('chevron-right', 18, 'go')}</button></li>`;
     })
     .join('')}</ol></section>`;
   writeHtml(el, html, (b) => (b as HTMLElement).dataset?.i ?? null);

@@ -10,12 +10,14 @@
 import { describeSpin, speedWord } from '../core/shot/power';
 import type { PocketId, ShotPlan } from '../core/types';
 import { isFrozenPlan } from './render/plan-draw';
+import { ballWords } from './ui/shot-card';
 
 export const ANNOUNCE_DEBOUNCE_MS = 600;
 
 /** The plan in one or two sentences, in the card's words. */
 export function planSentence(p: ShotPlan, names: Partial<Record<PocketId, string>>, labelOf: (id: string) => string): string {
-  const ball = `Ball ${labelOf(p.targetId)}`;
+  // "Ball 3", "Ball red"; a ball vision could not name: "Unnamed ball" (never "Ball ball").
+  const ball = ballWords(labelOf(p.targetId));
   const pocket = names[p.pocketId] ?? p.pocketId;
   if (!p.makeable) {
     const why = p.warnings.find((w) => w.code === 'not-makeable' || w.code === 'blocked-cue' || w.code === 'blocked-object');
@@ -59,8 +61,11 @@ export function createAnnouncer(el: { textContent: string | null }, timers: { se
       queuedKey = key;
       if (timer) timers.clear(timer);
       const sentence = planSentence(p, names, labelOf);
-      // The sentence already says why a shot is not makeable or too soft; speed hints do not apply to it.
-      const skip = new Set<string>(['not-makeable', 'cb-short', ...(p.makeable ? [] : ['too-soft', 'thin-cut', 'ob-missed'])]);
+      // The sentence already says why a shot is not makeable or too soft; speed hints do not apply to it,
+      // nor does the generic frozen hint ("…along the line of centres (plus a little throw)"), which the
+      // card drops next to a not-makeable reason too: for snooker's touching ball it would even suggest
+      // playing along that line.
+      const skip = new Set<string>(['not-makeable', 'cb-short', ...(p.makeable ? [] : ['too-soft', 'thin-cut', 'ob-missed', 'frozen'])]);
       const warnings = p.warnings.filter((w) => !skip.has(w.code));
       timer = timers.set(() => {
         timer = 0;

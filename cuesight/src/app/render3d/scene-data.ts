@@ -355,6 +355,14 @@ export function cueAim(d: { balls: readonly Ball[]; plan: ShotPlan | null; targe
   return { cue: cue.pos, aim: v, cueDir: v, ghost: null };
 }
 
+/**
+ * The ghost-ball sphere the 3D frame draws (FrameState.ghost): the plan's ghost ball, or none — the
+ * plan hidden, no cue ball, or a frozen cue ball (the core puts its "ghost" on the cue ball itself).
+ */
+export function frameGhost(plan: ShotPlan | null, cue: Vec2 | null, showPlan: boolean): Vec2 | null {
+  return showPlan && plan && cue ? aimLine(plan, cue, 0).ghost : null;
+}
+
 /** Contact point on the object ball (3D, on its equator facing the ghost ball). */
 export function contactPoint3(plan: ShotPlan, R: number): V3 {
   return [plan.contactPoint.x, plan.contactPoint.y, R];

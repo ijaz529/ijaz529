@@ -3,6 +3,8 @@
  * gauge itself carries an accessible text equivalent ("Power 6 of 10, medium-firm").
  */
 import { speedWord } from '../../core/shot/power';
+import type { ShotPlan } from '../../core/types';
+import { isFrozenPlan } from '../render/plan-draw';
 
 /**
  * Segment colour ramp: one hue, soft white → accent sky by intensity (the plan's line colours — orange,
@@ -27,6 +29,28 @@ export interface MeterOptions {
    * no power pots it with pace — never "more than full power" (the warning says harder won't help).
    */
   frozen?: boolean;
+}
+
+/**
+ * Fields of a plan the meter reads. `noWorkingPower` / `adviceSkipped` are the live-snap core's
+ * (ShotPlan.noWorkingPower: no power on the scale works, more power is not the answer;
+ * ShotPlan.adviceSkipped: a frozen cue ball's power advice is not worked out yet), read when present.
+ */
+export type MeterPlan = Pick<ShotPlan, 'warnings' | 'minPower' | 'minPowerCapture'> & { noWorkingPower?: unknown; adviceSkipped?: boolean };
+
+/**
+ * The meter's options for a plan — one helper for the shot card and the Snap HUD, so the two never
+ * word the same plan differently: a frozen cue ball (or any plan where no power works) has no band
+ * and, past 10, "No power gets it in with pace"; any other plan gets its "only just drops" band.
+ */
+export function meterOptions(plan: MeterPlan): MeterOptions {
+  const frozen = isFrozenPlan(plan) || !!plan.noWorkingPower;
+  return { frozen, ...(!frozen && plan.minPowerCapture !== undefined ? { capture: plan.minPowerCapture } : {}) };
+}
+
+/** The minimum the meter marks: none while it is unknown (not finite, or the frozen advice still being worked out). */
+export function meterMinPower(plan: MeterPlan): number | null {
+  return Number.isFinite(plan.minPower) && !plan.adviceSkipped ? plan.minPower : null;
 }
 
 /** The "only just drops" band [from, to] in power units, or null when there is none to show. */

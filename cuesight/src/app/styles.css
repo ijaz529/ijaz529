@@ -3021,6 +3021,46 @@ body[data-sheet='expanded'] :is(.view-controls, .scene-label, .scene-lead) {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+/* A frozen cue ball's tile must still say so there: a bare "0°" reads as a 0° cut. Its numeral row
+   carries "FROZEN" over the stroke angle and side ("20° stroke right", "0° straight"), inside the
+   same 38 px, so the peek keeps its height: two grid rows that never wrap (the widest, "60° stroke
+   right", takes 97 px of the 106 px tile at 375 px). Elsewhere the caption and the line below say it. */
+.hero-stat.cut.frozen :is(.fz-k, .fz-side) {
+  display: none;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat.cut.frozen .hero-main {
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-areas: 'k k' 'v s';
+  justify-content: center;
+  align-content: center;
+  align-items: baseline;
+  column-gap: 3px;
+  row-gap: 2px;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat.cut.frozen .fz-k {
+  display: block;
+  grid-area: k;
+  text-align: center;
+  font-size: 11px;
+  line-height: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #ff9b66;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat.cut.frozen .v {
+  grid-area: v;
+  font-size: 20px;
+}
+.panel[data-sheet='peek'] .shot.has-warn .hero-stat.cut.frozen .fz-side {
+  display: block;
+  grid-area: s;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
 /* Not makeable: the reason and what to do instead replace the numerals. */
 .hero.blocked {
   display: flex;

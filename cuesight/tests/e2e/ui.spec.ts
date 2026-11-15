@@ -532,8 +532,12 @@ type PlanHook = {
   selectBall(id: string): void;
   selectPocket(id: string): void;
 };
-/** Puts the practice table into a layout and plans b1: a 35.5° cut ("thick ⅜") or a frozen cue ball. */
-async function practiceShot(page: Page, kind: 'thick' | 'frozen' | 'frozen-soft') {
+/**
+ * Puts the practice table into a layout and plans b1: a 35.5° cut ("thick ⅜"), or a frozen cue ball
+ * whose line of centres points into the pocket ('frozen': stroke straight through) or 3° off it
+ * ('frozen-side': the stroke turned to throw it in).
+ */
+async function practiceShot(page: Page, kind: 'thick' | 'frozen' | 'frozen-side' | 'frozen-soft') {
   await page.evaluate((kind) => {
     const h = (window as unknown as { __cuesight: PlanHook }).__cuesight;
     const R = h.state.table.ballRadius;
@@ -551,7 +555,10 @@ async function practiceShot(page: Page, kind: 'thick' | 'frozen' | 'frozen-soft'
       const L = Math.hypot(m.x - ob.x, m.y - ob.y);
       const u = { x: (m.x - ob.x) / L, y: (m.y - ob.y) / L };
       if (kind === 'frozen') cue = { x: ob.x - u.x * (2 * R + 0.0003), y: ob.y - u.y * (2 * R + 0.0003) };
-      else {
+      else if (kind === 'frozen-side') {
+        const a = Math.atan2(u.y, u.x) + (3 * Math.PI) / 180;
+        cue = { x: ob.x - Math.cos(a) * (2 * R + 0.0003), y: ob.y - Math.sin(a) * (2 * R + 0.0003) };
+      } else {
         const a = Math.atan2(u.y, u.x) + (35.5 * Math.PI) / 180;
         cue = { x: ob.x - 2 * R * u.x - Math.cos(a) * 0.9, y: ob.y - 2 * R * u.y - Math.sin(a) * 0.9 };
       }
@@ -617,6 +624,49 @@ for (const viewport of [
       expect(t).toMatchObject({ k: 'Cut', t: '⅜+ ball', clipped: 0 });
     });
 
+    // Verify round 1: at the peek with a headline warning the tiles' captions step aside, and a frozen
+    // tile showed a bare "0°" (read as a 0° cut). "Frozen" and the stroke side must be ON SCREEN there:
+    // inside the viewport, inside the cut tile and the visible sheet (the top element at their centre),
+    // not merely in the markup.
+    test('frozen cue ball at the peek: "Frozen" and the stroke side are visible in the cut tile, never a bare 0°', async ({ page }) => {
+      await noOnboarding(page);
+      await page.goto('/?mode=practice');
+      await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+      for (const kind of ['frozen', 'frozen-side'] as const) {
+        await practiceShot(page, kind);
+        await expect(page.locator('#shot-card .hero-stat.cut.frozen')).toHaveCount(1);
+        await expect(page.locator('#shot-card .head-warn')).toBeVisible();
+        await sheetSettled(page);
+        const v = await page.evaluate(() => {
+          const card = document.querySelector('#shot-card')!;
+          const tile = card.querySelector('.hero-stat.cut')!.getBoundingClientRect();
+          const seen = (sel: string) => {
+            const e = card.querySelector<HTMLElement>(sel)!;
+            const r = e.getBoundingClientRect();
+            const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            return {
+              text: e.textContent,
+              size: r.width > 4 && r.height > 4,
+              inView: r.top >= 0 && r.bottom <= innerHeight && r.left >= 0 && r.right <= innerWidth,
+              inTile: r.left >= tile.left - 0.5 && r.right <= tile.right + 0.5 && r.top >= tile.top - 0.5 && r.bottom <= tile.bottom + 0.5,
+              onTop: !!hit && (hit === e || e.contains(hit)),
+              clipped: e.scrollWidth - e.clientWidth,
+            };
+          };
+          return { sheet: document.querySelector<HTMLElement>('.panel')!.dataset.sheet, k: seen('.hero-stat.cut .fz-k'), side: seen('.hero-stat.cut .fz-side'), cut: seen('.hero-stat.cut [data-testid="cut"]') };
+        });
+        expect(v.sheet).toBe('peek');
+        const shown = { size: true, inView: true, inTile: true, onTop: true };
+        expect(v.k, `${kind}: "Frozen"`).toMatchObject({ text: 'Frozen', ...shown });
+        expect(v.side, `${kind}: the stroke side`).toMatchObject(shown);
+        expect(v.cut, `${kind}: the angle`).toMatchObject(shown);
+        // (The recommended stroke can turn a straight frozen shot a degree or two to throw it in.)
+        expect(v.cut.text).toMatch(/^\d+°$/);
+        expect(v.side.text).toMatch(v.cut.text === '0°' ? /^straight$/ : /^stroke (left|right)$/);
+        if (kind === 'frozen-side') expect(v.cut.text).not.toBe('0°');
+      }
+    });
+
     test('frozen cue ball: the tile says "Frozen", the long power advice fits two lines at the peek and shows in full above it', async ({ page }) => {
       await noOnboarding(page);
       await page.goto('/?mode=practice');
@@ -662,3 +712,36 @@ for (const viewport of [
     });
   });
 }
+
+/**
+ * Verify round 1: the power slider's replan is coalesced (controls.ts perFrame). A value waiting to be
+ * sent must never be overwritten by a render of the older power (the thumb jumped back a frame when
+ * the range was not focused, as on a touch drag).
+ */
+test.describe('power slider coalescing', () => {
+  test('a dragged value is not overwritten by a render already queued for that frame', async ({ page }) => {
+    await noOnboarding(page);
+    await page.goto('/?mode=practice&renderer=2d');
+    await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+    await hookEval(page, (h) => h.selectBall('b1'));
+    await hookEval(page, (h) => h.selectPocket('TR'));
+    await expect(page.getByTestId('cut')).toHaveText('30.0°');
+    for (const to of ['8', '3', '6.5']) {
+      const seen = await page.locator('#power').evaluate(async (r: HTMLInputElement, to: string) => {
+        r.blur();
+        // A store update before the input: its render runs on the next frame, with the older power.
+        window.dispatchEvent(new Event('resize'));
+        r.value = to;
+        r.dispatchEvent(new Event('input', { bubbles: true }));
+        const vals: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          await new Promise((f) => requestAnimationFrame(f));
+          vals.push(r.value);
+        }
+        return vals;
+      }, to);
+      expect(seen, `slider at ${to}`).toEqual([to, to, to]);
+      await expect(page.getByTestId('power')).toContainText(to);
+    }
+  });
+});

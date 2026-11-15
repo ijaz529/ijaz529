@@ -11,7 +11,7 @@
 import { describeSpin } from '../../core/shot/power';
 import type { PocketId, ShotPlan, Stroke, TableSpec, Vec2, Vec3 } from '../../core/types';
 import { projectBallOutline, strikePoint, type CameraPose } from '../../vision/player-view';
-import { aimLine, fractionTile, frozenStroke, isFrozenPlan, stickDir } from '../render/plan-draw';
+import { aimLine, planLabel, stickDir } from '../render/plan-draw';
 
 /** Cue-tip radius used to size the strike dot (a 13 mm tip). ASSUMPTION: typical pool tip. */
 export const TIP_RADIUS_M = 0.0065;
@@ -107,6 +107,14 @@ export interface PlayerGuide {
   cross: Vec2[][];
   /** The cue's axis behind the strike point, toward the player (faint guide). */
   cueAxis: Vec2[][];
+  /**
+   * The aim label of a plan with no ghost ball (a frozen cue ball), which the photo would otherwise
+   * lose: the label anchors on the ghost outline (snap/draw.ts "Aim here" / "Not makeable"). The
+   * 2D table's words (planLabel: "Frozen · stroke 12° left"), at the far end of the stroke line; a
+   * shot that cannot be played says "Not makeable" at the cue ball (`warn`: vermillion). `at`/`r`:
+   * the anchor circle in image px. Null when the ghost ball carries the label.
+   */
+  aimLabel: { text: string; at: Vec2; r: number; warn: boolean } | null;
   inFrame: { cue: boolean; ghost: boolean; target: boolean; pocket: boolean };
   /** Player-facing notes on what is not visible and how to fix it (FR-119). */
   messages: string[];
@@ -393,6 +401,15 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
   };
 
   const face = inFrame.cue && cueCenter && cueRadiusPx > 0 ? strikeFace(cueCenter, cueRadiusPx, side, vert) : null;
+  // No ghost ball to carry the aim label: the stroke line's end (a playable frozen shot), or the cue ball.
+  let aimLabel: PlayerGuide['aimLabel'] = null;
+  if (!aimL.ghost) {
+    const ok = playable(plan);
+    const endCam = toCam(pose, on(aimL.to));
+    const end = ok && endCam.z > NEAR ? pix(pose, endCam) : null;
+    const at = end ?? cueCenter;
+    if (at) aimLabel = { text: ok ? planLabel(plan, i.cue) : 'Not makeable', at, r: end ? 3 : cueRadiusPx, warn: !ok };
+  }
   const messages: string[] = [];
   if (!inFrame.cue) messages.push('The cue ball is outside the photo. Step back a little so the cue ball is in the picture, then retake.');
   else if (strike && !strike.visible) messages.push('This photo is not from behind the cue ball. Crouch behind it, facing the shot, and retake. The strike point is shown on the spin ball.');
@@ -423,6 +440,7 @@ export function buildPlayerGuide(i: GuideInput): PlayerGuide {
     miscue,
     cross,
     cueAxis,
+    aimLabel,
     inFrame,
     messages,
   };
@@ -495,17 +513,3 @@ export function unplayableHeadline(plan: Pick<ShotPlan, 'makeable' | 'warnings' 
   return { title: 'Not makeable', reason: reason.charAt(0).toUpperCase() + reason.slice(1), altPocketId: plan.alternatives[0]?.pocketId ?? null };
 }
 
-/**
- * The Snap HUD's aim line in player words: "Aim at the ghost ball · 36° cut, ⅜+ ball" (the card's
- * tile wording, one short line), or for a frozen cue ball, which has no ghost ball, the stroke the
- * coaching tip asks for: "Frozen: stroke 12° left of the line of centres" / "Frozen: stroke
- * straight through the line of centres". `cue` is the cue-ball centre (default: the frozen plan's
- * ghost, which the core puts on the cue ball).
- */
-export function aimHudText(plan: Pick<ShotPlan, 'cutAngleDeg' | 'fractionLabel' | 'fractionPhrase' | 'warnings' | 'aimDir' | 'contactPoint' | 'ghost'>, cue: Vec2 = plan.ghost): string {
-  if (isFrozenPlan(plan)) {
-    const f = frozenStroke(plan, cue);
-    return f.side === 'straight' ? 'Frozen: stroke straight through the line of centres' : `Frozen: stroke ${f.deg}° ${f.side} of the line of centres`;
-  }
-  return `Aim at the ghost ball · ${plan.cutAngleDeg.toFixed(0)}° cut, ${fractionTile(plan).replace(/-/g, '\u2011')}`;
-}

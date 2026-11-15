@@ -5,8 +5,13 @@ import { changedFrac, gridDiff, regionStats, tableBox } from './pixels';
 
 // SwiftShader draws every frame in software. At the Pixel 7's device pixel ratio (2.625) a frame took
 // 0.6–3.3 s under CPU load and the camera-preset and replay tests flaked (wave-2a item 16); the
-// iPhone SE and iPad projects already run at 1. The layout in CSS px stays the phone's.
-test.use({ deviceScaleFactor: 1 });
+// iPhone SE and iPad projects already run at 1. The layout in CSS px stays the phone's. Chromium only:
+// WebKit (playwright.webkit.config.ts, iPhone 15 at 3) keeps its device's ratio, the only DPR-3 run.
+test.use({
+  deviceScaleFactor: async ({ browserName }, use, testInfo) => {
+    await use(browserName === 'chromium' ? 1 : (testInfo.project.use.deviceScaleFactor ?? 1));
+  },
+});
 type V2 = { x: number; y: number };
 type Hook = {
   state: {
@@ -102,6 +107,152 @@ const recommendedPlan = (page: Page, pocket = 'TR') =>
     { timeout: 30_000 },
   );
 
+/** A replay's longest real time: strike 0.5 s + the shot x1, capped at 4 s + the hold 3.5 s (render3d/index.ts). */
+const REPLAY_MAX_MS = 8_000;
+const HOLD_MS = 3_500;
+/** A skipped replay stops at once (stopPlayback is synchronous); this leaves room for a busy main thread. */
+const SKIP_MAX_MS = 1_500;
+
+type ReplayRec = { sawPlaying: boolean; moved: number; stillFrames: number; frames: number; tapAt: number; endedAt: number; lastAt: number; maxGap: number };
+
+/**
+ * Watches the next replay from inside the page, right after every frame the 3D view draws (rAF is
+ * wrapped; a frame counts when it issued GL draws, and is read back before the browser presents it):
+ * whether it played, the largest fraction of ~4 px cells of `box` whose luminance changed by more than
+ * 20 against the still plan (as changedFrac), and when it ended after the Play tap. The still
+ * reference is a frame drawn and read the same way just before (view3d.resize() redraws it).
+ */
+async function replayWatch(page: Page, box: { x: number; y: number; width: number; height: number }) {
+  await page.evaluate(async (box) => {
+    const w = window as unknown as { __cuesight: Hook & { view3d: { resize(): void } }; __replayRec: ReplayRec };
+    const h = w.__cuesight;
+    const canvas = document.querySelector<HTMLCanvasElement>('#table3d')!;
+    const gl = canvas.getContext('webgl2')!; // the 3D view's own context
+    const rect = canvas.getBoundingClientRect();
+    const k = canvas.width / rect.width;
+    const x0 = Math.max(0, Math.round((box.x - rect.left) * k));
+    const W = Math.max(1, Math.min(canvas.width - x0, Math.round(box.width * k)));
+    const H = Math.max(1, Math.min(canvas.height, Math.round(box.height * k)));
+    const y0 = Math.max(0, canvas.height - Math.round((box.y - rect.top) * k) - H); // GL rows run bottom-up
+    const cell = Math.max(1, Math.round(4 * k));
+    const GX = Math.ceil(W / cell);
+    const GY = Math.ceil(H / cell);
+    const buf = new Uint8Array(W * H * 4);
+    const grid = (): Float64Array => {
+      const prev = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.readPixels(x0, y0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, prev);
+      const sum = new Float64Array(GX * GY);
+      const n = new Float64Array(GX * GY);
+      for (let y = 0; y < H; y += 2)
+        for (let x = 0; x < W; x += 2) {
+          const i = (y * W + x) * 4;
+          const c = Math.floor(y / cell) * GX + Math.floor(x / cell);
+          sum[c]! += 0.2126 * buf[i]! + 0.7152 * buf[i + 1]! + 0.0722 * buf[i + 2]!;
+          n[c]! += 1;
+        }
+      for (let c = 0; c < sum.length; c++) sum[c] = sum[c]! / Math.max(1, n[c]!);
+      return sum;
+    };
+    let draws = 0;
+    const proto = WebGL2RenderingContext.prototype as unknown as Record<string, (...a: unknown[]) => unknown>;
+    for (const name of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+      const orig = proto[name]!;
+      proto[name] = function (this: unknown, ...a: unknown[]) {
+        draws++;
+        return orig.apply(this, a);
+      };
+    }
+    const rec: ReplayRec = { sawPlaying: false, moved: 0, stillFrames: 0, frames: 0, tapAt: 0, endedAt: 0, lastAt: 0, maxGap: 0 };
+    w.__replayRec = rec;
+    let still: Float64Array | null = null;
+    let seen = draws;
+    const after = () => {
+      if (rec.endedAt) return;
+      const playingNow = h.view3d!.isPlaying();
+      if (rec.sawPlaying && !playingNow) {
+        rec.endedAt = performance.now();
+        rec.maxGap = Math.max(rec.maxGap, rec.endedAt - rec.lastAt);
+        return;
+      }
+      if (draws === seen) return;
+      seen = draws;
+      const g = grid();
+      if (!playingNow) {
+        if (!rec.sawPlaying) {
+          still = g;
+          rec.stillFrames++;
+        }
+        return;
+      }
+      const t = performance.now();
+      if (rec.lastAt) rec.maxGap = Math.max(rec.maxGap, t - rec.lastAt);
+      rec.lastAt = t;
+      rec.sawPlaying = true;
+      rec.frames++;
+      if (!still) return;
+      let changed = 0;
+      for (let c = 0; c < g.length; c++) if (Math.abs(g[c]! - still[c]!) > 20) changed++;
+      rec.moved = Math.max(rec.moved, changed / g.length);
+    };
+    const raf = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = (cb: FrameRequestCallback) =>
+      raf((t) => {
+        cb(t);
+        after();
+      });
+    window.addEventListener(
+      'click',
+      (e) => {
+        if (!rec.tapAt && (e.target as Element | null)?.closest?.('.vc-play')) rec.tapAt = performance.now();
+      },
+      true,
+    );
+    // One still frame, drawn and read back like the replay's.
+    h.view3d.resize();
+    for (let i = 0; i < 300 && !rec.stillFrames; i++) await new Promise((r) => setTimeout(r, 20));
+  }, box);
+}
+/** What replayWatch saw; `endedAfterMs` runs from the Play tap to the first moment the replay is over. */
+const replayRecord = (page: Page) =>
+  page.evaluate(() => {
+    const r = (window as unknown as { __replayRec: ReplayRec }).__replayRec;
+    return { ...r, endedAfterMs: r.endedAt && r.tapAt ? r.endedAt - r.tapAt : Infinity };
+  });
+type SkipRec = { during: boolean; at: number; sync: boolean; stopped: number };
+/**
+ * Arms a page-side stopwatch for the next Skip input (a click on the Skip button, or Escape): `during`
+ * when it arrived while the replay ran, `sync` when the replay was over as soon as the app had handled
+ * that input (a bubble-phase listener on window runs after the app's own), `at` its time and `stopped`
+ * when it was first seen over (at once, else checked every 5 ms).
+ */
+async function skipWatch(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { __cuesight: Hook; __skipRec: SkipRec };
+    const r: SkipRec = { during: false, at: 0, sync: false, stopped: 0 };
+    w.__skipRec = r;
+    const mine = (e: Event) => w.__skipRec === r && (e.type === 'keydown' ? (e as KeyboardEvent).key === 'Escape' : !!(e.target as Element | null)?.closest?.('.vc-play'));
+    const before = (e: Event) => {
+      if (r.at || !mine(e)) return;
+      r.at = performance.now();
+      r.during = w.__cuesight.view3d!.isPlaying();
+    };
+    const after = (e: Event) => {
+      if (!r.at || r.stopped || !mine(e)) return;
+      const check = () => (w.__cuesight.view3d!.isPlaying() ? setTimeout(check, 5) : (r.stopped = performance.now()));
+      r.sync = !w.__cuesight.view3d!.isPlaying();
+      if (r.sync) r.stopped = performance.now();
+      else setTimeout(check, 5);
+    };
+    for (const type of ['click', 'keydown']) {
+      window.addEventListener(type, before, true);
+      window.addEventListener(type, after, false);
+    }
+  });
+}
+const skipRecord = (page: Page) => page.evaluate(() => (window as unknown as { __skipRec: SkipRec }).__skipRec);
+
 /** Taps ball b1 then the top-right pocket: the 30° cut of the default practice layout. */
 async function planB1(page: Page) {
   const ball = await screenOf(page, { ball: 'b1' });
@@ -191,14 +342,10 @@ test.describe('3D practice table (feature 002 US1)', () => {
     const before = await balls(page);
     const box = await tableBox(page);
     const still = await regionStats(page, box);
-    // The page notes, frame by frame, that the replay ran: polling from the test can miss a short one
-    // when the software renderer is slow.
-    await page.evaluate(() => {
-      const w = window as unknown as { __cuesight: Hook; __sawPlaying: boolean };
-      w.__sawPlaying = false;
-      const tick = () => (w.__cuesight.view3d!.isPlaying() ? (w.__sawPlaying = true) : requestAnimationFrame(tick));
-      requestAnimationFrame(tick);
-    });
+    // The page itself watches the replay, right after every frame the 3D view draws (replayWatch): that
+    // it ran, how much of the picture changed against the still plan, and when it ended. Polling
+    // screenshots from the test can miss a whole replay when the software renderer is slow.
+    await replayWatch(page, box);
     await page.getByRole('button', { name: 'Play shot' }).click();
     // During the replay the picture differs from the still plan (the plan lines hide, balls roll).
     let sawPlaying = false;
@@ -209,11 +356,21 @@ test.describe('3D practice table (feature 002 US1)', () => {
       sawPlaying ||= now;
       if (now) moved = Math.max(moved, changedFrac(still, await regionStats(page, box)));
     }
-    sawPlaying ||= await page.evaluate(() => (window as unknown as { __sawPlaying: boolean }).__sawPlaying);
-    expect(sawPlaying).toBe(true);
-    expect(moved).toBeGreaterThan(0.004);
     // ×1 speed, capped at 4 s, plus the strike and the hold: finishes on its own.
     await expect.poll(() => playing(page), { timeout: 20_000, intervals: [250] }).toBe(false);
+    const rec = await replayRecord(page);
+    test.info().annotations.push({ type: 'replay', description: JSON.stringify({ polledMoved: moved, pageMoved: rec.moved, frames: rec.frames, maxFrameGapMs: Math.round(rec.maxGap), endedAfterMs: Math.round(rec.endedAfterMs) }) });
+    sawPlaying ||= rec.sawPlaying;
+    moved = Math.max(moved, rec.moved);
+    expect(sawPlaying).toBe(true);
+    expect(rec.stillFrames, 'a still frame was read in the page').toBeGreaterThan(0);
+    expect(moved).toBeGreaterThan(0.004);
+    // Measured in the page from the tap: the strike (0.5 s), the shot (x1, capped at 4 s) and the hold
+    // (3.5 s) make at most 8 s of real time. The replay notices the shot's end and then the hold's end on
+    // a frame, so each can show up to one frame late (the slowest frame of this replay, measured), plus
+    // 1 s for the tap itself. Never less than the hold.
+    expect(rec.endedAfterMs, 'ends on its own, in its own time').toBeLessThan(REPLAY_MAX_MS + 2 * rec.maxGap + 1_000);
+    expect(rec.endedAfterMs).toBeGreaterThan(HOLD_MS);
     await expect(page.getByRole('button', { name: 'Play shot' })).toBeEnabled({ timeout: 15_000 });
     expect(await balls(page)).toEqual(before);
     await expect(page.getByTestId('cut')).toHaveText('30.0°');
@@ -223,12 +380,32 @@ test.describe('3D practice table (feature 002 US1)', () => {
     // Skip works too, from the button and from the keyboard (Escape). `force` skips Playwright's
     // stability wait, which takes several seconds against the software-rendered (SwiftShader) canvas,
     // so the tap lands while the replay is still running.
-    for (const skip of [() => page.locator('.vc-play').click({ force: true }), () => page.keyboard.press('Escape')]) {
-      await page.getByRole('button', { name: 'Play shot' }).click();
-      await expect.poll(() => playing(page), { timeout: 15_000 }).toBe(true);
-      await expect(page.locator('.vc-play')).toHaveAttribute('aria-label', 'Skip the replay', { timeout: 15_000 });
-      await skip();
-      await expect.poll(() => playing(page), { timeout: 15_000 }).toBe(false);
+    for (const [how, skip] of [
+      ['button', () => page.locator('.vc-play').click({ force: true })],
+      ['Escape', () => page.keyboard.press('Escape')],
+    ] as const) {
+      let sk: SkipRec | null = null;
+      // Under load the replay (8 s at most) can end before the input lands; then the input was no
+      // skip (a click on "Play shot" even starts a new replay): let it end, and try again at half speed.
+      for (let attempt = 0; attempt < 3 && !sk?.during; attempt++) {
+        if (attempt === 1 && (await page.locator('.vc-slow').getAttribute('aria-pressed')) !== 'true') await page.locator('.vc-slow').click({ force: true });
+        await page.getByRole('button', { name: 'Play shot' }).click();
+        await expect.poll(() => playing(page), { timeout: 15_000 }).toBe(true);
+        await expect(page.locator('.vc-play')).toHaveAttribute('aria-label', 'Skip the replay', { timeout: 15_000 });
+        await skipWatch(page);
+        await skip();
+        await expect.poll(() => playing(page), { timeout: 15_000 }).toBe(false);
+        if (!(await skipRecord(page)).during) await expect.poll(() => playing(page), { timeout: 20_000 }).toBe(false);
+        await expect.poll(async () => (await skipRecord(page)).stopped, { timeout: 15_000 }).toBeGreaterThan(0);
+        sk = await skipRecord(page);
+        test.info().annotations.push({ type: 'skip', description: `${how} #${attempt + 1}: during ${sk.during}, sync ${sk.sync}, ${Math.round(sk.stopped - sk.at)} ms` });
+        if (!sk.during) await page.waitForTimeout(500);
+      }
+      // Measured in the page: the replay is over as soon as the app has handled the Skip input (Skip
+      // is synchronous), so a Skip that did nothing fails here even when the replay later ends on its own.
+      expect(sk!.during, `${how}: the skip landed during the replay`).toBe(true);
+      expect(sk!.sync, `${how}: stopped by the input itself`).toBe(true);
+      expect(sk!.stopped - sk!.at, `${how}: stopped within`).toBeLessThan(SKIP_MAX_MS);
       await expect(page.getByRole('button', { name: 'Play shot' })).toBeVisible({ timeout: 15_000 });
       // Not restarted by a late tap.
       await page.waitForTimeout(300);

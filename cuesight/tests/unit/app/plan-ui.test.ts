@@ -6,23 +6,25 @@
  * frozen "no power" case, the headline warnings, the eighth-fraction labels, the snooker push-stroke
  * reason, the recommendation's honesty notes and the ball letters/colours for the new vision names.
  */
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DRILLS } from '../../../src/app/drills';
-import { planSentence } from '../../../src/app/announce';
+import { createAnnouncer, planSentence } from '../../../src/app/announce';
 import { DEFAULT_SETTINGS, physicsFor } from '../../../src/app/settings';
 import { Overlay, type OverlayData } from '../../../src/app/render/overlay';
-import { DASH, PALETTE, ballCss } from '../../../src/app/render/palette';
+import { BALL_NEUTRAL, DASH, PALETTE, ballCss } from '../../../src/app/render/palette';
 import { aimLine, isFrozenPlan, planLabel, stickDir, stickLine } from '../../../src/app/render/plan-draw';
 import { TableView } from '../../../src/app/render/table-view';
 import { tableGeom } from '../../../src/app/render3d/geom';
-import { ballLook, cueAim, cuePose, parseColor, planRibbons, srgbToLinear } from '../../../src/app/render3d/scene-data';
-import { aimHudText, buildPlayerGuide, projectPolyline, unplayableHeadline } from '../../../src/app/snap/guide';
+import { ballLook, cueAim, cuePose, frameGhost, parseColor, planRibbons, srgbToLinear } from '../../../src/app/render3d/scene-data';
+import { drawGuide } from '../../../src/app/snap/draw';
+import { buildPlayerGuide, projectPolyline, unplayableHeadline } from '../../../src/app/snap/guide';
 import type { AppState } from '../../../src/app/store';
 import { tagText } from '../../../src/app/ui/ball-tags';
-import { perFrame } from '../../../src/app/ui/controls';
-import { powerMeterSvg, powerText } from '../../../src/app/ui/power-meter';
+import { PER_FRAME_MAX_MS, perFrame, renderSuggestions } from '../../../src/app/ui/controls';
+import { meterMinPower, meterOptions, powerMeterSvg, powerText } from '../../../src/app/ui/power-meter';
 import { planLabelContent } from '../../../src/app/ui/scene-labels';
-import { ballChip, fractionTile, headlineWarning, recommendationContext, renderShotCard, type CardContext } from '../../../src/app/ui/shot-card';
+import { NO_OTHER_POCKET, PICK_ANOTHER, ballChip, fractionTile, headlineWarning, recommendationContext, renderShotCard, type CardContext } from '../../../src/app/ui/shot-card';
 import { DEFAULT_PHYSICS } from '../../../src/core/physics/params';
 import { fractionOf } from '../../../src/core/shot/geometry';
 import { planShot } from '../../../src/core/shot/planner';
@@ -302,16 +304,18 @@ describe('frozen cue ball (w1-4): no ghost ball, the stroke line drawn from the 
     expect(n.ghostCenter).not.toBeNull();
   });
 
-  it('words: the card, the announcer and the Snap HUD say "frozen", never "0° cut, full-ball"', () => {
+  // The Snap HUD's own aim line is live-snap's snap/session.ts snapAimText (tested there, frozen
+  // included); the words on the photo come from the guide (aimLabel) and match the 2D label.
+  it('words: the card, the announcer and the Snap photo label say "frozen", never "0° cut, full-ball"', () => {
     const html = cardHtml(plan);
     expect(html).toContain('Frozen');
     expect(html).not.toMatch(/full(-|‑)?ball hit|full hit/);
     const s = planSentence(plan, { TR: 'far right corner' }, () => '1');
     expect(s).toMatch(/frozen/i);
     expect(s).not.toMatch(/cut 0 degrees|full-ball/);
-    expect(aimHudText(plan)).toMatch(/^Frozen/);
-    expect(aimHudText(plan)).not.toMatch(/ghost ball ·|0° cut/);
-    expect(aimHudText(sidePlan(0))).toMatch(/^Aim at the ghost ball · \d+° cut, /);
+    const g = buildPlayerGuide({ pose: TOP, table, plan, cue, target: { x: 0.87, y: 0.48 }, stroke: plan.stroke });
+    expect(g.aimLabel!.text).toMatch(/^Frozen/);
+    expect(g.aimLabel!.text).not.toMatch(/ghost ball|0° cut|full/);
   });
 });
 
@@ -553,5 +557,258 @@ describe('power slider: at most one replan per frame (a soft frozen-ball replan 
     expect(got).toEqual([2, 2.5]);
     cb!();
     expect(got).toEqual([2, 2.5]);
+  });
+});
+
+// ================================================================================================
+// Round 1 repairs (adversarial verification): the peek's frozen tile, the announcer's frozen hint,
+// the blocked card's tip, the unnamed ball's words, chip letters/colours, the Snap photo's label
+// without a ghost ball, the 3D frame's ghost, the meter options and the slider's coalescing.
+// ================================================================================================
+const speak = (plan: ShotPlan, label: string, names: Partial<Record<PocketId, string>> = { TR: 'far right corner' }) => {
+  const el = { textContent: '' as string | null };
+  const a = createAnnouncer(el, { set: (f) => (f(), 1), clear: () => {} });
+  a.update(plan, false, names, () => label);
+  return el.textContent ?? '';
+};
+/** What a screen reader reads of card markup: hidden spans and tags dropped. */
+const srText = (html: string) =>
+  html
+    .replace(/<span hidden[^>]*>.*?<\/span>/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ');
+
+describe('r1 announcer (w1-10): a shot that is not makeable never ends with the generic frozen hint', () => {
+  const touching = planShot(frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red').lay, { targetId: 'b1', pocketId: 'TR' }, params);
+  const frozenLine = planShot(frozenLayout('TR', { x: 0.9, y: 0.45 }, 30).lay, { targetId: 'b1', pocketId: 'TR' }, params);
+  it('snooker touching ball: the push-stroke reason, not "plus a little throw"', () => {
+    const t = speak(touching, 'red');
+    expect(t).toMatch(/push stroke/);
+    expect(t).not.toMatch(/plus a little throw|line of centres/);
+  });
+  it('pool, frozen along a line that misses: the reason only', () => {
+    expect(frozenLine.makeable).toBe(false);
+    const t = speak(frozenLine, '1');
+    expect(t).toMatch(/not makeable/);
+    expect(t).not.toMatch(/plus a little throw/);
+  });
+  it('a makeable frozen shot still speaks its frozen warning', () => {
+    const { lay } = frozenLayout('TR', { x: 0.87, y: 0.48 });
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(p.makeable).toBe(true);
+    expect(speak(p, '1')).toContain(p.warnings.find((w) => w.code === 'frozen')!.message.replace(/\.$/, ''));
+  });
+});
+
+describe('r1 card (w1-10): the blocked tip never repeats the warning, the frozen screen-reader text has no 0.0°', () => {
+  it('blocked drill b1 → far right corner: "No other pocket is clear…" exactly once', () => {
+    const p = planShot(drill('blocked'), { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(p.makeable).toBe(false);
+    expect(p.alternatives).toEqual([]);
+    const html = cardHtml(p);
+    expect(html.split(NO_OTHER_POCKET).length - 1).toBe(1);
+    expect(html).toContain(`data-testid="tip">${PICK_ANOTHER}<`);
+  });
+  it('snooker touching ball (no warning says it): the tip says it, once', () => {
+    const p = planShot(frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red').lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    const html = cardHtml(p, { targetLabel: 'red' });
+    expect(html.split(NO_OTHER_POCKET).length - 1).toBe(1);
+    expect(html).toContain(`data-testid="tip">${NO_OTHER_POCKET}<`);
+  });
+  it('balls frozen together: no meaningless "0.0°" read aloud (the test id stays, hidden)', () => {
+    const p = planShot(frozenLayout('TR', { x: 0.9, y: 0.45 }, 30).lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    const html = cardHtml(p);
+    expect(html).toMatch(/<span hidden data-testid="cut">0\.0°<\/span>/);
+    const sr = srText(html);
+    expect(sr).toContain('Balls frozen together. No stroke: this shot is not makeable.');
+    expect(sr).not.toMatch(/0\.0°/);
+    // A plain not-makeable shot still says its cut.
+    const thin = planShot(drill('blocked'), { targetId: 'b1', pocketId: 'BR' }, params);
+    expect(srText(cardHtml(thin))).toMatch(/Cut 8\d\.\d°, /);
+  });
+});
+
+describe('r1 words for a ball vision could not name ("ball")', () => {
+  const plan = planShot(drill('cut30'), { targetId: 'b1', pocketId: 'TR' }, params);
+  it('announcer and card title: "Unnamed ball", never "Ball ball"', () => {
+    const s = planSentence(plan, { TR: 'far right corner' }, () => 'ball');
+    expect(s).toMatch(/^Unnamed ball to the far right corner: /);
+    expect(planSentence(plan, { TR: 'far right corner' }, () => '1')).toMatch(/^Ball 1 to the far right corner: /);
+    const title = srText(cardHtml(plan, { targetLabel: 'ball' }));
+    expect(title).not.toMatch(/Ball ball/i);
+    expect(title).toContain('Unnamed ball');
+  });
+  it("ball picker: \"Unnamed ball\", and its chip is neutral grey, not the cue ball's ivory", () => {
+    const el = stubEl();
+    renderShotCard(el, null, ctx({ balls: [{ id: 'b3', label: 'ball' }, { id: 'b4', label: 'red', color: '#c81e1e' }] }));
+    expect(el.innerHTML).not.toContain('aria-label="Ball ball"');
+    expect(el.innerHTML).toContain('aria-label="Unnamed ball"');
+    expect(ballChip('ball')).toContain(`--ball:${BALL_NEUTRAL}`);
+    expect(ballChip('cue')).not.toContain(BALL_NEUTRAL);
+  });
+});
+
+describe('r1 chip letters follow the table, as the 2D table and the 3D tags do', () => {
+  it('pool: a colour-named vision ball shows its number; snooker: its letters; unknown table: the initial', () => {
+    expect(ballChip('red', undefined, false, false)).toContain('<i>3</i>');
+    expect(ballChip('yellow stripe', undefined, true, false)).toContain('<i>9</i>');
+    expect(ballChip('black', undefined, false, false)).toContain('<i>8</i>');
+    expect(ballChip('red', undefined, false, true)).toContain('<i>R</i>');
+    expect(ballChip('blue', undefined, false, true)).toContain('<i>Bl</i>');
+    expect(ballChip('ball', undefined, false, false)).not.toContain('<i>');
+    expect(ballChip('red')).toContain('<i>R</i>');
+    for (const label of ['red', 'yellow stripe', 'brown', 'pink', 'ball', '7'])
+      for (const snk of [false, true]) {
+        const t = tagText({ kind: 'object', label, id: 'x' }, snk);
+        const chip = ballChip(label, undefined, false, snk);
+        expect(chip.includes(`<i>${t}</i>`) || (!t && !chip.includes('<i>')), `${label} ${snk}`).toBe(true);
+      }
+  });
+  it('the card and the suggestions list pass the table', () => {
+    const plan = planShot(drill('cut30'), { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(cardHtml(plan, { targetLabel: 'red', snooker: false })).toContain('<i>3</i>');
+    expect(cardHtml(plan, { targetLabel: 'red', snooker: true })).toContain('<i>R</i>');
+    const el = stubEl();
+    const state = { table: snooker, mode: 'practice', practice: { balls: [] }, suggestions: { pending: false, items: [{ targetId: 'b2', pocketId: 'TR', difficulty: 'easy', toleranceMm: 12 }] } } as unknown as AppState;
+    renderSuggestions(el, state, () => 'blue', () => 'far right corner', () => {});
+    expect(el.innerHTML).toContain('<i>Bl</i>');
+    renderSuggestions(el, { ...state, table } as AppState, () => 'blue', () => 'far right corner', () => {});
+    expect(el.innerHTML).toContain('<i>2</i>');
+  });
+});
+
+describe('r1 peek: a frozen cut tile says "Frozen" and the stroke side even when the captions step aside', () => {
+  it('the numeral row carries "Frozen" (sight only: the caption says it to screen readers) and the stroke side', () => {
+    const p = planShot(frozenLayout('TR', { x: 0.87, y: 0.48 }, 8).lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    const html = cardHtml(p);
+    const m = /<span class="fz-k" aria-hidden="true">Frozen<\/span><div class="v num" data-testid="cut">\d+°<\/div><span class="fz-side">([^<]+)<\/span>/.exec(html);
+    expect(m, html).not.toBeNull();
+    expect(m![1]).toMatch(/^stroke (left|right)$/);
+    // (The ui.spec frozen layout: its line of centres points into the pocket, "stroke straight through it".)
+    const straight = cardHtml(planShot(frozenLayout('TR', { x: 0.55, y: 0.18 }).lay, { targetId: 'b1', pocketId: 'TR' }, params));
+    expect(straight).toContain('<span class="fz-side">straight</span>');
+    // A plain cut has none.
+    expect(cardHtml(sidePlan(0))).not.toMatch(/fz-k|fz-side/);
+  });
+});
+
+describe('r1 Snap photo: a label on the photo even without a ghost ball', () => {
+  const recGuide = (plan: ShotPlan, t: TableSpec, cue: Vec2, target: Vec2, makeable: boolean) => {
+    const g = buildPlayerGuide({ pose: TOP, table: t, plan, cue, target, stroke: plan.stroke });
+    const rec = recordingCanvas(1280, 720);
+    rec.canvas.width = 1280;
+    rec.canvas.height = 720;
+    drawGuide(rec.canvas.getContext('2d')!, { toScreen: (p) => p, toFrame: (p) => p }, g, { showCuePath: true, makeable });
+    return rec.texts.map((x) => x.text);
+  };
+  it('PlayerGuide.aimLabel: "Not makeable" at the cue ball for a frozen shot that cannot be played', () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red');
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    const g = buildPlayerGuide({ pose: TOP, table: snooker, plan: p, cue, target: ob, stroke: p.stroke });
+    expect(g.ghost).toEqual([]);
+    expect(g.aimLabel).toMatchObject({ text: 'Not makeable', warn: true });
+    expect(Math.hypot(g.aimLabel!.at.x - g.cueCenter!.x, g.aimLabel!.at.y - g.cueCenter!.y)).toBeLessThan(1e-6);
+    expect(g.aimLabel!.r).toBeCloseTo(g.cueRadiusPx, 6);
+  });
+  it("PlayerGuide.aimLabel: the frozen stroke in the 2D label's words, at the stroke line's end", () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.87, y: 0.48 }, 8);
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    const g = buildPlayerGuide({ pose: TOP, table, plan: p, cue, target: ob, stroke: p.stroke });
+    expect(g.aimLabel!.text).toBe(planLabel(p, cue));
+    expect(g.aimLabel!.text).toMatch(/^Frozen · stroke \d+° (left|right)$/);
+    expect(g.aimLabel!.warn).toBe(false);
+    const end = aimLine(p, cue, R, { hx: table.length / 2, hy: table.width / 2 }).to;
+    const want = projectPolyline(TOP, [
+      { ...end, z: 0 },
+      { x: end.x + 1e-4, y: end.y, z: 0 },
+    ])[0]![0]!;
+    expect(Math.hypot(g.aimLabel!.at.x - want.x, g.aimLabel!.at.y - want.y)).toBeLessThan(0.5);
+    // A shot with a ghost ball keeps its label there (draw.ts: "Aim here"): no aimLabel.
+    expect(buildPlayerGuide({ pose: TOP, table, plan: sidePlan(0), cue: squirtLay.balls[0]!.pos, target: { x: 0.6, y: 0.3 }, stroke: sidePlan(0).stroke }).aimLabel).toBeNull();
+  });
+  // snap/draw.ts (not this package's file) still anchors its only plan label to the ghost outline.
+  // This pins that gap: it is EXPECTED to fail today, and vitest reports it the day draw.ts places
+  // PlayerGuide.aimLabel when g.ghost is empty — then turn it into a plain `it` (see appChanges).
+  it.fails('drawGuide writes "Not makeable" on the photo for the snooker touching-ball plan (needs snap/draw.ts)', () => {
+    const { lay, cue, ob } = frozenLayout('TR', { x: 0.9, y: 0.45 }, 0, snooker, 'red');
+    const p = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(recGuide(p, snooker, cue, ob, false)).toContain('Not makeable');
+  });
+  it('drawGuide still labels a plain shot\'s ghost ball ("Aim here"), so the probe above can see labels', () => {
+    const p = sidePlan(0);
+    expect(recGuide(p, table, squirtLay.balls[0]!.pos, { x: 0.6, y: 0.3 }, true)).toContain('Aim here');
+  });
+});
+
+describe('r1 3D frame: the ghost-ball sphere (FrameState.ghost) comes from frameGhost', () => {
+  it("null for a frozen cue ball, the plan's ghost otherwise, null with the plan hidden", () => {
+    const { lay, cue } = frozenLayout('TR', { x: 0.87, y: 0.48 });
+    const frozen = planShot(lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(frameGhost(frozen, cue, true)).toBeNull();
+    const p = sidePlan(0);
+    expect(frameGhost(p, squirtLay.balls[0]!.pos, true)).toEqual(p.ghost);
+    expect(frameGhost(p, squirtLay.balls[0]!.pos, false)).toBeNull();
+    expect(frameGhost(p, null, true)).toBeNull();
+    expect(frameGhost(null, squirtLay.balls[0]!.pos, true)).toBeNull();
+  });
+  // createTable3D needs WebGL2 (no Node test can run it): the frame it draws must take its ghost ball
+  // from frameGhost, never straight from plan.ghost (a sphere on top of a frozen cue ball).
+  it('render3d/index.ts sets FrameState.ghost through frameGhost', () => {
+    const src = readFileSync(new URL('../../../src/app/render3d/index.ts', import.meta.url), 'utf8');
+    expect(src).toMatch(/^\s*ghost: frameGhost\(plan(?: \?\? null)?, cueBall\?\.pos \?\? null, showPlan\),$/m);
+    expect(src).not.toMatch(/ghost:[^\n]*plan\.ghost/);
+  });
+});
+
+describe('r1 meter options: one helper for the card and the Snap HUD', () => {
+  it('a plain plan: the capture band; frozen: no band and "no power" past 10; noWorkingPower counts too', () => {
+    const plan = planShot(drill('cut30'), { targetId: 'b1', pocketId: 'TR', stroke: { power: 4, side: 0, vert: 0 } }, params);
+    expect(meterOptions(plan)).toEqual({ frozen: false, capture: plan.minPowerCapture });
+    const fz = planShot(frozenLayout('TR', { x: 0.87, y: 0.48 }).lay, { targetId: 'b1', pocketId: 'TR' }, params);
+    expect(meterOptions(fz)).toEqual({ frozen: true });
+    // The live-snap core adds ShotPlan.noWorkingPower: no power works, whatever the cause.
+    const none = { ...plan, minPower: 10.5, noWorkingPower: 'other' as const };
+    expect(meterOptions(none)).toEqual({ frozen: true });
+    expect(powerText(3, meterMinPower(none), meterOptions(none))).toMatch(/No power gets it in with pace/);
+    expect(powerText(3, meterMinPower(none), meterOptions(none))).not.toMatch(/more than full power/);
+    expect(meterMinPower(none)).toBe(10.5);
+    // The frozen power advice not worked out yet (live-snap's adviceSkipped): no minimum to show.
+    expect(meterMinPower({ ...plan, adviceSkipped: true })).toBeNull();
+    expect(meterMinPower({ ...plan, minPower: Number.NaN })).toBeNull();
+    expect(meterMinPower(plan)).toBe(plan.minPower);
+  });
+});
+
+describe('r1 power slider: never waits on a slow frame', () => {
+  it('perFrame runs on the next frame or after PER_FRAME_MAX_MS, whichever comes first, once; pending() says a value waits', () => {
+    const got: number[] = [];
+    let frame: (() => void) | null = null;
+    let timer: (() => void) | null = null;
+    let ms = -1;
+    const f = perFrame(
+      (v: number) => got.push(v),
+      (c) => {
+        frame = c;
+      },
+      (c, t) => {
+        timer = c;
+        ms = t;
+      },
+    );
+    expect(f.pending()).toBe(false);
+    f.push(3);
+    f.push(3.5);
+    expect(f.pending()).toBe(true);
+    expect(ms).toBe(PER_FRAME_MAX_MS);
+    expect(PER_FRAME_MAX_MS).toBeLessThanOrEqual(50);
+    timer!();
+    expect(got).toEqual([3.5]);
+    expect(f.pending()).toBe(false);
+    frame!(); // the frame comes later: nothing more
+    expect(got).toEqual([3.5]);
+    f.push(4);
+    frame!();
+    timer!();
+    expect(got).toEqual([3.5, 4]);
   });
 });

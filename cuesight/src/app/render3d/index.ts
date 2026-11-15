@@ -29,7 +29,7 @@ import { pickRay, type Pick3D } from './picking';
 import { buildTrack, playbackTimeline, sampleTrack, type BallPose, type PlaybackTrack, type Timeline } from './playback';
 import { Renderer, type BallDraw, type DotDraw, type FrameState } from './scene';
 import { aimLine, stickDir } from '../render/plan-draw';
-import { ADDRESS_GAP, ballLook, contactPoint3, cueAim, cuePose, hexRGBA, planRibbons, practiceStroke, restOrientation, type BallLook } from './scene-data';
+import { ADDRESS_GAP, ballLook, contactPoint3, cueAim, cuePose, frameGhost, hexRGBA, planRibbons, practiceStroke, restOrientation, type BallLook } from './scene-data';
 
 export type { Pick3D } from './picking';
 
@@ -515,7 +515,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       dpr: canvas.width / Math.max(1, cssW),
       balls,
       // No ghost ball for a frozen cue ball (the core puts it on the cue ball).
-      ghost: showPlan && plan && cueBall ? aimLine(plan, cueBall.pos, R).ghost : null,
+      ghost: frameGhost(plan, cueBall?.pos ?? null, showPlan),
       dots,
       cue: cueModel,
       glow: hole ? { x: hole.x, y: hole.y, r: hole.r * 1.6, color: [0.91, 0.77, 0.42, 0.2] } : null,

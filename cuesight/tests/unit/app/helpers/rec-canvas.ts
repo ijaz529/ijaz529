@@ -90,12 +90,14 @@ export function recordingCanvas(w: number, h: number) {
     createImageData: (iw: number, ih: number) => ({ data: new Uint8ClampedArray(iw * ih * 4) }),
     putImageData: () => {},
     setTransform: () => {},
+    getTransform: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }),
     translate: () => {},
     rotate: () => {},
     scale: () => {},
   };
   for (const k of Object.keys(st)) Object.defineProperty(ctx, k, { get: () => st[k], set: (v) => (st[k] = v), enumerable: true });
   const canvas = { width: 0, height: 0, getContext: () => ctx, getBoundingClientRect: () => ({ width: w, height: h, left: 0, top: 0, right: w, bottom: h }) };
+  ctx.canvas = canvas;
   const reset = () => {
     strokes.length = 0;
     texts.length = 0;
