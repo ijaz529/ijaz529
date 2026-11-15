@@ -129,20 +129,27 @@ interface CalCase {
 }
 
 /**
- * The calibrations a cluster must hold under: the table detector's (auto), the camera's exact one, and
- * the exact corners jittered uniformly by ±0.3 px (12 seeds) and ±1 px (6 seeds), as calibration error.
+ * The jittered calibrations a cluster must hold under, as [corner amplitude px, seeds, first seed]:
+ * the exact corners moved uniformly by up to ±0.3 px (30 seeds), ±0.15 px (12), ±0.5 px (12) and
+ * ±1 px (6), as calibration error. (The wave-1 detector lost 0–5 balls and put phantoms on packs in
+ * up to 4 of 20 calibrations at ±0.3 px; fresh seeds of the earlier 12 + 6 set found more.)
  */
-function calibrationSet(sc: SynthScene): CalCase[] {
+const JITTER: readonly (readonly [number, number, number])[] = [
+  [0.3, 30, 1000],
+  [0.15, 12, 3000],
+  [0.5, 12, 4000],
+  [1, 6, 2000],
+];
+
+/** The calibrations: the table detector's (auto), the camera's exact one, and the jittered `sets`. */
+function calibrationSet(sc: SynthScene, sets: readonly (readonly [number, number, number])[] = JITTER): CalCase[] {
   const ex = exactCorners(sc);
   const cam = cameraModel(sc.camera, sc.width, sc.height);
   const out: CalCase[] = [
     { name: 'auto', cal: null, refs: null },
     { name: 'exact', cal: exactCalibration(sc), refs: null },
   ];
-  for (const [amp, n, seed0] of [
-    [0.3, 12, 1000],
-    [1, 6, 2000],
-  ] as const)
+  for (const [amp, n, seed0] of sets)
     for (let s = 0; s < n; s++) {
       const rn = lcg(seed0 + s);
       const cal = calibrationFromCorners(
@@ -218,8 +225,15 @@ interface Run {
  * Detect, then match one-to-one (greedy, within 6 cm) to the truth. With auto calibration the
  * table's 180° symmetry is resolved by whichever orientation fits better.
  */
+/** detectTable is deterministic: one table fit per frame object (the calibration sets reuse a frame many times). */
+const tables = new WeakMap<Frame, ReturnType<typeof detectTable>>();
+function tableOf(frame: Frame): ReturnType<typeof detectTable> {
+  if (!tables.has(frame)) tables.set(frame, detectTable(frame));
+  return tables.get(frame)!;
+}
+
 function detect(sc: SynthScene, frame: Frame, o: { exact?: boolean; cal?: Calibration | null; refs?: Vec2[] | null } = {}): Run {
-  const det = detectTable(frame);
+  const det = tableOf(frame);
   const given = o.cal ?? null;
   if (!o.exact && !given) expect(det, 'table detected').not.toBeNull();
   const cal = given ?? (o.exact ? exactCalibration(sc) : calibrationFromCorners(det!.corners, sc.table, frame.width, frame.height));
@@ -661,24 +675,25 @@ describe('touching clusters', () => {
   // wave-1 table fit moved them by 0.1–0.3 px and both broke; the camera's exact calibration broke
   // them in the 0.3.0 detector too): the 15-ball corner view (2 → 3; six balls at 6–13 %, the exact
   // calibration misses #6, #8, #9 at 12 %, 7 %, 6 %) and the snooker end view (2 → 3; #5, #8, #9 at
-  // 9 %, i.e. 2 image px each). Never a phantom ball.
+  // 9 %, i.e. 2 image px each).
   //
-  // Every scene holds under 20 calibrations: the table detector's, the camera's exact one, and the
-  // exact corners jittered by ±0.3 px (12 seeds) and ±1 px (6 seeds); the count of a cluster must not
-  // hinge on sub-pixel calibration error (the 0.3.0-and-wave-1 detector: 0–5 balls lost and phantoms
-  // in 4 of 20 at ±0.3 px). Known limits, measured: in a few jittered calibrations of the snooker
-  // end/side/corner views and the pool end views one ball still goes (a disc settles on a corner
-  // ball's rim and an interior ball is not counted, or the cloth-coloured green and the black of a
-  // pool pack read as too little of themselves); those views hold strictly under the auto and exact
-  // calibrations, and at most `jitterMisses` of their 18 jittered calibrations may fail.
+  // Every scene runs under 62 calibrations: the table detector's, the camera's exact one, and the 60
+  // jittered ones of JITTER. Never a phantom ball, under any of them. The auto and exact calibrations
+  // hold every criterion. Known limit, measured: in a few jittered calibrations of the end views one
+  // ball at 28–56 % of its outline is not counted (the pool pack's green 6 or black 8, a snooker
+  // row-2 end ball) or the snooker corner views' median reaches 10.1–10.3 mm; at most `jitterFails`
+  // of the 60 may fail that way. (Same 62 calibrations, wave-1 detector: 9-ball end 18, 15-ball end
+  // 19, snooker end 38, snooker side 48, snooker corner 31 with 12 phantoms, 15-ball side 53, 9-ball
+  // corner 56; the previous fix, chosen on 20 of them: 11, 6, 2 with 1 phantom, 3 with 3 phantoms,
+  // 18 with 12 phantoms, 0, 0.)
   const cases: [string, (p: Pose) => SynthScene, Partial<Record<Pose, number>>, Partial<Record<Pose, number>>][] = [
     ['3-ball row', (p) => rack(3, p), {}, {}],
-    ['9-ball diamond', (p) => rack(9, p), { end: 1, corner: 1 }, { end: 3 }],
-    ['15-ball triangle', (p) => rack(15, p), { end: 3, corner: 3 }, { end: 2 }],
-    ['snooker 15-red pack', snookerPack, { end: 3, corner: 3 }, { end: 2, side: 1, corner: 4 }],
+    ['9-ball diamond', (p) => rack(9, p), { end: 1, corner: 1 }, { end: 11 }],
+    ['15-ball triangle', (p) => rack(15, p), { end: 3, corner: 3 }, { end: 7 }],
+    ['snooker 15-red pack', snookerPack, { end: 3, corner: 3 }, { end: 6, corner: 5 }],
   ];
-  for (const [name, build, hidden, jitterMisses] of cases)
-    it.each(ALL_POSES)(`${name}, %s view: every visible ball, no phantom, median ≤ 10 mm, p95 ≤ 25 mm, under auto, exact and jittered calibrations`, (pose) => {
+  for (const [name, build, hidden, jitterFails] of cases)
+    it.each(ALL_POSES)(`${name}, %s view: every visible ball, no phantom, median ≤ 10 mm, p95 ≤ 25 mm, under auto, exact and 60 jittered calibrations`, (pose) => {
       const sc = build(pose);
       const frame = render(sc);
       const share = exclusiveShare(sc);
@@ -687,6 +702,7 @@ describe('touching clusters', () => {
       // Where misses are allowed, hidden and visible balls are far apart (no ball near the 15 % line).
       if (allow > 0) expect(share.every((v) => v < 0.15 || v >= 0.25), `no ball between hidden and visible: ${share.map((v) => v.toFixed(2)).join(' ')}`).toBe(true);
       const bad: string[] = [];
+      const phantoms: string[] = [];
       const log: string[] = [];
       for (const c of calibrationSet(sc)) {
         const r = detect(sc, frame, { cal: c.cal, refs: c.refs });
@@ -694,21 +710,22 @@ describe('touching clusters', () => {
         const s = errStats(r, found);
         const missed = sc.balls.length - found.length;
         const fail: string[] = [];
-        if (r.fp.length) fail.push(`${r.fp.length} phantom`);
         if (missed > allow) fail.push(`${missed} missed > ${allow}`);
         if (s.median > 10) fail.push(`median ${s.median.toFixed(1)} mm`);
         if (s.p95 > (missed ? 30 : 25)) fail.push(`p95 ${s.p95.toFixed(1)} mm`);
         const line = `${c.name}: ${r.balls.length}/${sc.balls.length}, errors mm ${fmt(errStats(r).mm)}`;
         log.push(line);
+        if (r.fp.length) phantoms.push(`${c.name}: ${r.fp.length} phantom (${line})`);
         if (fail.length) bad.push(`${c.name}: ${fail.join(', ')} (${line})`);
       }
       console.log(`${name} ${pose}:\n  ${log.join('\n  ')}`);
+      expect(phantoms, phantoms.join('\n')).toEqual([]);
       // Next to an uncounted ball the neighbours' fits absorb a little of its silhouette, so the tail is
       // allowed to 30 mm there; SC-003's 25 mm holds wherever every ball is counted.
       const strict = bad.filter((b) => b.startsWith('auto') || b.startsWith('exact'));
       expect(strict, strict.join('\n')).toEqual([]);
-      expect(bad.length, bad.join('\n')).toBeLessThanOrEqual(jitterMisses[pose] ?? 0);
-    }, 120_000);
+      expect(bad.length, bad.join('\n')).toBeLessThanOrEqual(jitterFails[pose] ?? 0);
+    }, 180_000);
 });
 
 describe('touching pairs side by side across the view', () => {
@@ -1000,7 +1017,8 @@ describe('per-frame scratch (Constitution IV)', () => {
     // call 7 MB). What remains is per-blob bookkeeping (a few KB).
     const { det, cal } = setup();
     // Warm enough for the JIT to settle even when this test runs alone (5 calls: +450–500 KB per call
-    // alone with the wave-1 detector and this one alike, +44 KB after the rest of the file).
+    // alone with the wave-1 detector and this one alike; 40 calls: +77 KB alone, +47 KB after the rest
+    // of the file).
     for (let i = 0; i < 40; i++) detectBalls(frame(), cal, sc.table, det.cloth);
     let maxBuf = -Infinity;
     let maxHeap = -Infinity;
@@ -1018,9 +1036,9 @@ describe('per-frame scratch (Constitution IV)', () => {
   });
 
   it('a snooker pack resampled on its own finer window: no typed arrays and < 256 KB of JS heap per call once warm', () => {
-    // The window pass has its own scratch set (grown once, then reused). Measured: +168–172 KB per call
-    // once the JIT has settled (40 warm calls; the first few allocate MBs of boxed doubles while the
-    // code is still unoptimised), as the whole-table pass alone (+143 KB on this frame).
+    // The window pass has its own scratch set (grown once, then reused). Measured once the JIT has
+    // settled (40 warm calls; the first few allocate MBs of boxed doubles while the code is still
+    // unoptimised): no typed arrays, +57 KB of heap per call after the rest of this file, +121 KB alone.
     const psc = snookerPack('end');
     const f = render(psc);
     const det = detectTable(f)!;
