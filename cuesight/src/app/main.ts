@@ -24,8 +24,10 @@ import {
   bedPointFromProjection,
   calibrationFeedback,
   cameraHint,
+  cameraMessageTitle,
   clearSelection,
   cornersPlausible,
+  dropLiveSelection,
   explicitMode,
   framesMatch,
   liveGate,
@@ -39,6 +41,7 @@ import {
   trackSelection,
   unfreezeSelection,
   visionConfigChanged,
+  visionFailureMessage,
   CALIBRATION_MESSAGES,
   STATUS_TEXT,
 } from './live-logic';
@@ -751,23 +754,30 @@ const grabber = new FrameGrabber(640);
 let frameSize = { w: 640, h: 480 };
 /** Consecutive live-frame `error` replies (3 in a row: detection is not working). */
 let visionErrors = 0;
-/** Table-frame generation: bumped by every vision config that rebuilds the tracker (new ball ids). */
+/** Table-frame generation: bumped whenever the live ball ids change meaning (new frame, new tracker). */
 let frameGen = 0;
 /** Manual corners were just sent: the first result for a frame id ≥ this confirms or refuses them. */
 let manualCheckFrom: number | null = null;
 let lastReason = '';
-const VISION_FAILED = 'Table detection couldn’t start — it may not be available offline yet. Reconnect and tap “Try again”, or use the practice table.';
+/** The current vision worker has replied at least once (it loaded): a later failure is not a load failure. */
+let visionAnswered = false;
 
 function visionWorker(): Worker {
   if (!vision) {
     const w = new Worker(new URL('../workers/vision.worker.ts', import.meta.url), { type: 'module' });
     vision = w;
-    w.onmessage = (ev: MessageEvent<VisionOut>) => onVision(ev.data);
+    visionAnswered = false;
+    w.onmessage = (ev: MessageEvent<VisionOut>) => {
+      if (vision !== w) return; // a replaced worker's tracker ids mean nothing any more
+      visionAnswered = true;
+      onVision(ev.data);
+    };
     watchWorker(w, (msg) => {
       if (vision === w) visionFailed(msg);
     });
-    frameGen++; // a new worker is a new tracker: ids start again
     configureVision();
+    // A new worker is a new tracker: its ids start again at b1, so ids held from an older one name other balls.
+    if (liveIdsChanged()) toast('Table detection restarted. The selection was cleared.');
   }
   return vision;
 }
@@ -782,10 +792,12 @@ function visionFailed(message: string): void {
   }
   vision = null; // recreated by "Try again" or by entering Live again
   visionErrors = 0;
+  // The tracker that issued the selected ids is gone: "Try again" starts a new one (ids from b1).
+  liveIdsChanged();
   if (S.mode !== 'camera') return;
   leaveCamera(); // without detection the camera has nothing to do
   store.update((s) => {
-    s.cameraError = VISION_FAILED;
+    s.cameraError = visionFailureMessage(visionAnswered);
     s.vision = null;
   });
 }
@@ -797,18 +809,23 @@ function configureVision(): void {
 /**
  * Sends the vision config after a change of the table frame (Rotate, corners set or cleared, another
  * table or field of view). The tracker restarts its ball ids, so a live selection no longer means the
- * same balls: it is cleared (a frozen snapshot keeps its own ids; unfreezing checks `frameGen`).
- * Returns whether something the player had selected was cleared.
+ * same balls (see liveIdsChanged). Returns whether something the player had selected was cleared.
  */
 function tableFrameChanged(): boolean {
-  frameGen++;
   configureVision();
-  if (S.mode !== 'camera' || S.frozen) return false;
+  return liveIdsChanged();
+}
+
+/**
+ * The live ball ids changed meaning (a new table frame or a new tracker): bumps `frameGen`, so a
+ * frozen snapshot taken before is unfrozen without its selection, and clears the live selection
+ * together with the planner requests made for it. Returns whether anything selected was cleared.
+ */
+function liveIdsChanged(): boolean {
+  frameGen++;
   let cleared = false;
-  store.update((s) => (cleared = clearSelection(s)));
-  planner.cancel('recommend');
-  planner.cancel('suggest');
-  planner.cancel('heatmap');
+  store.update((s) => (cleared = dropLiveSelection(s)));
+  if (cleared) for (const k of ['recommend', 'suggest', 'heatmap'] as const) planner.cancel(k);
   return cleared;
 }
 
@@ -1376,6 +1393,7 @@ function render(s: AppState): void {
     const st = s.frozen ? 'frozen' : (live?.status ?? 'searching');
     if (statusPill.dataset.status !== st) statusPill.dataset.status = st;
     camMsg.hidden = !s.cameraError;
+    setText(camMsg.querySelector('.msg-title')!, cameraMessageTitle(s.cameraError));
     camMsg.querySelector('p')!.textContent = s.cameraError ?? '';
     overlay.draw(overlayData(), frameMapping());
     if (layout) miniView.draw({ table: s.table, balls: layout.balls, plan: s.plan, targetId: s.targetId, pocketId: s.pocketId, landing: s.landing, heatmap: heat });

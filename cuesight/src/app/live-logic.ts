@@ -129,6 +129,37 @@ export function clearSelection(s: SelectionState): boolean {
   return had;
 }
 
+/**
+ * The live tracker's ids stopped naming the same balls: a new table frame (Rotate, corners set or
+ * cleared, another table or field of view) or a new tracker (the vision worker failed or was
+ * recreated: its ids start again at b1). The live selection, held by those ids, is cleared. A frozen
+ * snapshot keeps its own ids (unfreezing compares the frame generation), and Practice / Snap never
+ * hold live ids. Returns whether anything the player had chosen was cleared.
+ */
+export function dropLiveSelection(s: SelectionState & Pick<AppState, 'mode' | 'frozen'>): boolean {
+  if (s.mode !== 'camera' || s.frozen) return false;
+  return clearSelection(s);
+}
+
+// --- Table detection failures --------------------------------------------------------------------
+
+export const VISION_FAILED = {
+  /** The worker never answered: its script did not load (often: not cached yet for offline use). */
+  load: 'Table detection couldn’t start — it may not be available offline yet. Reconnect and tap “Try again”, or use the practice table.',
+  /** The worker had been answering, then crashed or kept failing on frames. */
+  stopped: 'Table detection stopped working. Tap “Try again” to restart it, or use the practice table.',
+} as const;
+
+/** The camera message when table detection is off; `answered`: the failed worker had replied at least once. */
+export function visionFailureMessage(answered: boolean): string {
+  return answered ? VISION_FAILED.stopped : VISION_FAILED.load;
+}
+
+/** The camera message's title: the camera itself works when only table detection failed. */
+export function cameraMessageTitle(error: string | null): string {
+  return error === VISION_FAILED.load || error === VISION_FAILED.stopped ? 'Table detection is off' : 'Camera unavailable';
+}
+
 // --- Frozen layout -------------------------------------------------------------------------------
 
 /**

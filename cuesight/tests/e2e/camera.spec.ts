@@ -6,6 +6,8 @@ type Hook = {
     vision: { status: string; balls: { id: string; kind: string; pos: V2 }[] } | null;
     frozen: { layout: { balls: { id: string; kind: string }[] } } | null;
     targetId: string | null;
+    cueOverrideId: string | null;
+    pocketId: string | null;
     interaction: string;
     manualCorners: V2[] | null;
     cameraError: string | null;
@@ -66,6 +68,18 @@ test.describe('live camera (US2) — synthetic table as the fake camera', () => 
     // The per-frame counters still show, outside the live region and hidden from assistive tech.
     await expect(page.locator('#status-meta')).toHaveAttribute('aria-hidden', 'true');
     await expect(page.locator('#status-meta')).toContainText(/\d+ balls · \d+ ms/);
+    // …and read as one line, one space after the lock state (not a flex gap, not glued on).
+    const pill = await page.evaluate(() => {
+      const a = document.querySelector('#status')!.getBoundingClientRect();
+      const b = document.querySelector('#status-meta')!.getBoundingClientRect();
+      const text = (sel: string) => document.querySelector(sel)!.textContent ?? '';
+      return { gap: b.left - a.right, top: Math.abs(b.top - a.top), pill: text('#status-pill'), status: text('#status'), meta: text('#status-meta') };
+    });
+    expect(pill.meta).toMatch(/^· \d+ balls · \d+ ms$/);
+    expect(pill.pill).toBe(`${pill.status} ${pill.meta}`);
+    expect(pill.gap).toBeGreaterThan(1);
+    expect(pill.gap).toBeLessThan(6);
+    expect(pill.top).toBeLessThan(4);
   });
 
   test('Settings saved without a camera-related change keep the tracker, so the target stays on its ball', async ({ page }) => {
@@ -180,7 +194,74 @@ test.describe('live camera (US2) — synthetic table as the fake camera', () => 
     await page.goto('/?mode=camera');
     await expect(page.locator('#camera-msg')).toBeVisible({ timeout: 15_000 });
     await expect(page.locator('#camera-msg')).toContainText('Table detection couldn’t start');
+    // The camera itself works: the title says what is off.
+    await expect(page.locator('#camera-msg h2')).toHaveText('Table detection is off');
     await expect(page.getByRole('button', { name: 'Use practice table' })).toBeVisible();
+  });
+
+  test('table detection that stops mid-session is restarted by “Try again” without keeping the old ball ids as the selection', async ({ page }) => {
+    // Turns the vision worker's live results into `error` replies on demand (3 in a row = detection failed).
+    await page.addInitScript(() => {
+      const W = window.Worker;
+      const w = window as unknown as { __breakVision: boolean; __visionWorkers: number };
+      w.__breakVision = false;
+      w.__visionWorkers = 0;
+      window.Worker = class extends W {
+        private plain = true;
+        private fn: ((ev: MessageEvent) => void) | null = null;
+        constructor(url: string | URL, opts?: WorkerOptions) {
+          super(url, opts);
+          if (!String(url).includes('vision')) return;
+          this.plain = false;
+          w.__visionWorkers++;
+          super.addEventListener('message', (ev: MessageEvent) => {
+            const m = ev.data as { v: number; type: string; id?: number };
+            if (w.__breakVision && m?.type === 'result') this.fn?.({ data: { v: m.v, type: 'error', id: m.id, message: 'injected' } } as MessageEvent);
+            else this.fn?.(ev);
+          });
+        }
+        override set onmessage(f: ((ev: MessageEvent) => void) | null) {
+          if (this.plain) super.onmessage = f;
+          else this.fn = f;
+        }
+        override get onmessage(): ((ev: MessageEvent) => void) | null {
+          return this.plain ? super.onmessage : this.fn;
+        }
+      };
+    });
+    const state = () =>
+      page.evaluate(() => {
+        const s = (window as unknown as { __cuesight: Hook }).__cuesight.state;
+        return { targetId: s.targetId, cueOverrideId: s.cueOverrideId, pocketId: s.pocketId, workers: (window as unknown as { __visionWorkers: number }).__visionWorkers };
+      });
+    await page.goto('/?mode=camera');
+    await locked(page);
+    // A marked cue ball and a target, both held as ids of this tracker.
+    const ids = await page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: Hook }).__cuesight;
+      const obj = h.state.vision!.balls.filter((x) => x.kind !== 'cue');
+      return { cue: obj[0]!.id, target: obj[1]!.id };
+    });
+    await pressTool(page, 'mark-cue');
+    await page.evaluate((i) => (window as unknown as { __cuesight: Hook }).__cuesight.selectBall(i), ids.cue);
+    await page.evaluate((i) => (window as unknown as { __cuesight: Hook }).__cuesight.selectBall(i), ids.target);
+    expect(await state()).toMatchObject({ targetId: ids.target, cueOverrideId: ids.cue, workers: 1 });
+
+    await page.evaluate(() => ((window as unknown as { __breakVision: boolean }).__breakVision = true));
+    await expect(page.locator('#camera-msg')).toBeVisible({ timeout: 10_000 });
+    // The worker did run: this is not the "couldn't load (offline?)" case.
+    await expect(page.locator('#camera-msg')).toContainText('Table detection stopped working');
+    await expect(page.locator('#camera-msg')).not.toContainText('offline');
+    await expect(page.locator('#camera-msg h2')).toHaveText('Table detection is off');
+    // The tracker that issued those ids is gone: nothing is selected by them any more.
+    expect(await state()).toMatchObject({ targetId: null, cueOverrideId: null, pocketId: null });
+
+    await page.evaluate(() => ((window as unknown as { __breakVision: boolean }).__breakVision = false));
+    await page.getByRole('button', { name: 'Try again' }).click();
+    await locked(page);
+    await page.waitForTimeout(500); // a few results of the new tracker
+    // A new worker (a new tracker, ids from b1 again): the old ids are not re-attached to whatever now carries them.
+    expect(await state()).toMatchObject({ targetId: null, cueOverrideId: null, pocketId: null, workers: 2 });
   });
 });
 
@@ -196,6 +277,7 @@ test.describe('camera denied', () => {
     });
     await page.goto('/?mode=camera');
     await expect(page.locator('#camera-msg')).toContainText('never uploaded');
+    await expect(page.locator('#camera-msg h2')).toHaveText('Camera unavailable');
     await page.getByRole('button', { name: 'Use practice table' }).click();
     await expect(page.locator('body')).toHaveAttribute('data-mode', 'practice');
     await ctx.close();
@@ -232,6 +314,7 @@ test.describe('no camera on the device (desktop, iOS Simulator)', () => {
     await page.goto('/?mode=camera');
     await expect(page.locator('body')).toHaveAttribute('data-mode', 'camera');
     await expect(page.locator('#camera-msg')).toContainText('No camera was found');
+    await expect(page.locator('#camera-msg h2')).toHaveText('Camera unavailable');
   });
 
   test('a touch device with a camera still starts in Live', async ({ page }) => {

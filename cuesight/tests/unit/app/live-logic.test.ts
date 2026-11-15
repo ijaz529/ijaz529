@@ -10,8 +10,10 @@ import {
   bedPointFromProjection,
   calibrationFeedback,
   cameraHint,
+  cameraMessageTitle,
   clearSelection,
   cornersPlausible,
+  dropLiveSelection,
   explicitMode,
   framesMatch,
   liveGate,
@@ -25,6 +27,7 @@ import {
   trackSelection,
   unfreezeSelection,
   visionConfigChanged,
+  visionFailureMessage,
 } from '../../../src/app/live-logic';
 
 const R = 0.028575;
@@ -118,6 +121,63 @@ describe('clearSelection (the table frame changed: ids and positions no longer m
     expect(clearSelection(s)).toBe(true);
     expect(s).toMatchObject({ targetId: null, pocketId: null, landing: null, recommended: null, suggestions: null, cueOverrideId: null, targetMem: null, cueMem: null, interaction: 'select' });
     expect(clearSelection(s)).toBe(false);
+  });
+});
+
+describe('dropLiveSelection: the live tracker’s ids stop naming the same balls (new table frame, new tracker)', () => {
+  const live = (over: Partial<{ mode: 'camera' | 'practice' | 'snap'; frozen: { layout: TableLayout; calibration: null; gen?: number } | null }> = {}) => ({
+    mode: 'camera' as 'camera' | 'practice' | 'snap',
+    frozen: null as { layout: TableLayout; calibration: null; gen?: number } | null,
+    targetId: 'b6' as string | null,
+    pocketId: 'TR' as 'TR' | null,
+    landing: null,
+    recommended: null,
+    heatmap: null,
+    suggestions: null,
+    cueOverrideId: 'b2' as string | null,
+    targetMem: { id: 'b6', pos: { x: 0.3, y: 0.1 } } as SelectionMemory | null,
+    cueMem: { id: 'b2', pos: { x: -0.4, y: 0 } } as SelectionMemory | null,
+    plan: null,
+    interaction: 'select' as const,
+    ...over,
+  });
+  it('clears a live selection (target, pocket and the marked cue ball held by tracker id)', () => {
+    const s = live();
+    expect(dropLiveSelection(s)).toBe(true);
+    expect(s).toMatchObject({ targetId: null, pocketId: null, cueOverrideId: null, targetMem: null, cueMem: null });
+    expect(dropLiveSelection(s)).toBe(false);
+  });
+  it('keeps a frozen snapshot’s selection (the snapshot has its own ids) and other modes’ selections', () => {
+    const frozen = live({ frozen: { layout: { table: makeTable('pool9'), balls: [], source: 'camera', frozen: true }, calibration: null, gen: 1 } });
+    expect(dropLiveSelection(frozen)).toBe(false);
+    expect(frozen).toMatchObject({ targetId: 'b6', cueOverrideId: 'b2', pocketId: 'TR' });
+    for (const mode of ['practice', 'snap'] as const) {
+      const s = live({ mode });
+      expect(dropLiveSelection(s)).toBe(false);
+      expect(s.targetId).toBe('b6');
+    }
+  });
+});
+
+describe('visionFailureMessage: why table detection is off', () => {
+  it('a worker that never answered could not start (its script may not be cached for offline use)', () => {
+    const m = visionFailureMessage(false);
+    expect(m).toContain('Table detection couldn’t start');
+    expect(m).toContain('offline');
+    expect(m).toContain('Try again');
+  });
+  it('a worker that had answered stopped working: no claim about being offline', () => {
+    const m = visionFailureMessage(true);
+    expect(m).toContain('Table detection stopped working');
+    expect(m).not.toContain('offline');
+    expect(m).toContain('Try again');
+    expect(m).toContain('practice table');
+  });
+  it('titles the message after what failed: table detection, not the camera', () => {
+    expect(cameraMessageTitle(visionFailureMessage(false))).toBe('Table detection is off');
+    expect(cameraMessageTitle(visionFailureMessage(true))).toBe('Table detection is off');
+    expect(cameraMessageTitle('No camera was found on this device.')).toBe('Camera unavailable');
+    expect(cameraMessageTitle(null)).toBe('Camera unavailable');
   });
 });
 
