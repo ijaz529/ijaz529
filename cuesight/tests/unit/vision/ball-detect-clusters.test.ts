@@ -10,8 +10,11 @@ import type { SynthCamera, SynthScene } from '../../../src/vision/synth/render';
 import type { Frame } from '../../../src/vision/image';
 import {
   ALL_POSES,
+  C,
   POSES,
+  R9,
   SNOOKER_POSES,
+  bilinear420,
   calibrationSet,
   chroma420,
   cueIndex,
@@ -20,6 +23,7 @@ import {
   exclusiveShare,
   fmt,
   gain,
+  mk,
   nearestTruth,
   rack,
   render,
@@ -38,14 +42,17 @@ interface Tally {
   far: string[];
   /** Wrong cue: an object ball or a phantom flagged as the cue. */
   wrongCue: string[];
+  /** Visible balls (at least 25 % of their outline their own, given `share`) not found, over all calibrations. */
+  visMiss: string[];
   log: string[];
 }
 
 /** Run `frame` of `sc` under every calibration of `cals`; misses beyond `allow` and the accuracy bounds are failures. */
-function sweep(sc: SynthScene, frame: Frame, cals: ReturnType<typeof calibrationSet>, allow: number): Tally {
-  const t: Tally = { bad: [], phantoms: [], far: [], wrongCue: [], log: [] };
+function sweep(sc: SynthScene, frame: Frame, cals: ReturnType<typeof calibrationSet>, allow: number, share: number[] = []): Tally {
+  const t: Tally = { bad: [], phantoms: [], far: [], wrongCue: [], visMiss: [], log: [] };
   for (const c of cals) {
     const r = detectWith(sc, frame, c);
+    for (let i = 0; i < share.length; i++) if (share[i]! >= 0.25 && r.match[i]!.det < 0) t.visMiss.push(`${c.name}: #${i} (${share[i]!.toFixed(2)})`);
     const found = r.match.map((_, i) => i).filter((i) => r.match[i]!.det >= 0);
     const s = errStats(r, found);
     const missed = sc.balls.length - found.length;
@@ -110,36 +117,57 @@ describe('touching clusters, more views', () => {
 });
 
 describe('snooker packs on 4:2:0 video (no coloured single ball: the frame dilation is unknown)', () => {
-  // Reds and the cue ball only. On video the pack's chroma is one sample per 2×2 block, about one
-  // sample per ball radius here (2.5–3 image px): the mask of the end and corner views does not
-  // resolve the pack (known limit: a few reds lost or misplaced, medians 14–20 mm). Measured, per
-  // view over these 10 calibrations × 2 encodings (replicated 4:2:0 and the 8-bit YUV round trip):
-  // calibrations with a phantom, this detector / wave-1 / previous fix: overhead 0 / 1 / 9, side
-  // 1 / 4 / 10, end 3 / 14 / 18, corner 18 / 12 / 20 (in the corner view the pack's mask is so coarse
-  // that a misplaced red matches no ball: known limit). Overhead holds every criterion.
-  const cals = (sc: SynthScene) => calibrationSet(sc, [[0.3, 8, 51000]]);
-  const maxPhantomCals: Record<Pose, number> = { overhead: 0, side: 1, end: 3, corner: 18 };
-  it.each(ALL_POSES)('%s view', (pose) => {
-    const sc = snookerPack(SNOOKER_POSES[pose]);
+  // Reds and the cue ball only, under the 62 calibrations, with the three ways video chroma reaches
+  // the detector: replicated per 2×2 block, the 8-bit YUV round trip, and upsampled bilinearly (a GPU's
+  // YUV → RGB conversion). The pack's chroma is one sample per 2×2 block, about one sample per ball
+  // radius here (2.5–3 image px): the masks of the end, corner and mirrored corner views do not resolve
+  // the pack (known limit: reds misplaced by 25–40 mm, medians 15–18 mm, against 17–20 mm for the
+  // wave-1 detector). Bounds per view, summed over the three encodings: phantoms next to the pack and
+  // visible balls (≥ 25 % of their outline) missed, each at most the wave-1 detector's on the same
+  // runs. Measured (wave-1 / previous fix / this detector), phantoms: end 141 / 148 / 119, side
+  // 21 / 49 / 7, corner 199 / 194 / 151, overhead 42 / 121 / 1, mirrored corner 211 / 198 / 167;
+  // visible misses: end 271 / 179 / 236, side 134 / 5 / 9, corner 4 / 0 / 0, overhead 6 / 6 / 0,
+  // mirrored corner 8 / 0 / 0. The overhead view holds every criterion on replicated and YUV chroma.
+  const WAVE1: Record<string, { phantoms: number; visMiss: number }> = {
+    end: { phantoms: 141, visMiss: 271 },
+    side: { phantoms: 21, visMiss: 134 },
+    corner: { phantoms: 199, visMiss: 4 },
+    overhead: { phantoms: 42, visMiss: 6 },
+    mirror: { phantoms: 211, visMiss: 8 },
+  };
+  const cameras: Record<string, SynthCamera> = { ...SNOOKER_POSES, mirror: { pos: { x: -3.0, y: 2.0, z: 2.2 }, target: { x: 0.2, y: -0.05, z: 0 }, fovDeg: 66 } };
+  it.each(Object.keys(WAVE1))('%s view', (pose) => {
+    const sc = snookerPack(cameras[pose]!);
     const f = render(sc);
-    let withPhantom = 0;
+    const share = exclusiveShare(sc);
+    const cals = calibrationSet(sc);
+    let phantoms = 0;
+    let far = 0;
+    let visMiss = 0;
     const log: string[] = [];
     const strict: string[] = [];
+    const wrong: string[] = [];
     for (const [nm, frame] of [
       ['4:2:0', chroma420(f)],
       ['YUV', yuv420(f)],
+      ['bilinear', bilinear420(f)],
     ] as const) {
-      const t = sweep(sc, frame, cals(sc), pose === 'overhead' ? 0 : 6);
-      const ph = new Set([...t.phantoms, ...t.far].map((p) => p.split(':')[0]));
-      withPhantom += ph.size;
-      log.push(`${nm}:`, ...t.log);
-      if (pose === 'overhead') strict.push(...t.bad.map((b) => `${nm} ${b}`), ...[...t.phantoms, ...t.far].map((b) => `${nm} ${b}`));
-      expect(t.wrongCue, t.wrongCue.join('\n')).toEqual([]);
+      const t = sweep(sc, frame, cals, pose === 'overhead' ? 0 : 6, share);
+      phantoms += t.phantoms.length;
+      far += t.far.length;
+      visMiss += t.visMiss.length;
+      log.push(`${nm}: phantoms ${t.phantoms.length} (far ${t.far.length}), visible missed ${t.visMiss.length}`, ...t.phantoms.slice(0, 8), ...t.visMiss.slice(0, 8));
+      if (pose === 'overhead' && nm !== 'bilinear') strict.push(...t.bad.map((b) => `${nm} ${b}`), ...[...t.phantoms, ...t.far].map((b) => `${nm} ${b}`));
+      wrong.push(...t.wrongCue.map((w) => `${nm} ${w}`));
     }
-    console.log(`snooker pack ${pose} on video:\n  ${log.join('\n  ')}\n  calibrations with a phantom: ${withPhantom} of 20`);
+    console.log(`snooker pack ${pose} on video (62 calibrations × 3 encodings): phantoms ${phantoms} (wave-1 ${WAVE1[pose]!.phantoms}), visible missed ${visMiss} (wave-1 ${WAVE1[pose]!.visMiss})\n  ${log.join('\n  ')}`);
+    expect(wrong, wrong.join('\n')).toEqual([]);
     expect(strict, strict.join('\n')).toEqual([]);
-    expect(withPhantom).toBeLessThanOrEqual(maxPhantomCals[pose]);
-  }, 180_000);
+    expect(phantoms).toBeLessThanOrEqual(WAVE1[pose]!.phantoms);
+    // No pocket-hole phantom far from the pack in any of these runs (as for the wave-1 detector).
+    expect(far).toBe(0);
+    expect(visMiss).toBeLessThanOrEqual(WAVE1[pose]!.visMiss);
+  }, 240_000);
 });
 
 describe('packs under exposure, cloth noise and a moved lamp (sharp frames)', () => {
@@ -184,36 +212,99 @@ describe('packs under exposure, cloth noise and a moved lamp (sharp frames)', ()
 describe('cue ball beside a rack', () => {
   // A stripe in the back row of a rack shows only its caps (its band hidden behind the nearer balls)
   // and reads whiter than the real cue ball, whose camera side is in shade: it may never be flagged.
-  // Over these cameras plus the corner and side views (racks × encodings × auto/exact: 72 runs) the
-  // previous fix flagged an object ball in 13 (stripes of the 15-ball rack in the end view under its
-  // auto and exact calibrations among them), the wave-1 detector in 3, this one in none.
-  const cams: Record<string, SynthCamera> = {
-    end: POSES.end!,
-    endFar: { pos: { x: -3.6, y: 0.0, z: 1.9 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 66 },
-    endFar2: { pos: { x: -3.4, y: 0.0, z: 1.8 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 66 },
-    endFar3: { pos: { x: -3.8, y: 0.1, z: 2.0 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 66 },
-    endFar4: { pos: { x: -3.6, y: 0.0, z: 1.9 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 60 },
-    cornerFar: { pos: { x: -3.2, y: -2.2, z: 2.0 }, target: { x: 0.15, y: 0.05, z: 0 }, fovDeg: 66 },
-    sideFar: { pos: { x: 0.2, y: -3.0, z: 2.2 }, target: { x: 0, y: 0.08, z: 0 }, fovDeg: 68 },
+  // Such a ball is walled in on opposite sides by its neighbours (the only way a band, which reaches the
+  // rim at two opposite points, can be out of sight), so its whiteness is no evidence against the real
+  // cue ball, which is chosen among the other candidates. Per camera (9- and 15-ball racks, RGB and YUV
+  // 4:2:0, auto, exact and 12 jittered calibrations at ±0.3 px: 56 runs), the real cue is flagged at
+  // least as often as by the wave-1 detector (end 38, endFar 43, endFar2 30, endFar3 50, endFar4 41,
+  // cornerFar 55, sideFar 51; it also flagged an object ball in 27 runs), never an object ball. The
+  // previous fix flagged the real cue in 30 / 48 / 31 / 39 / 45 / 54 / 55; this one in 56 / 56 / 42 /
+  // 56 / 56 / 56 / 55.
+  const cams: Record<string, [SynthCamera, number]> = {
+    end: [POSES.end!, 38],
+    endFar: [{ pos: { x: -3.6, y: 0.0, z: 1.9 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 66 }, 43],
+    endFar2: [{ pos: { x: -3.4, y: 0.0, z: 1.8 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 66 }, 30],
+    endFar3: [{ pos: { x: -3.8, y: 0.1, z: 2.0 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 66 }, 50],
+    endFar4: [{ pos: { x: -3.6, y: 0.0, z: 1.9 }, target: { x: 0.2, y: 0, z: 0 }, fovDeg: 60 }, 41],
+    cornerFar: [{ pos: { x: -3.2, y: -2.2, z: 2.0 }, target: { x: 0.15, y: 0.05, z: 0 }, fovDeg: 66 }, 55],
+    sideFar: [{ pos: { x: 0.2, y: -3.0, z: 2.2 }, target: { x: 0, y: 0.08, z: 0 }, fovDeg: 68 }, 51],
   };
-  it.each(Object.keys(cams))('%s camera: the flagged cue is the real cue ball or none (9- and 15-ball racks, RGB and YUV 4:2:0, auto and exact)', (cn) => {
+  it.each(Object.keys(cams))('%s camera: the flagged cue is the real cue ball or none, and the real one at least as often as wave-1 (9- and 15-ball racks, RGB and YUV 4:2:0, auto, exact and 12 jittered calibrations)', (cn) => {
+    const [cam, floor] = cams[cn]!;
     const wrong: string[] = [];
     let real = 0;
+    let runs = 0;
     for (const n of [9, 15] as const) {
-      const sc = rack(n, cams[cn]!);
+      const sc = rack(n, cam);
       const f = render(sc);
       for (const [nm, frame] of [
         ['RGB', f],
         ['YUV', yuv420(f)],
       ] as const)
-        for (const c of calibrationSet(sc, [])) {
+        for (const c of calibrationSet(sc, [[0.3, 12, 61000]])) {
           const r = detectWith(sc, frame, c);
           const ci = cueIndex(r);
+          runs++;
           if (ci === 0) real++;
           else if (ci !== -1) wrong.push(`${n}-ball ${nm} ${c.name}: ${ci} (${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')})`);
         }
     }
-    console.log(`${cn}: real cue flagged in ${real} of 8`);
+    console.log(`${cn}: real cue flagged in ${real} of ${runs} (wave-1 ${floor})`);
     expect(wrong, wrong.join('\n')).toEqual([]);
-  }, 120_000);
+    expect(real).toBeGreaterThanOrEqual(floor);
+  }, 180_000);
+});
+
+describe('cue ball partly behind an object ball, stripes on the table', () => {
+  // The cue ball 2.05 R behind a maroon (solid or stripe) on the line of sight, offset sideways by
+  // 0.6, 1 or 1.4 R (20–40 % of its silhouette hidden), with five stripes and two solids elsewhere (a
+  // green stripe on green cloth among them). Hidden on one side only, its rim shows on the other: no
+  // band could be out of sight, so its whiteness counts. The previous fix withheld every partly hidden
+  // white ball when any other ball was white-ish and flagged no cue in 42 (RGB) and 47 (YUV) of the 108
+  // end-view runs; the wave-1 detector flags the real cue in 108, 108, 108, 108, 108 and 107 of 108
+  // (end RGB, end YUV, side, corner); so does this one. Never an object ball.
+  const R = R9;
+  const OTHERS = [
+    { pos: { x: -0.9, y: -0.35 }, color: C.yellow!, stripe: true },
+    { pos: { x: 0.85, y: -0.3 }, color: C.blue!, stripe: true },
+    { pos: { x: 0.95, y: 0.35 }, color: C.red!, stripe: true },
+    { pos: { x: -0.7, y: 0.4 }, color: C.purple! },
+    { pos: { x: 0.0, y: 0.38 }, color: C.green!, stripe: true },
+    { pos: { x: -0.05, y: -0.38 }, color: C.orange! },
+  ];
+  const FLOOR: Record<string, number> = { 'end RGB': 108, 'end YUV': 107, 'side RGB': 108, 'side YUV': 108, 'corner RGB': 108, 'corner YUV': 108 };
+  it.each(['end', 'side', 'corner'] as Pose[])('%s view: the real cue ball is flagged as often as by wave-1 (RGB and YUV, auto, exact and 4 jittered calibrations)', (pose) => {
+    const cam = POSES[pose]!;
+    const wrong: string[] = [];
+    const real: Record<string, number> = { RGB: 0, YUV: 0 };
+    const none: string[] = [];
+    for (const [cx, cy] of [
+      [-0.3, 0.2],
+      [0.2, -0.15],
+      [0.5, 0.3],
+    ] as const)
+      for (const off of [0.6, 1.0, 1.4])
+        for (const stripe of [false, true]) {
+          const a = Math.atan2(cam.pos.y - cy, cam.pos.x - cx);
+          const front = { x: cx + 2.05 * R * Math.cos(a) - off * R * Math.sin(a), y: cy + 2.05 * R * Math.sin(a) + off * R * Math.cos(a) };
+          const sc = mk('pool9', cam, [{ pos: { x: cx, y: cy }, color: C.cue! }, { pos: front, color: C.maroon!, ...(stripe ? { stripe: true } : {}) }, ...OTHERS]);
+          const f = render(sc);
+          for (const [nm, frame] of [
+            ['RGB', f],
+            ['YUV', yuv420(f)],
+          ] as const)
+            for (const c of calibrationSet(sc, [[0.3, 4, 98000]])) {
+              const r = detectWith(sc, frame, c);
+              const ci = cueIndex(r);
+              const tag = `(${cx}, ${cy}) off ${off}${stripe ? ' stripe' : ''} ${nm} ${c.name}`;
+              if (ci === 0) real[nm]!++;
+              else if (ci === -1) none.push(tag);
+              else wrong.push(`${tag}: ${ci} (${r.balls.map((b) => `${b.label}:${b.white.toFixed(2)}`).join(' ')})`);
+            }
+        }
+    console.log(`${pose}: real cue flagged RGB ${real.RGB} / 108, YUV ${real.YUV} / 108; none in ${none.join(', ') || '-'}`);
+    expect(wrong, wrong.join('\n')).toEqual([]);
+    expect(real.RGB).toBeGreaterThanOrEqual(FLOOR[`${pose} RGB`]!);
+    expect(real.YUV).toBeGreaterThanOrEqual(FLOOR[`${pose} YUV`]!);
+  }, 180_000);
 });

@@ -17,15 +17,19 @@
  *     matched filter peaks; a ball the cluster can do without once its neighbours re-settle is not
  *     counted. When the frame has no coloured single ball to measure its silhouette dilation by, the
  *     discs keep the true ball radius and the mask's outer ring, as wide as a coloured silhouette may
- *     have grown at the cluster's chroma resolution (sharp frame or 4:2:0 video, measured on the
- *     frame), is evidence neither way (no size to choose, so no knife edge). A pack seen at less than
- *     RP_FIT px of ball radius is resampled finer in its own window first.
+ *     have grown at the cluster's chroma resolution, is evidence neither way (no size to choose, so no
+ *     knife edge). The chroma resolution is read on the frame around the cluster, whatever filter
+ *     upsampled it: block replication by the 2×2-block parity of its differences, smooth upsampling by
+ *     the width of its transitions (chromaBand). A pack seen at less than RP_FIT px of ball radius is
+ *     resampled finer in its own window first.
  *  4. Shape gate (fill, aspect, size, shading, width across the view) rejects lamp glare and sticks.
  *  5. Colour: robust hue and brightness (relative to the frame's white through the cloth beside each
  *     ball) named from the table's palette; the cue ball is the whitest COMPLETE ball with a clear
  *     margin over the runner-up, otherwise no ball is flagged (the app then asks the player to tap the
- *     cue ball, spec edge case). A white ball largely hidden behind nearer balls (a stripe in a rack's
- *     back row shows only its caps) is the cue only when no other ball is white at all.
+ *     cue ball, spec edge case). A white ball partly hidden and walled in on opposite sides by its
+ *     neighbours (a stripe in a rack's back row shows only its caps: its band can be out of sight) is
+ *     ambiguous: the cue is chosen among the other candidates, and it is the cue only when no other ball
+ *     is white at all.
  *
  * Known limits (Constitution II), measured on the ray-traced fixtures:
  *  - a ball whose silhouette is (almost) entirely inside its neighbours' (the middle of a pack seen from
@@ -36,15 +40,23 @@
  *    (RGB: 11 of 12 found);
  *  - a black ball 1R inside a far pocket (its dark pixels merge with the hole) is missed in about a
  *    third of the views, as by the 0.2.x detector;
- *  - on 4:2:0 video a snooker pack in the end and corner views loses 3–5 reds (median error 14–20 mm):
- *    its chroma is about one sample per ball radius there, and in the corner view a misplaced red
- *    matches no ball in most calibrations;
+ *  - on 4:2:0 video a snooker pack in the end, corner and mirrored corner views loses or misplaces
+ *    3–5 reds (25–40 mm; median error 15–18 mm, the wave-1 detector 17–20 mm): its chroma is about one
+ *    sample per ball radius there. Over 62 calibrations × replicated, YUV and bilinear chroma, phantoms
+ *    next to the pack: end 119, corner 151, mirrored corner 167 (wave-1: 141, 199, 211);
+ *  - on 960-px Snap frames from 1280-px video with bilinear chroma, the snooker end view loses a
+ *    28 %-visible red in 5 of 6 calibrations (wave-1 3; its ring is set for the 0.69–0.76 px such
+ *    frames bleed, the end view's thin crescents are 1–2 px);
+ *  - the 15-ball end view under the exact calibration loses the green 6 (29 % of its outline, green
+ *    on green cloth): its neighbours' discs take most of its slice of the outline and one disc goes to
+ *    the hidden #5 and #8 instead (14 mask samples better against a toll of 33; the auto calibration and
+ *    the wave-1 detector find it);
  *  - under jittered calibrations (60 per scene, ±0.15–1 px corners) the end views lose one ball at
  *    28–56 % of its outline in 6–11 of 60 (the pool pack's green 6 or black 8, a snooker row-2 end
  *    ball) and the snooker corner views reach a 10–12 mm median in 5–6 of 60; the auto and exact
  *    calibrations are not affected;
- *  - with ±1 px corner error or more a pocket's hole can fall outside its throat mask and read as a
- *    dark ball in the pocket;
+ *  - with corner error a pocket's hole can fall outside its throat mask and read as a dark ball in the
+ *    pocket, 0.6–1 m from any ball (2 of 1798 fresh-seed runs, at ±0.3 and ±0.5 px; more at ±2 px);
  *  - a cue stick crossing the near cushion diagonally (butt raised ≥ 8°) can leave one piece that
  *    passes as a ball.
  *
@@ -149,11 +161,6 @@ const CUE_FILL_MIN = 0.75;
 const CUE_MIN_WHITE = 0.05;
 const CUE_SPREAD = 0.15;
 const CUE_MARGIN = 0.15;
-/**
- * A cue candidate with more than this share of its silhouette hidden by nearer balls could be a stripe
- * whose band is hidden there (a band covers ≳ 20 % of a silhouette in any orientation).
- */
-const CUE_OCC = 0.2;
 /** Any ball: luminance spread p90 − p10 at least this × p90 (shading); flat bright blobs are glare. */
 const FLAT_SPREAD = 0.25;
 /** Tint: saturation above this but ≤ 0.4, hue away from the cloth; weighted into the cue score. */
@@ -173,12 +180,31 @@ const TINT_W = 1.5;
  * snooker end, corner and mirrored corner views: 18 / 23 / 32 fail (the end view loses more as it
  * grows, the corner views fewer), none with a phantom next to the pack; on fresh seeds (74
  * calibrations × the 16 cluster scenes) 0.33 / 0.37: 34 / 48 visible balls missed, 0 / 0 phantoms
- * next to a cluster.
+ * next to a cluster. BAND_SMOOTH: 4:2:0 chroma upsampled bilinearly (a GPU's YUV → RGB conversion, a
+ * JPEG decoder's fancy upsampling) bleeds further, over its ~4 px transitions: red packs 0.81–0.97 image
+ * px at the processing size, 0.69–0.76 for 960-px Snap frames from 1280-px video, 0.48–0.56 for 640-px
+ * live frames from 1280-px video; pairs 0.56–0.75. Measured on 240 bilinear runs (pairs, rows, racks
+ * and packs in 4 views) with the ring at 0.6 / 0.8 / 0.9 for it: phantoms next to a cluster
+ * 22 / 14 / 8, visible balls missed 47 / 50 / 52 (wave-1 detector 23 and 57). At 0.8 (the final width
+ * mapping: 15 and 50) every bilinear snooker view stays at or under the wave-1 detector's phantoms and
+ * visible misses over 62 calibrations; 0.9 loses more of the end view's thin crescents.
  */
 const BAND_SHARP = 0.33;
 const BAND_VIDEO = 0.6;
-/** chromaParity at or above this is full-resolution chroma (measured 0.6–0.87 around ray-traced RGB clusters, ≤ 0.01 on 4:2:0); the ring width is interpolated below it. */
+const BAND_SMOOTH = 0.8;
+/**
+ * chromaBand's readings (its comment has the measure): block parity at or above PARITY_FULL is not
+ * replicated 4:2:0 (measured 0.39–0.98 around ray-traced clusters with full-resolution or bilinear
+ * chroma, ≤ 0.02 replicated); a chroma transition width (lag-2 / lag-1 energy) at or below WIDTH_FULL
+ * is full-resolution chroma (measured 2.47–2.88 on RGB frames, 2.53–2.88 on 640-px frames grabbed from
+ * replicated 1280-px video, 1.99–2.04 replicated), at or above WIDTH_VIDEO bilinear 4:2:0 (3.44–3.67 at
+ * the processing size; 3.04–3.29 grabbed at 640 px and 3.44–3.60 at 960 px from 1280-px video, which
+ * the interpolation between the two places in between). The ring width follows the transition width
+ * continuously (no knife edge: a frame between the two gets a ring between the two).
+ */
 const PARITY_FULL = 0.6;
+const WIDTH_FULL = 3.0;
+const WIDTH_VIDEO = 3.5;
 /** A single blob with more than this share of low-S pixels is a white (or black) ball: luma-bound rim. */
 const WHITE_BLOB = 0.7;
 /**
@@ -781,7 +807,7 @@ interface Ctx {
   next: number;
   /** Focal length (image px). */
   focal: number;
-  /** The frame itself (chroma resolution is measured on it, see chromaParity). */
+  /** The frame itself (chroma resolution is measured on it, see chromaBand). */
   frame: Frame;
   /**
    * The frame's silhouette dilation in IMAGE px (+ = coloured blobs larger than the true silhouette),
@@ -802,6 +828,12 @@ interface Found {
   complete: number;
   /** Share of the predicted silhouette that nearer balls hide (counted in `complete`). */
   occ: number;
+  /**
+   * Whether the ball's rim against known cloth leaves a pair of opposite rim directions hidden (by
+   * nearer balls, touching neighbours or unknown pixels): only then can a stripe's band, which reaches
+   * the rim at two opposite points, be out of sight (see enclosedRim).
+   */
+  enclosed: boolean;
   spread: number;
   /** Colour evidence: robust hue (°), median S and p75 V of the hue group; the ball's p90 V; white share. */
   hue: number;
@@ -979,6 +1011,7 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
         a.ball.px = ww;
         a.complete = Math.max(a.complete, b.complete);
         a.occ = Math.min(a.occ, b.occ);
+        a.enclosed = a.enclosed && b.enclosed;
         found.splice(j, 1);
       }
     }
@@ -988,23 +1021,34 @@ export function detectBalls(frame: Frame, calib: Calibration, table: TableSpec, 
   // Cue ball: the whitest COMPLETE ball (a stripe whose band dropped out is not), with real shading
   // (flat glare is not), and clearly whiter than the runner-up. Otherwise no ball is the cue: the
   // tracker's vote then decays and the app asks the player to tap the cue ball (spec edge case).
+  // A white ball in a cluster may instead be a stripe whose band is out of sight (a pack's back row
+  // shows only its caps, lit toward the camera, and reads whiter than the real cue ball whose camera
+  // side is in shade; on video the rest of a band between two touching neighbours blends into its caps).
+  // A band reaches the silhouette's rim at two opposite points, so it can be out of sight only where
+  // the ball's rim against the cloth leaves an opposite pair hidden (enclosed: walled in by nearer balls
+  // and touching neighbours, as in a pack's back row). Such a ball is ambiguous: its whiteness is no
+  // evidence for or against any other ball, so the cue is chosen among the unambiguous candidates (a
+  // cue ball partly behind one object ball is one) with the margin over them; an ambiguous one is the
+  // cue only when no other ball is white at all.
   let best = -1;
   let second = -1;
+  let amb = -1;
   let nWhite = 0;
   const cueFill = Math.max(CUE_FILL_MIN, CUE_FILL - 0.5 / ctx.rp);
   for (let i = 0; i < found.length; i++) {
     const f = found[i]!;
     if (f.ball.white >= CUE_MIN_WHITE) nWhite++;
     if (f.complete < cueFill || f.ball.white < CUE_MIN_WHITE || f.spread < CUE_SPREAD) continue;
+    if (f.enclosed) {
+      if (amb < 0 || f.ball.white > found[amb]!.ball.white) amb = i;
+      continue;
+    }
     if (best < 0 || f.ball.white > found[best]!.ball.white) {
       second = best;
       best = i;
     } else if (second < 0 || f.ball.white > found[second]!.ball.white) second = i;
   }
-  // A white ball partly hidden behind nearer balls may be a stripe whose band is the hidden part (a
-  // pack's back row shows only its caps, lit toward the camera, and reads whiter than the real cue ball
-  // whose camera side is in shade): it is the cue only when no other ball is white at all.
-  if (best >= 0 && found[best]!.occ > CUE_OCC && nWhite > 1) best = -1;
+  if (best < 0 && amb >= 0 && nWhite === 1) best = amb;
   if (best >= 0 && (second < 0 || found[second]!.ball.white <= found[best]!.ball.white - CUE_MARGIN)) {
     found[best]!.ball.isCue = true;
     found[best]!.ball.label = 'cue';
@@ -1489,17 +1533,27 @@ function stripThin(ctx: Ctx, n: number, lab: number, minI: number, maxI: number,
   return nSub;
 }
 
-/** Image bbox scratch for chromaParity. */
+/** Image bbox scratch for chromaBand. */
 const PBOX = new Float64Array(4);
 /**
- * Chroma resolution at a cluster (blob pixels queue[start..start+cnt) of the rectified frame): over
- * the cluster's image bounding box (plus 2 px), the share of the squared chroma (Cb, Cr) differences
- * between neighbouring pixels that falls between the two pixels of an aligned 2×2 block, against the
- * share across blocks, as min/max (alignment-free): ≈ 1 with full-resolution chroma, ≈ 0 when the
- * chroma is one sample per 2×2 block (YUV 4:2:0 video upsampled by replication; ≈ 0.65 bilinear).
- * No chroma variation (nothing to tell by): 1.
+ * The dilation ring's width (image px, fitDiscs' band) for a cluster (blob pixels queue[start..start+cnt)
+ * of the rectified frame) whose frame has no coloured single ball to measure the dilation by: how far
+ * a coloured silhouette may have bled at the chroma resolution where the cluster is. Two readings over
+ * the cluster's image bounding box (plus 2 px), each independent of the chroma's content and contrast:
+ *  - parity: the share of the squared chroma (Cb, Cr) differences between neighbouring pixels that
+ *    falls between the two pixels of an aligned 2×2 block, against the share across blocks, as
+ *    min/max (alignment-free): ≈ 0 when the chroma is one sample per 2×2 block upsampled by
+ *    replication, 0.4–1 otherwise;
+ *  - width: the chroma's lag-2 over lag-1 squared differences (both axes). A step edge reads 2, a linear
+ *    ramp of width w px 4 − 2/w: it is the chroma's transition width, which an interpolating upsampler
+ *    leaves about as wide as its sample spacing or wider. Replicated 4:2:0 reads ≈ 2 (its steps are
+ *    sharp: parity tells it), full-resolution chroma 2.5–2.9 (the image's own blur), 4:2:0 upsampled
+ *    bilinearly (a GPU's YUV → RGB conversion, a JPEG decoder's fancy upsampling) 3.4–3.7.
+ * Replicated chroma moves the ring from BAND_SHARP toward BAND_VIDEO, smooth chroma toward BAND_SMOOTH
+ * (each by linear interpolation of its reading), whichever is wider. No chroma variation (nothing to
+ * tell by): BAND_SHARP.
  */
-function chromaParity(ctx: Ctx, start: number, cnt: number): number {
+function chromaBand(ctx: Ctx, start: number, cnt: number): number {
   const { S, w } = ctx;
   const f = ctx.frame;
   const fw = f.width;
@@ -1536,37 +1590,47 @@ function chromaParity(ctx: Ctx, start: number, cnt: number): number {
     if (v > PBOX[3]!) PBOX[3] = v;
   }
   const x0 = Math.max(0, Math.floor(PBOX[0]!) - 2);
-  const x1 = Math.min(fw - 2, Math.ceil(PBOX[1]!) + 2);
+  const x1 = Math.min(fw - 3, Math.ceil(PBOX[1]!) + 2);
   const y0 = Math.max(0, Math.floor(PBOX[2]!) - 2);
-  const y1 = Math.min(fh - 2, Math.ceil(PBOX[3]!) + 2);
+  const y1 = Math.min(fh - 3, Math.ceil(PBOX[3]!) + 2);
   let eh0 = 0;
   let eh1 = 0;
   let ev0 = 0;
   let ev1 = 0;
+  let e2 = 0;
   for (let y = y0; y <= y1; y++)
     for (let x = x0; x <= x1; x++) {
       const k = (y * fw + x) * 4;
-      const r = d[k]!;
-      const g = d[k + 1]!;
-      const b = d[k + 2]!;
-      const cb = -0.168736 * r - 0.331264 * g + 0.5 * b;
-      const cr = 0.5 * r - 0.418688 * g - 0.081312 * b;
+      const cb = -0.168736 * d[k]! - 0.331264 * d[k + 1]! + 0.5 * d[k + 2]!;
+      const cr = 0.5 * d[k]! - 0.418688 * d[k + 1]! - 0.081312 * d[k + 2]!;
       const kx = k + 4;
       const ex = -0.168736 * d[kx]! - 0.331264 * d[kx + 1]! + 0.5 * d[kx + 2]! - cb;
       const fx = 0.5 * d[kx]! - 0.418688 * d[kx + 1]! - 0.081312 * d[kx + 2]! - cr;
       const ky = k + fw * 4;
       const ey = -0.168736 * d[ky]! - 0.331264 * d[ky + 1]! + 0.5 * d[ky + 2]! - cb;
       const fy = 0.5 * d[ky]! - 0.418688 * d[ky + 1]! - 0.081312 * d[ky + 2]! - cr;
+      const kx2 = k + 8;
+      const ex2 = -0.168736 * d[kx2]! - 0.331264 * d[kx2 + 1]! + 0.5 * d[kx2 + 2]! - cb;
+      const fx2 = 0.5 * d[kx2]! - 0.418688 * d[kx2 + 1]! - 0.081312 * d[kx2 + 2]! - cr;
+      const ky2 = k + fw * 8;
+      const ey2 = -0.168736 * d[ky2]! - 0.331264 * d[ky2 + 1]! + 0.5 * d[ky2 + 2]! - cb;
+      const fy2 = 0.5 * d[ky2]! - 0.418688 * d[ky2 + 1]! - 0.081312 * d[ky2 + 2]! - cr;
       const eh = ex * ex + fx * fx;
       const ev = ey * ey + fy * fy;
+      e2 += ex2 * ex2 + fx2 * fx2 + ey2 * ey2 + fy2 * fy2;
       if (x & 1) eh1 += eh;
       else eh0 += eh;
       if (y & 1) ev1 += ev;
       else ev0 += ev;
     }
+  const e1 = eh0 + eh1 + ev0 + ev1;
   const h = eh0 + eh1 > 1 ? Math.min(eh0, eh1) / Math.max(eh0, eh1) : 1;
   const v = ev0 + ev1 > 1 ? Math.min(ev0, ev1) / Math.max(ev0, ev1) : 1;
-  return Math.max(0, Math.min(1, (h + v) / 2));
+  const parity = Math.max(0, Math.min(1, (h + v) / 2));
+  const width = e1 > 1 ? e2 / e1 : 2;
+  const vRep = 1 - Math.min(1, parity / PARITY_FULL);
+  const vSmooth = Math.max(0, Math.min(1, (width - WIDTH_FULL) / (WIDTH_VIDEO - WIDTH_FULL)));
+  return BAND_SHARP + Math.max((BAND_VIDEO - BAND_SHARP) * vRep, (BAND_SMOOTH - BAND_SHARP) * vSmooth);
 }
 
 /** Is rectified pixel k "known cloth" (a true silhouette edge lies between it and a ball pixel)? */
@@ -1703,8 +1767,7 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
   // sample per 2×2 block; its bleed widens the rim).
   let band = 0;
   if (!single && !known) {
-    const P = chromaParity(ctx, start, cnt);
-    band = Math.min(2.5, (BAND_VIDEO - (BAND_VIDEO - BAND_SHARP) * Math.min(1, P / PARITY_FULL)) * rho);
+    band = Math.min(2.5, chromaBand(ctx, start, cnt) * rho);
   }
   const k = fitDiscs(ctx, cnt, lab, cx, cy, ax, ay, sinEl, uMin, uMax, vMin, vMax, rad, band);
   CENT.set(BEST.subarray(0, k * 2));
@@ -1793,8 +1856,71 @@ function processBlob(ctx: Ctx, start: number, cnt: number, lab: number): void {
     if ((k > 1 || truncated) && !wideAcross(ctx, xr, yr, ax, ay, sinEl)) continue;
     pos.x = Math.max(-(table.length / 2 - ctx.R), Math.min(table.length / 2 - ctx.R, pos.x));
     pos.y = Math.max(-(table.width / 2 - ctx.R), Math.min(table.width / 2 - ctx.R, pos.y));
-    describe(ctx, start, cnt, m, n, a1, pos, lab, own, FILL.tot > 0 ? occ / FILL.tot : 0);
+    describe(ctx, start, cnt, m, n, a1, pos, lab, own, FILL.tot > 0 ? occ / FILL.tot : 0, k > 1 && enclosedRim(S.edge, nEdge, k, m, rad));
   }
+}
+
+/** Rim direction bins for enclosedRim (each 2π/ENC_BINS wide; ENC_BINS even). */
+const ENC_BINS = 32;
+/**
+ * Opposite rim directions (consecutive bins) that must be hidden together for a band to be out of
+ * sight. A band's end spans about ±27° of rim (|n·axis| ≲ 0.45, the renderer's; a real stripe's
+ * 0.4–0.5), but where it meets a touching neighbour its pixels go to that ball, so a hidden arc just
+ * over 180° can already hide it. Measured (11.25° bins): back-row stripes of a 15-ball rack that read
+ * white (0.21–0.82) are hidden over 202–236°, with 2–5 opposite pairs; a cue ball behind an object
+ * ball offset 0.6 R sideways, 101° and none. Requiring 3 pairs let two such stripes through as the cue
+ * in 392 rack runs (an earlier form of the cue rule); with 1, none, and the cue behind an object ball is
+ * still flagged in 647 of 648 runs.
+ */
+const ENC_MIN = 1;
+const ENC = new Uint8Array(ENC_BINS);
+const ENC2 = new Uint8Array(ENC_BINS);
+/**
+ * Could a stripe's band be out of sight on ball m of a k-ball fit? A band (a belt about a great
+ * circle) reaches the silhouette's rim at two opposite points, so it can be hidden only if two
+ * opposite rim arcs, each about a band end wide, show no silhouette edge against known cloth (they are
+ * behind nearer balls, against touching neighbours, or unknown). The edge faces (edge[0..nEdge),
+ * de-stretched about the blob centroid) nearest to m's centre (CENT) and within 1.5 radii of it are
+ * binned by direction; single-bin gaps between visible bins (sampling: about one face per px of rim)
+ * count as visible and single visible bins between hidden ones (a crevice pixel) as hidden. Enclosed:
+ * at least ENC_MIN consecutive directions are hidden together with their opposite.
+ */
+function enclosedRim(edge: Float64Array, nEdge: number, k: number, m: number, rad: number): boolean {
+  ENC.fill(0);
+  const cu = CENT[m * 2]!;
+  const cv = CENT[m * 2 + 1]!;
+  const lim = 2.25 * rad * rad;
+  for (let e = 0; e < nEdge; e++) {
+    const x = edge[e * 2]!;
+    const y = edge[e * 2 + 1]!;
+    const du = x - cu;
+    const dv = y - cv;
+    const d2 = du * du + dv * dv;
+    if (d2 > lim) continue;
+    let mine = true;
+    for (let o = 0; o < k && mine; o++) {
+      if (o === m) continue;
+      const eu = x - CENT[o * 2]!;
+      const ev = y - CENT[o * 2 + 1]!;
+      if (eu * eu + ev * ev < d2) mine = false;
+    }
+    if (!mine) continue;
+    const b = Math.floor(((Math.atan2(dv, du) + Math.PI) / (2 * Math.PI)) * ENC_BINS);
+    ENC[b < ENC_BINS ? b : 0] = 1;
+  }
+  const n = ENC_BINS;
+  for (let i = 0; i < n; i++) ENC2[i] = ENC[i]! || (ENC[(i + n - 1) % n]! && ENC[(i + 1) % n]!) ? 1 : 0;
+  for (let i = 0; i < n; i++) ENC[i] = ENC2[i]! && (ENC2[(i + n - 1) % n]! || ENC2[(i + 1) % n]!) ? 1 : 0;
+  // Longest circular run of directions hidden together with their opposite (pairs i, i + n/2).
+  const h = n / 2;
+  let run = 0;
+  let best = 0;
+  for (let i = 0; i < 2 * h; i++) {
+    const j = i % h;
+    if (ENC[j] || ENC[j + h]) run = 0;
+    else if (++run > best) best = run;
+  }
+  return best >= ENC_MIN;
 }
 
 /**
@@ -2975,7 +3101,7 @@ function fitCircle(edge: Float64Array, eown: Int32Array, nEdge: number, m: numbe
 }
 
 /** Colour statistics, name and cue score for ball m of the blob; appends a detection. */
-function describe(ctx: Ctx, start: number, cnt: number, m: number, n: number, a1: number, pos: Vec2, blob: number, complete: number, occ: number): void {
+function describe(ctx: Ctx, start: number, cnt: number, m: number, n: number, a1: number, pos: Vec2, blob: number, complete: number, occ: number, enclosed: boolean): void {
   const { S } = ctx;
   const { queue, assign, rgb, hue, sat, val } = S;
   if (n === 0) return;
@@ -3103,6 +3229,7 @@ function describe(ctx: Ctx, start: number, cnt: number, m: number, n: number, a1
     blob,
     complete,
     occ,
+    enclosed,
     spread: vTop - vLow,
     hue: hh,
     sat: ng > 0 ? sg / ng : 0,

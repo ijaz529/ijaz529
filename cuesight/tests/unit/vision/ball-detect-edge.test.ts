@@ -15,6 +15,7 @@ import { BALL_COLORS, cameraModel, fixtureBalls, renderSyntheticTable, type RGB,
 import { createTableScratch, detectTable, learnClothInQuad, type ClothModel } from '../../../src/vision/table-detect';
 import type { Vec2 } from '../../../src/core/vec';
 import { POSES } from '../../helpers/scenes';
+import { bilinear420 } from './ball-detect-helpers';
 
 type Pose = 'end' | 'side' | 'corner' | 'overhead';
 const ALL_POSES: Pose[] = ['end', 'side', 'corner', 'overhead'];
@@ -692,6 +693,13 @@ describe('touching clusters', () => {
     ['15-ball triangle', (p) => rack(15, p), { end: 3, corner: 3 }, { end: 7 }],
     ['snooker 15-red pack', snookerPack, { end: 3, corner: 3 }, { end: 6, corner: 5 }],
   ];
+  // Under the auto and exact calibrations every ball with at least 25 % of its outline its own is found
+  // (asserted per ball, not only as a miss count). One measured exception, a regression against the
+  // wave-1 detector pending approval: the 15-ball end view under the exact calibration loses the green 6
+  // (29 %, green on green cloth) and counts an interior disc between the hidden #5 and #8 instead (the
+  // two 13-ball fits differ by 14 mask samples against a toll of 33; under the auto calibration the
+  // order is reversed and #6 is found).
+  const KNOWN_VISIBLE_MISS = new Set(['15-ball triangle end exact #6']);
   for (const [name, build, hidden, jitterFails] of cases)
     it.each(ALL_POSES)(`${name}, %s view: every visible ball, no phantom, median ≤ 10 mm, p95 ≤ 25 mm, under auto, exact and 60 jittered calibrations`, (pose) => {
       const sc = build(pose);
@@ -703,9 +711,13 @@ describe('touching clusters', () => {
       if (allow > 0) expect(share.every((v) => v < 0.15 || v >= 0.25), `no ball between hidden and visible: ${share.map((v) => v.toFixed(2)).join(' ')}`).toBe(true);
       const bad: string[] = [];
       const phantoms: string[] = [];
+      const visible: string[] = [];
       const log: string[] = [];
       for (const c of calibrationSet(sc)) {
         const r = detect(sc, frame, { cal: c.cal, refs: c.refs });
+        if (c.name === 'auto' || c.name === 'exact')
+          for (let i = 0; i < share.length; i++)
+            if (share[i]! >= 0.25 && r.match[i]!.det < 0 && !KNOWN_VISIBLE_MISS.has(`${name} ${pose} ${c.name} #${i}`)) visible.push(`${c.name}: #${i} (${share[i]!.toFixed(2)} of its outline) missed`);
         const found = r.match.map((_, i) => i).filter((i) => r.match[i]!.det >= 0);
         const s = errStats(r, found);
         const missed = sc.balls.length - found.length;
@@ -720,6 +732,7 @@ describe('touching clusters', () => {
       }
       console.log(`${name} ${pose}:\n  ${log.join('\n  ')}`);
       expect(phantoms, phantoms.join('\n')).toEqual([]);
+      expect(visible, visible.join('\n')).toEqual([]);
       // Next to an uncounted ball the neighbours' fits absorb a little of its silhouette, so the tail is
       // allowed to 30 mm there; SC-003's 25 mm holds wherever every ball is counted.
       const strict = bad.filter((b) => b.startsWith('auto') || b.startsWith('exact'));
@@ -741,21 +754,47 @@ describe('touching pairs side by side across the view', () => {
     }
   });
 
-  it.each(['end', 'corner'] as Pose[])('%s view, 4:2:0 video, the cue the only isolated ball: no phantom ball at any angle', (pose) => {
+  it.each(['end', 'corner'] as Pose[])('%s view, 4:2:0 video (chroma replicated or upsampled bilinearly), the cue the only isolated ball: no phantom ball at any angle', (pose) => {
     // Chroma bleed dilates the pairs' masks by about a pixel and the white cue's not at all, so with no
     // coloured single ball in view the frame cannot tell the pairs' dilation; the ring must still not
     // be fitted as extra balls (0.3.0 detector: 6–8 balls for these 5 in the corner view).
-    // Under auto, exact and jittered (±0.3 / ±1 px) calibrations: the chroma ring must not become a ball
+    // Under auto, exact and jittered (±0.15–1 px) calibrations: the chroma ring must not become a ball
     // whichever side of a threshold the calibration's sub-pixel error puts it (the wave-1 detector put a
     // phantom on it at 30° with the automatic corners only: its refit trigger sat at a visible-cloth
     // share of 0.056 against a threshold of 0.08).
+    // Both ways a decoder shows 4:2:0 chroma: replicated per 2×2 block, and upsampled bilinearly (a GPU's
+    // YUV → RGB conversion, as when the camera's own stream is at the processing size). Bilinear chroma
+    // reads as full-resolution to a 2×2-block parity test (0.6–0.8 against 0.4–1 for RGB), but its
+    // transitions are about 4 px wide: the previous fix judged it by parity alone and put a phantom red
+    // next to the far pair at 75–90° in 84 of 291 calibrations (wave-1 3, the fix before it 0).
     const bad: string[] = [];
-    for (const deg of [0, 30, 45, 60, 75, 90]) {
-      const sc = pairs(pose, deg);
-      const frame = chroma420(render(sc));
-      for (const c of calibrationSet(sc)) {
-        const r = detect(sc, frame, { cal: c.cal, refs: c.refs });
-        const msg = `${deg}° ${c.name}: ${r.balls.length} balls, errors mm ${fmt(r.match.map((m) => m.err * 1000))}, labels ${r.balls.map((b) => b.label).join(',')}`;
+    for (const [enc, code] of [
+      ['replicated', chroma420],
+      ['bilinear', bilinear420],
+    ] as const)
+      for (const deg of [0, 30, 45, 60, 75, 80, 85, 90]) {
+        const sc = pairs(pose, deg);
+        const frame = code(render(sc));
+        for (const c of calibrationSet(sc)) {
+          const r = detect(sc, frame, { cal: c.cal, refs: c.refs });
+          const msg = `${enc} ${deg}° ${c.name}: ${r.balls.length} balls, errors mm ${fmt(r.match.map((m) => m.err * 1000))}, labels ${r.balls.map((b) => b.label).join(',')}`;
+          if (r.balls.length !== 5 || r.fp.length > 0 || r.match.some((m) => m.err > 0.015)) bad.push(msg);
+        }
+      }
+    expect(bad, bad.join('\n')).toEqual([]);
+  }, 240_000);
+
+  it('640×360 end view, 4:2:0 video upsampled bilinearly: no phantom next to the pairs (exact and 60 jittered calibrations)', () => {
+    // At 640×360 the near cushion is below the frame and the table detector declines the outline (see
+    // the next test): the camera's own calibration and its jittered copies. The previous fix: a phantom
+    // at 90° in 10 of 14 calibrations.
+    const bad: string[] = [];
+    for (const deg of [60, 75, 85, 90]) {
+      const sc = pairs('end', deg, 640, 360);
+      const frame = bilinear420(render(sc));
+      for (const c of calibrationSet(sc).filter((q) => q.name !== 'auto')) {
+        const r = detect(sc, frame, { cal: c.cal, refs: c.refs, exact: c.name === 'exact' });
+        const msg = `${deg}° ${c.name}: ${r.balls.length} balls, errors mm ${fmt(r.match.map((m) => m.err * 1000))}`;
         if (r.balls.length !== 5 || r.fp.length > 0 || r.match.some((m) => m.err > 0.015)) bad.push(msg);
       }
     }

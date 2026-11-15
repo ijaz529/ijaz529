@@ -95,6 +95,54 @@ export function yuv420(f: Frame): Frame {
   return { width: w, height: h, data: out };
 }
 
+/**
+ * YUV 4:2:0 as a GPU (or a JPEG decoder's fancy upsampling) shows it: full-res 8-bit luma, chroma
+ * averaged per 2×2 block to 8 bits and upsampled BILINEARLY from the block centres, (2i + ½, 2j + ½) in
+ * pixel units, instead of replicated. The chroma transitions are then smooth over about 4 px.
+ */
+export function bilinear420(f: Frame): Frame {
+  const { width: w, height: h, data } = f;
+  const cw = w >> 1;
+  const ch = h >> 1;
+  const U = new Float64Array(cw * ch);
+  const V = new Float64Array(cw * ch);
+  for (let j = 0; j < ch; j++)
+    for (let i = 0; i < cw; i++) {
+      let u = 0;
+      let v = 0;
+      for (let q = 0; q < 4; q++) {
+        const k = ((2 * j + (q >> 1)) * w + 2 * i + (q & 1)) * 4;
+        u += -0.168736 * data[k]! - 0.331264 * data[k + 1]! + 0.5 * data[k + 2]!;
+        v += 0.5 * data[k]! - 0.418688 * data[k + 1]! - 0.081312 * data[k + 2]!;
+      }
+      U[j * cw + i] = Math.round(u / 4);
+      V[j * cw + i] = Math.round(v / 4);
+    }
+  const out = new Uint8ClampedArray(data.length);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const k = (y * w + x) * 4;
+      const Y = Math.round(0.299 * data[k]! + 0.587 * data[k + 1]! + 0.114 * data[k + 2]!);
+      const fx = Math.max(0, Math.min(cw - 1, (x + 0.5) / 2 - 0.5));
+      const fy = Math.max(0, Math.min(ch - 1, (y + 0.5) / 2 - 0.5));
+      const x0 = Math.floor(fx);
+      const y0 = Math.floor(fy);
+      const x1 = Math.min(cw - 1, x0 + 1);
+      const y1 = Math.min(ch - 1, y0 + 1);
+      const ax = fx - x0;
+      const ay = fy - y0;
+      const a = y0 * cw;
+      const b = y1 * cw;
+      const u = (U[a + x0]! * (1 - ax) + U[a + x1]! * ax) * (1 - ay) + (U[b + x0]! * (1 - ax) + U[b + x1]! * ax) * ay;
+      const v = (V[a + x0]! * (1 - ax) + V[a + x1]! * ax) * (1 - ay) + (V[b + x0]! * (1 - ax) + V[b + x1]! * ax) * ay;
+      out[k] = Y + 1.402 * v;
+      out[k + 1] = Y - 0.344136 * u - 0.714136 * v;
+      out[k + 2] = Y + 1.772 * u;
+      out[k + 3] = 255;
+    }
+  return { width: w, height: h, data: out };
+}
+
 /** Exposure change: every channel scaled by `g`. */
 export function gain(f: Frame, g: number): Frame {
   const d = new Uint8ClampedArray(f.data.length);
