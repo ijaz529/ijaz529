@@ -10,8 +10,10 @@
 # wait for the web app, take screenshots, relaunch in Practice and Snap (debug launch argument
 # -CueSightStartQuery, see ios/App/App/CueSightViewController.swift), and check the app is still alive.
 #
-# Hard failures: build/install errors, the app dying, Capacitor failing to load the web bundle, or a
-# blank screen. Soft (warning): the web app's "[CueSight] ready" log marker not seen.
+# Hard failures: build/install errors, the app dying, Capacitor failing to load the web bundle, a blank
+# screen, or the web app not logging its "[CueSight] ready" marker within READY_TIMEOUT seconds of a launch
+# (default 90; US4-AS1). The first CI run (Xcode 26.3, iOS 26.2) logged it 22 s after a cold launch. The
+# screenshots are still taken when it is missing.
 # If the web build was made with VITE_CUESIGHT_TOUR=1 and logs "[CueSight] tour <step>" markers, one
 # screenshot is taken per step.
 #
@@ -21,11 +23,10 @@ cd "$(dirname "$0")/.."
 
 OUT="${SIM_OUT:-build/sim}"
 DERIVED="${DERIVED_DATA:-build/DerivedData}"
-READY_TIMEOUT="${READY_TIMEOUT:-60}"
+READY_TIMEOUT="${READY_TIMEOUT:-90}"
 mkdir -p "$OUT"
 : > "$OUT/summary.md"
 note() { echo "$*" | tee -a "$OUT/summary.md"; }
-warn() { echo "::warning::$*"; echo "- ⚠️ $*" >> "$OUT/summary.md"; }
 fail() { echo "::error::$*"; echo "- ❌ $*" >> "$OUT/summary.md"; FAILED=1; }
 FAILED=0
 touch "$OUT/.started"
@@ -82,7 +83,7 @@ fi
 echo "$(grep -cE 'warning:' "$OUT/xcodebuild.log" || true) compiler warning lines"
 echo "::endgroup::"
 APP="$DERIVED/Build/Products/Debug-iphonesimulator/App.app"
-BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+BUNDLE_ID=$("${PLISTBUDDY:-/usr/libexec/PlistBuddy}" -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
 note "- Built \`$BUNDLE_ID\` ($(du -sh "$APP" | cut -f1))"
 
 # --------------------------------------------------------------------------------------------- boot + install
@@ -119,6 +120,13 @@ wait_for() { # wait_for <fixed-string> <seconds>
   local i
   for ((i = 0; i < $2 * 2; i++)); do grep -qF -- "$1" "$CONSOLE" 2>/dev/null && return 0; sleep 0.5; done
   return 1
+}
+require_ready() { # require_ready <label>: the web app must log "[CueSight] ready" within READY_TIMEOUT s
+  if wait_for "[CueSight] ready" "$READY_TIMEOUT"; then
+    note "- Web app ready after $(( $(date +%s) - LAUNCHED_AT )) s: \`$(grep -m1 -o '\[CueSight\] ready.*' "$CONSOLE" | tr -d '\r')\`"
+  else
+    fail "$1: the web app did not log '[CueSight] ready' within ${READY_TIMEOUT} s (screenshots still taken; see $(basename "$CONSOLE"))"
+  fi
 }
 alive() { xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -F "UIKitApplication:$BUNDLE_ID" >/dev/null; }
 shot() { xcrun simctl io "$UDID" screenshot --type=png "$OUT/$1.png" >/dev/null 2>&1 && echo "$OUT/$1.png"; }
@@ -172,8 +180,7 @@ sleep 3
 shot 01-launch >/dev/null || true
 if wait_for "Loading app at" 30; then note "- Capacitor loaded the bundled web app: \`$(grep -m1 -o 'Loading app at [^ ]*' "$CONSOLE")\`"; else fail "Capacitor never logged 'Loading app at' (web bundle not loaded)"; fi
 if grep -qE "FATAL ERROR|Unable to load .*index.html" "$CONSOLE"; then fail "Capacitor reported a fatal load error (see console-default.log)"; fi
-READY=0
-if wait_for "[CueSight] ready" "$READY_TIMEOUT"; then READY=1; note "- Web app ready after $(( $(date +%s) - LAUNCHED_AT )) s: \`$(grep -m1 -o '\[CueSight\] ready.*' "$CONSOLE" | tr -d '\r')\`"; else warn "the web app's '[CueSight] ready' marker was not logged within ${READY_TIMEOUT}s (screenshots still taken)"; fi
+require_ready "default launch"
 settle_until 12
 sleep 1.5
 if shot 02-home >/dev/null; then check_screen "$OUT/02-home.png" "default launch"; else fail "simctl screenshot failed"; fi
@@ -207,7 +214,7 @@ for mode in practice snap; do
   note ""
   note "### Launch with ?mode=$mode"
   launch "$mode" -CueSightStartQuery "mode=$mode"
-  if wait_for "[CueSight] ready" 40; then note "- ready: \`$(grep -m1 -o '\[CueSight\] ready.*' "$CONSOLE" | tr -d '\r')\`"; fi
+  require_ready "$mode launch"
   settle_until 10
   sleep 1.5
   n=$([[ $mode == practice ]] && echo 03 || echo 04)
@@ -227,6 +234,6 @@ note "### Console"
 note "- JS console errors: $( [[ -z "$ERRS" ]] && echo none || echo "$(printf '%s\n' "$ERRS" | wc -l | tr -d ' ') distinct")"
 [[ -n "$ERRS" ]] && printf '%s\n' "$ERRS" | sed 's/^/    /' | tee -a "$OUT/summary.md" >/dev/null
 note "- Screenshots: $(cd "$OUT" && for f in ./*.png; do printf '%s ' "${f#./}"; done)"
-note "- Result: $( (( FAILED )) && echo '**FAILED**' || echo '**passed**')$( (( READY )) || echo ' (without the ready marker)')"
+note "- Result: $( (( FAILED )) && echo '**FAILED**' || echo '**passed**')"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
 exit "$FAILED"

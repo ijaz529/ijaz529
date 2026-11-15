@@ -250,9 +250,36 @@ function guideAvoid(g: PlayerGuide, m: FrameMapping): Pt[] {
   add(g.aim, 2);
   add(g.objectPath);
   add(g.cuePath);
+  add([...g.hidden.aim, ...g.hidden.objectPath, ...g.hidden.cuePath]);
   add(g.pocket, 6);
   for (const poly of [g.ghost, g.target]) for (let i = 0; i < poly.length; i += 4) out.push(m.toScreen(poly[i]!));
   return out;
+}
+
+/** Dash pattern of a stretch another ball hides from the camera: short dashes, wide gaps (with the "hidden" label). */
+export const HIDDEN_DASH = [4, 7];
+
+/** The longest run (screen px) and its middle point, for the "hidden" label. */
+function longestRunMiddle(runs: Vec2[][]): Vec2 | null {
+  let best: { len: number; mid: Vec2 } | null = null;
+  for (const r of runs) {
+    let len = 0;
+    for (let i = 1; i < r.length; i++) len += Math.hypot(r[i]!.x - r[i - 1]!.x, r[i]!.y - r[i - 1]!.y);
+    if (len < 6 || (best && best.len >= len)) continue;
+    let acc = 0;
+    let mid = r[0]!;
+    for (let i = 1; i < r.length; i++) {
+      const d = Math.hypot(r[i]!.x - r[i - 1]!.x, r[i]!.y - r[i - 1]!.y);
+      if (acc + d >= len / 2) {
+        const u = d > 0 ? (len / 2 - acc) / d : 0;
+        mid = { x: r[i - 1]!.x + (r[i]!.x - r[i - 1]!.x) * u, y: r[i - 1]!.y + (r[i]!.y - r[i - 1]!.y) * u };
+        break;
+      }
+      acc += d;
+    }
+    best = { len, mid };
+  }
+  return best?.mid ?? null;
 }
 
 /** Arrow head at the end of a polyline (screen px). */
@@ -329,6 +356,21 @@ export function drawGuide(c: CanvasRenderingContext2D, m: FrameMapping, g: Playe
   // Not makeable: vermillion and dashed (never colour alone).
   const aimColor = st.makeable === false ? PALETTE.warn : PALETTE.aim;
   for (const run of mapRuns(g.aim, m)) glowLine(c, run, aimColor, 5 * k, st.makeable === false ? [10, 7] : DASH.aim, 12);
+  // Stretches another ball hides from the camera: the same colour, thin short dashes, no glow, and a
+  // "hidden" label (below), so they never read as a line drawn over that ball.
+  const hiddenRuns: Vec2[][] = [];
+  const hid = (runs: Vec2[][], color: string, w: number) => {
+    for (const run of mapRuns(runs, m)) {
+      c.save();
+      c.globalAlpha = 0.85;
+      glowLine(c, run, color, w * k, HIDDEN_DASH, 0);
+      c.restore();
+      hiddenRuns.push(run);
+    }
+  };
+  hid(g.hidden.objectPath, PALETTE.object, 2.5);
+  if (st.showCuePath) hid(g.hidden.cuePath, PALETTE.cue, 2);
+  hid(g.hidden.aim, aimColor, 3);
   // Target ball ring.
   if (g.target.length) glowLine(c, mapPts(g.target, m), PALETTE.target, 2.5 * k, [], 10, true);
   // Ghost ball: a dotted white outline only, so the real object ball stays visible through it.
@@ -361,6 +403,8 @@ export function drawGuide(c: CanvasRenderingContext2D, m: FrameMapping, g: Playe
   // A shot that cannot be played as planned: no strike point and no power on the photo (Principle II).
   if (st.makeable !== false) drawStrike(c, m, g, k, labels, st.strikeNote, avoid, free);
   if (labels && ghostAnchor) placedLabel(c, st.makeable === false ? 'Not makeable' : 'Aim here', ghostAnchor, avoid, free, st.makeable === false ? '#FF9B66' : UI.text);
+  const hm = labels ? longestRunMiddle(hiddenRuns) : null;
+  if (hm && hm.x >= free.left && hm.x <= free.right && hm.y >= free.top && hm.y <= free.bottom) placedLabel(c, 'hidden', { x: hm.x, y: hm.y, r: 3 }, avoid, free, UI.text);
 }
 
 /**

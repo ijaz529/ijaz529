@@ -67,11 +67,14 @@ export const BESIDE_DEG: readonly [number, number] = [62, 110];
  * - Sides: "left side"/"right side" when the pocket is more to the side than ahead or behind, else
  *   "far side"/"near side".
  *
- * Names are adjusted only when two would collide, and the result is always unique.
+ * Names are adjusted only when two would collide, and the result is always unique. A name never
+ * puts a pocket on the wrong side ("left" is always on the player's left), and "far" is never used for
+ * a corner behind the player: each side of the player is a ladder (far → on your side → near), and the
+ * corners on that side take distinct rungs in the order they come round from ahead to behind.
  */
 export function shooterPocketNames(pockets: readonly (NamedPocket & { mouthCenter: Vec2 })[], from: Vec2, facing: Vec2): Partial<Record<PocketId, string>> {
   const L = Math.hypot(facing.x, facing.y);
-  const f = L > 1e-9 ? { x: facing.x / L, y: facing.y / L } : { x: 1, y: 0 };
+  const f = L > 1e-9 && Number.isFinite(L) ? { x: facing.x / L, y: facing.y / L } : { x: 1, y: 0 };
   // Player's right when facing f with z up: f × ẑ.
   const r = { x: f.y, y: -f.x };
   const rel = pockets.map((p) => {
@@ -79,51 +82,52 @@ export function shooterPocketNames(pockets: readonly (NamedPocket & { mouthCente
     const dy = p.mouthCenter.y - from.y;
     const ahead = dx * f.x + dy * f.y;
     const right = dx * r.x + dy * r.y;
-    return { p, ahead, right, bearing: (Math.atan2(right, ahead) * 180) / Math.PI };
+    return { p, ahead, right, bearing: Math.abs((Math.atan2(right, ahead) * 180) / Math.PI) };
   });
   type Rel = (typeof rel)[number];
   const out: Partial<Record<PocketId, string>> = {};
   const sideOf = (q: Rel) => (q.right >= 0 ? 'right' : 'left');
-  const quadrant = (q: Rel) => `${q.ahead >= 0 ? 'far' : 'near'} ${sideOf(q)} corner`;
   const corners = rel.filter((q) => q.p.kind === 'corner');
-  for (const q of corners) {
-    const b = Math.abs(q.bearing);
-    out[q.p.id] =
-      b <= AHEAD_DEG ? 'corner straight ahead' : b >= 180 - AHEAD_DEG ? 'corner behind you' : b >= BESIDE_DEG[0] && b <= BESIDE_DEG[1] ? `corner on your ${sideOf(q)}` : quadrant(q);
+  if (!corners.length || corners.some((q) => !Number.isFinite(q.bearing))) {
+    // Not a usable position (a degenerate pose): the rank rule, which is unique for any input.
+    const pts = new Map(rel.map((q) => [q.p.id, Number.isFinite(q.bearing) ? { x: q.right, y: -q.ahead } : { x: 0, y: 0 }]));
+    return perspectivePocketNames(pockets, (id) => pts.get(id)!);
   }
-  const groups = () => {
-    const by = new Map<string, Rel[]>();
-    for (const q of corners) by.set(out[q.p.id]!, [...(by.get(out[q.p.id]!) ?? []), q]);
-    return [...by.values()].filter((g) => g.length > 1);
-  };
-  for (const g of groups()) {
-    if (g.length === 2 && sideOf(g[0]!) === sideOf(g[1]!)) {
-      // Same side: tell them apart by how far ahead each one is.
-      const [a, b] = [...g].sort((x, y) => Math.abs(x.bearing) - Math.abs(y.bearing)) as [Rel, Rel];
-      const s = sideOf(a);
-      const [na, nb] =
-        Math.abs(b.bearing) < 90 ? [`far ${s} corner`, `corner on your ${s}`] : Math.abs(a.bearing) >= 90 ? [`corner on your ${s}`, `near ${s} corner`] : [`far ${s} corner`, `near ${s} corner`];
-      out[a.p.id] = na;
-      out[b.p.id] = nb;
-    } else for (const q of g) out[q.p.id] = quadrant(q);
-  }
-  // Still a clash (rare): the rank rule, which is always unique.
-  if (groups().length && corners.length === 4) {
-    const byRank = perspectivePocketNames(
-      corners.map((q) => q.p),
-      (id) => {
-        const q = corners.find((c) => c.p.id === id)!;
-        return { x: q.right, y: -q.ahead };
-      },
-    );
-    for (const q of corners) out[q.p.id] = byRank[q.p.id]!;
+  // Straight ahead and behind you: one corner each at most (the one closest to that bearing).
+  const byBearing = [...corners].sort((a, b) => a.bearing - b.bearing);
+  const ahead = byBearing[0]!.bearing <= AHEAD_DEG ? byBearing[0]! : null;
+  const last = byBearing[byBearing.length - 1]!;
+  const behind = last !== ahead && last.bearing >= 180 - AHEAD_DEG ? last : null;
+  if (ahead) out[ahead.p.id] = 'corner straight ahead';
+  if (behind) out[behind.p.id] = 'corner behind you';
+  // Each side: rungs far (0), beside (1), near (2). A corner's own rung comes from its bearing; corners
+  // sharing a rung move to the nearest free ones, keeping their order from ahead to behind, and "far"
+  // is never given to a corner behind the player nor "near" to one ahead of them unless nothing else is left.
+  const rung = (b: number) => (b < BESIDE_DEG[0] ? 0 : b <= BESIDE_DEG[1] ? 1 : 2);
+  const cost = (slot: number, b: number) => Math.abs(slot - rung(b)) + (slot === 0 && b >= 90 ? 3 : 0) + (slot === 2 && b < 90 ? 3 : 0);
+  for (const side of ['left', 'right'] as const) {
+    const list = byBearing.filter((q) => q !== ahead && q !== behind && sideOf(q) === side);
+    if (list.length > 3) return shooterRankFallback(pockets, rel, out);
+    let best: number[] = [];
+    let bestCost = Infinity;
+    const choose = (k: number, from0: number, acc: number[], c: number) => {
+      if (c >= bestCost) return;
+      if (k === list.length) {
+        best = acc.slice();
+        bestCost = c;
+        return;
+      }
+      for (let s = from0; s <= 3 - (list.length - k); s++) choose(k + 1, s + 1, [...acc, s], c + cost(s, list[k]!.bearing));
+    };
+    choose(0, 0, [], 0);
+    list.forEach((q, i) => (out[q.p.id] = best[i] === 0 ? `far ${side} corner` : best[i] === 1 ? `corner on your ${side}` : `near ${side} corner`));
   }
   const sides = rel.filter((q) => q.p.kind === 'side');
   const sideName = (q: Rel) => (Math.abs(q.right) > Math.abs(q.ahead) ? `${sideOf(q)} side` : `${q.ahead >= 0 ? 'far' : 'near'} side`);
   for (const q of sides) out[q.p.id] = sideName(q);
   if (sides.length === 2 && out[sides[0]!.p.id] === out[sides[1]!.p.id]) {
     const [a, b] = sides as [Rel, Rel];
-    if (Math.sign(a.right) !== Math.sign(b.right)) for (const q of [a, b]) out[q.p.id] = `${sideOf(q)} side`;
+    if (sideOf(a) !== sideOf(b)) for (const q of [a, b]) out[q.p.id] = `${sideOf(q)} side`;
     else {
       const [far, near] = a.ahead >= b.ahead ? [a, b] : [b, a];
       out[far.p.id] = 'far side';
@@ -131,4 +135,18 @@ export function shooterPocketNames(pockets: readonly (NamedPocket & { mouthCente
     }
   }
   return out;
+}
+
+/**
+ * More than three corners on one side of the player (only possible from outside the table, e.g. a
+ * camera well off to one side): there is no truthful left/right split, so the corners are ranked as
+ * a picture would be (depth, then left to right), which is unique.
+ */
+function shooterRankFallback(
+  pockets: readonly NamedPocket[],
+  rel: { p: NamedPocket; ahead: number; right: number }[],
+  out: Partial<Record<PocketId, string>>,
+): Partial<Record<PocketId, string>> {
+  const pts = new Map(rel.map((q) => [q.p.id, { x: q.right, y: -q.ahead }]));
+  return { ...out, ...perspectivePocketNames(pockets, (id) => pts.get(id)!) };
 }

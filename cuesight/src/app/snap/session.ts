@@ -41,7 +41,11 @@ export interface SnapSession {
   /** Manual cloth corners in table-photo px (for a re-run), and taps in progress. */
   corners: Vec2[] | null;
   cornerTaps: Vec2[];
-  player: (PhotoInfo & { result: PlayerViewResult | null }) | null;
+  /**
+   * The player photo and its fit. `fitTargetId` is the target ball the fit (and so its confidence) was
+   * computed for; `manual` marks a fit from the two taps; `refitting` a quiet re-fit for a new target.
+   */
+  player: (PhotoInfo & { result: PlayerViewResult | null; fitTargetId?: string | null; manual?: boolean; refitting?: boolean }) | null;
   /** Manual-fallback taps on the player photo (image px). */
   taps: { cue?: Vec2; target?: Vec2 };
   error: string | null;
@@ -57,7 +61,9 @@ export type SnapEvent =
   | { type: 'cancel-corners' }
   | { type: 'layout'; balls: Ball[] }
   | { type: 'player-photo'; photo: PhotoInfo }
-  | { type: 'player-result'; result: PlayerViewResult }
+  | { type: 'player-result'; result: PlayerViewResult; targetId?: string | null; manual?: boolean }
+  /** The target changed after an automatic fit: the same photo is fitted again, the guide stays up. */
+  | { type: 'refit' }
   | { type: 'player-failed'; message: string }
   | { type: 'manual-tap'; p: Vec2 }
   | { type: 'start-manual' }
@@ -69,7 +75,22 @@ export const SNAP_MESSAGES = {
   noBalls: "I found the table but no balls. Retake the photo a little closer, or add the balls by hand.",
   noCue: "I couldn't tell which ball is the cue ball. Tap “Cue ball”, then tap it on the table.",
   decode: "That photo couldn't be opened. Try another one.",
+  /** The vision worker never answered before it failed (its script may not be cached for offline use yet). */
+  detectionLoad: 'Table detection couldn’t start — it may not be available offline yet. Reconnect, then retake the photo or choose it again.',
+  /** The vision worker had been answering, then failed on this table photo. */
+  detectionStopped: 'Table detection stopped working on this photo. Retake it or choose it again to try once more.',
+  /** The vision worker failed while lining up the player photo; the two taps run it again. */
+  detectionStoppedPlayer: 'Table detection stopped working on this photo. Tap the cue ball, then your target, to try again.',
 } as const;
+
+/**
+ * The event that ends a Snap request when the vision worker itself failed (it will never reply):
+ * `loaded` = the worker had answered at least once, so this is not a script that failed to load.
+ */
+export function visionFailedEvent(kind: 'still' | 'player-view', loaded: boolean): SnapEvent {
+  if (kind === 'player-view') return { type: 'player-failed', message: loaded ? SNAP_MESSAGES.detectionStoppedPlayer : SNAP_MESSAGES.detectionLoad };
+  return { type: 'overview-failed', message: loaded ? SNAP_MESSAGES.detectionStopped : SNAP_MESSAGES.detectionLoad };
+}
 
 export function initialSnap(): SnapSession {
   return { step: 'intro', overview: null, layout: null, corners: null, cornerTaps: [], player: null, taps: {}, error: null };
@@ -111,9 +132,11 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
       return s.layout ? { ...s, step: 'player-processing', player: { ...e.photo, result: null }, taps: {}, error: null } : s;
     case 'player-result': {
       if (!s.player) return s;
-      const player = { ...s.player, result: e.result };
+      const player = { ...s.player, result: e.result, fitTargetId: e.targetId ?? null, manual: !!e.manual, refitting: false };
       return { ...s, player, step: e.result.ok ? 'guide' : 'manual-taps', taps: {}, error: e.result.ok ? null : (e.result.reason ?? null) };
     }
+    case 'refit':
+      return s.player?.result ? { ...s, player: { ...s.player, refitting: true } } : s;
     case 'player-failed':
       return s.player ? { ...s, step: 'manual-taps', taps: {}, error: e.message } : s;
     case 'start-manual':
@@ -128,6 +151,22 @@ export function snapReducer(s: SnapSession, e: SnapEvent): SnapSession {
     case 'back-to-guide':
       return s.player?.result?.ok ? { ...s, step: 'guide' } : s.player ? { ...s, step: 'manual-taps', taps: {} } : s;
   }
+}
+
+/**
+ * Whether the guide's fit (and its confidence chip) is about the target being shown:
+ * - `current`: yes; `checking`: a re-fit for it is running; `none`: no fit to show (not in the guide,
+ *   or no target picked);
+ * - `refit`: an automatic fit made for another target, so fit the same photo again;
+ * - `taps`: a fit from two taps that named another target ball, so the player taps again.
+ * The pocket and the stroke never matter: the confidence is about the target ball's position.
+ */
+export function fitCheck(s: SnapSession, targetId: string | null): 'current' | 'checking' | 'refit' | 'taps' | 'none' {
+  const p = s.player;
+  if (s.step !== 'guide' || !p?.result?.ok || !targetId) return 'none';
+  if (p.refitting) return 'checking';
+  if (p.fitTargetId === targetId) return 'current';
+  return p.manual ? 'taps' : 'refit';
 }
 
 /** The step the progress indicator highlights: 1 (table) or 2 (your view). */

@@ -4,10 +4,11 @@
  */
 import type { PocketId, ShotSuggestion, Stroke, TablePresetId } from '../../core/types';
 import { TABLE_PRESETS } from '../../core/table';
-import type { Settings } from '../settings';
+import { parseSettingsForm, SETTING_LIMITS, type Settings } from '../settings';
 import type { AppState } from '../store';
 import { DRILLS } from '../drills';
 import { iconMarkup, type IconName } from './icons';
+import { writeHtml } from './patch';
 import { ballChip, marginText } from './shot-card';
 import { createSpinPad } from './spin-pad';
 
@@ -176,22 +177,39 @@ function ballLook(s: AppState, id: string): { color?: string; stripe?: boolean }
   return b ? { ...(b.color ? { color: b.color } : {}), ...(b.stripe ? { stripe: true } : {}) } : {};
 }
 
+/** The suggestions each list element shows, read by its one delegated click listener. */
+const shownSuggestions = new WeakMap<HTMLElement, { items: ShotSuggestion[]; pick: (x: ShotSuggestion) => void }>();
+
+/**
+ * The "Best shots" list. Runs on every store flush, so it only rewrites the list when what it shows
+ * changed (focus on a suggestion survives a vision frame or a resize), and clicks go through one
+ * delegated listener that reads the latest list.
+ */
 export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: string) => string, pocketName: (id: PocketId, targetId?: string) => string, pick: (x: ShotSuggestion) => void): void {
+  if (!shownSuggestions.has(el)) {
+    el.addEventListener('click', (e) => {
+      const b = (e.target as Element | null)?.closest?.('button[data-i]') as HTMLButtonElement | null;
+      const shown = shownSuggestions.get(el);
+      const x = b && shown ? shown.items[Number(b.dataset.i)] : undefined;
+      if (x) shown!.pick(x);
+    });
+  }
+  shownSuggestions.set(el, { items: s.suggestions && !s.suggestions.pending ? s.suggestions.items : [], pick });
   if (!s.suggestions) {
-    el.innerHTML = '';
+    writeHtml(el, '');
     delete el.dataset.revealed;
     return;
   }
   if (s.suggestions.pending) {
-    el.innerHTML = `<section class="suggest loading" aria-busy="true"><h2>${iconMarkup('sparkles', 16)}Best shots</h2><p class="loading-row"><span class="spinner" aria-hidden="true"></span> Finding the best shots…</p></section>`;
+    writeHtml(el, `<section class="suggest loading" aria-busy="true"><h2>${iconMarkup('sparkles', 16)}Best shots</h2><p class="loading-row"><span class="spinner" aria-hidden="true"></span> Finding the best shots…</p></section>`);
     revealOnce(el, 'pending');
     return;
   }
   if (!s.suggestions.items.length) {
-    el.innerHTML = `<section class="suggest"><h2>${iconMarkup('sparkles', 16)}Best shots</h2><p class="none">${iconMarkup('info', 16)}No clean pot on this layout. Consider a safety or a bank.</p></section>`;
+    writeHtml(el, `<section class="suggest"><h2>${iconMarkup('sparkles', 16)}Best shots</h2><p class="none">${iconMarkup('info', 16)}No clean pot on this layout. Consider a safety or a bank.</p></section>`);
     return;
   }
-  el.innerHTML = `<section class="suggest" aria-labelledby="sugg-title"><h2 id="sugg-title">${iconMarkup('sparkles', 16)}Best shots</h2><ol>${s.suggestions.items
+  const html = `<section class="suggest" aria-labelledby="sugg-title"><h2 id="sugg-title">${iconMarkup('sparkles', 16)}Best shots</h2><ol>${s.suggestions.items
     .map((x, i) => {
       const look = ballLook(s, x.targetId);
       const label = labelOf(x.targetId);
@@ -201,7 +219,7 @@ export function renderSuggestions(el: HTMLElement, s: AppState, labelOf: (id: st
       return `<li><button type="button" class="sugg" data-i="${i}"><span class="rank" aria-hidden="true">${i + 1}</span>${ballChip(label, look.color, look.stripe)}<span class="sugg-main">${numbered ? `<span class="sr-only">Ball ${esc(label)} </span>` : `<b>${esc(label)}</b> `}→ ${esc(pocketName(x.pocketId, x.targetId))}</span><span class="chip diff diff-${x.difficulty.replace(' ', '-')}">${x.difficulty} · ${esc(marginText(x))}</span>${iconMarkup('chevron-right', 18, 'go')}</button></li>`;
     })
     .join('')}</ol></section>`;
-  el.querySelectorAll<HTMLButtonElement>('button[data-i]').forEach((b) => b.addEventListener('click', () => pick(s.suggestions!.items[Number(b.dataset.i)]!)));
+  writeHtml(el, html, (b) => (b as HTMLElement).dataset?.i ?? null);
   revealOnce(el, s.suggestions.items.map((x) => `${x.targetId}>${x.pocketId}`).join(','));
 }
 
@@ -220,12 +238,19 @@ export function buildSettings(dialog: HTMLDialogElement, get: () => Settings, ap
   const row = (label: string, control: string, icon?: IconName) =>
     `<label class="set-row">${icon ? `<span class="set-ic">${iconMarkup(icon, 18)}</span>` : ''}<span class="set-label">${label}</span>${control}</label>`;
   const sel = (name: string, opts: string) => `<span class="select-wrap"><select name="${name}">${opts}</select>${iconMarkup('chevron-down', 16)}</span>`;
+  // Number fields are required and bounded like parseSettingsForm: an emptied field blocks Save.
+  const num = (name: keyof typeof SETTING_LIMITS, mode: 'decimal' | 'numeric') => {
+    const l = SETTING_LIMITS[name];
+    return `<input name="${name}" type="number" min="${l.min}" max="${l.max}" step="${l.step}" inputmode="${mode}" required/>`;
+  };
   dialog.setAttribute('aria-labelledby', 'settings-title');
+  // Save is the form's only submit button, so Enter / Go in a field saves (implicit submission uses
+  // the first submit button). The × and Cancel close the dialog without submitting or validating.
   dialog.innerHTML = `
     <form method="dialog" class="settings">
       <header class="dlg-head">
         <h2 id="settings-title">Settings</h2>
-        <button value="cancel" type="submit" class="icon-btn dlg-close" aria-label="Close settings">${iconMarkup('close', 20)}</button>
+        <button type="button" data-dlg="cancel" class="icon-btn dlg-close" aria-label="Close settings">${iconMarkup('close', 20)}</button>
       </header>
       <div class="dlg-scroll">
         <p class="group-label">Table</p>
@@ -233,12 +258,12 @@ export function buildSettings(dialog: HTMLDialogElement, get: () => Settings, ap
           ${row('Table', sel('table', presetOpts), 'ruler')}
           ${row('Cloth speed', sel('cloth', '<option value="fast">Fast (new cloth)</option><option value="normal">Normal</option><option value="slow">Slow (worn / humid)</option>'), 'layers')}
           ${row('Cushions', sel('cushions', '<option value="dead">Dead</option><option value="normal">Normal</option><option value="lively">Lively</option>'), 'swap')}
-          ${row('Cushion width (cm)', '<input name="cushionWidthCm" type="number" min="2" max="10" step="0.5" inputmode="decimal"/>', 'width')}
+          ${row('Cushion width (cm)', num('cushionWidthCm', 'decimal'), 'width')}
         </div>
         <p class="group-label">Cue &amp; camera</p>
         <div class="group">
           ${row('Shaft', sel('shaft', '<option value="standard">Standard</option><option value="low-deflection">Low-deflection</option>'), 'cue')}
-          ${row('Camera field of view (°)', '<input name="fovDeg" type="number" min="40" max="110" step="1" inputmode="numeric"/>', 'camera')}
+          ${row('Camera field of view (°)', num('fovDeg', 'numeric'), 'camera')}
         </div>
         <p class="group-label">Display</p>
         <div class="group">
@@ -247,26 +272,21 @@ export function buildSettings(dialog: HTMLDialogElement, get: () => Settings, ap
         </div>
         <p class="privacy">${iconMarkup('lock', 16)}<span>Everything runs on this device. No video, image or data is uploaded.</span></p>
       </div>
-      <footer class="dlg-actions"><button value="cancel" type="submit" class="btn secondary">Cancel</button><button value="ok" type="submit" class="btn primary">Save</button></footer>
+      <footer class="dlg-actions"><button type="button" data-dlg="cancel" class="btn secondary">Cancel</button><button value="ok" type="submit" class="btn primary">Save</button></footer>
     </form>`;
   const form = dialog.querySelector('form')!;
+  form.querySelectorAll<HTMLButtonElement>('[data-dlg="cancel"]').forEach((b) => b.addEventListener('click', () => dialog.close('cancel')));
   dialog.addEventListener('close', () => {
     if (dialog.returnValue !== 'ok') return;
-    const fd = new FormData(form);
-    apply({
-      table: fd.get('table') as TablePresetId,
-      cloth: fd.get('cloth') as Settings['cloth'],
-      cushions: fd.get('cushions') as Settings['cushions'],
-      shaft: fd.get('shaft') as Settings['shaft'],
-      cushionWidthCm: Number(fd.get('cushionWidthCm')),
-      fovDeg: Number(fd.get('fovDeg')),
-      showDetails: fd.get('showDetails') === 'on',
-      table3d: fd.get('table3d') === 'on',
-    });
+    // Validated field by field: anything empty or out of range keeps the current setting.
+    apply(parseSettingsForm(new FormData(form), get()));
   });
   const open = dialog.showModal.bind(dialog);
   dialog.showModal = () => {
     const s = get();
+    // A close request (Esc, Android Back) keeps the previous returnValue in some engines: start clean
+    // so dismissing never re-applies the last Save.
+    dialog.returnValue = '';
     (form.elements.namedItem('table') as HTMLSelectElement).value = s.table;
     (form.elements.namedItem('cloth') as HTMLSelectElement).value = s.cloth;
     (form.elements.namedItem('cushions') as HTMLSelectElement).value = s.cushions;
