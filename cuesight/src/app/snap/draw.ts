@@ -8,7 +8,7 @@ import type { Vec2 } from '../../core/types';
 import { DASH, PALETTE, UI } from '../render/palette';
 import { containMapping, type FrameMapping } from '../render/overlay';
 import { placeLabel, type Box, type Pt } from '../ui/label-place';
-import type { PlayerGuide, StrikeFace } from './guide';
+import { aimLabelAnchor, type PlayerGuide, type StrikeFace } from './guide';
 import type { Photo } from './photo';
 
 /**
@@ -401,8 +401,11 @@ export function drawGuide(c: CanvasRenderingContext2D, m: FrameMapping, g: Playe
   const avoid = labels ? guideAvoid(g, m) : [];
   for (const r of st.avoidRects ?? []) for (let x = r.left; x <= r.right; x += 10) for (let y = r.top; y <= r.bottom; y += 10) avoid.push({ x, y });
   // A shot that cannot be played as planned: no strike point and no power on the photo (Principle II).
-  if (st.makeable !== false) drawStrike(c, m, g, k, labels, st.strikeNote, avoid, free);
+  const strikeBox = st.makeable !== false ? drawStrike(c, m, g, k, labels, st.strikeNote, avoid, free) : null;
+  // The aim label of a frozen shot sits near the cue ball: keep it off the strike label.
+  if (strikeBox) for (let x = strikeBox.left; x <= strikeBox.right; x += 6) for (let y = strikeBox.top; y <= strikeBox.bottom; y += 6) avoid.push({ x, y });
   if (labels && ghostAnchor) placedLabel(c, st.makeable === false ? 'Not makeable' : 'Aim here', ghostAnchor, avoid, free, st.makeable === false ? '#FF9B66' : UI.text);
+  else if (labels && g.aimLabel) placedLabel(c, g.aimLabel.text, aimLabelAnchor(g.aimLabel, m), avoid, free, g.aimLabel.warn ? '#FF9B66' : UI.text);
   const hm = labels ? longestRunMiddle(hiddenRuns) : null;
   if (hm && hm.x >= free.left && hm.x <= free.right && hm.y >= free.top && hm.y <= free.bottom) placedLabel(c, 'hidden', { x: hm.x, y: hm.y, r: 3 }, avoid, free, UI.text);
 }
@@ -467,15 +470,16 @@ export function drawFace(c: CanvasRenderingContext2D, f: StrikeFace, toScreen: (
 }
 
 /** Strike mark on the photo's cue ball (face-on), with a label carrying the power too. */
-export function drawStrike(c: CanvasRenderingContext2D, m: FrameMapping, g: PlayerGuide, k = 1, labels = true, note?: string, avoid: Pt[] = [], free?: Box): void {
-  if (!g.face) return;
+export function drawStrike(c: CanvasRenderingContext2D, m: FrameMapping, g: PlayerGuide, k = 1, labels = true, note?: string, avoid: Pt[] = [], free?: Box): Box | null {
+  if (!g.face) return null;
   const scale = Math.abs(m.toScreen({ x: 1, y: 0 }).x - m.toScreen({ x: 0, y: 0 }).x);
   const a = drawFace(c, g.face, (p) => m.toScreen(p), scale, k);
   if (labels) {
     const W = c.canvas.width / (c.getTransform().a || 1);
     const Hh = c.canvas.height / (c.getTransform().d || 1);
-    placedLabel(c, note ? `Strike here · ${note}` : 'Strike here', a, avoid, free ?? { left: 4, top: 4, right: W - 4, bottom: Hh - 4 });
+    return placedLabel(c, note ? `Strike here · ${note}` : 'Strike here', a, avoid, free ?? { left: 4, top: 4, right: W - 4, bottom: Hh - 4 });
   }
+  return null;
 }
 
 /**

@@ -816,18 +816,15 @@ describe('r2 Snap photo: the label without a ghost ball sits at its anchor on th
       expectLabelAt(drawOn(g, W, H, m, true), 'Aim here', { ...c, r }, name);
     }
   });
-  // snap/draw.ts (not this package's file) still anchors its only plan label to the ghost outline,
-  // so the three `it.fails` below are EXPECTED to fail today. vitest reports them the day draw.ts
-  // places PlayerGuide.aimLabel at aimLabelAnchor(g.aimLabel, m) and keeps it off the strike label
-  // (the appChanges recipe): then turn each into a plain `it`. A recipe that passes the photo-px
-  // `at`/`r` straight to placedLabel keeps all three failing; one that maps them but lets the label
-  // sit on the strike label keeps the third failing.
-  it.fails('drawGuide writes "Not makeable" at the cue ball on the canvas for the snooker touching-ball plan (needs snap/draw.ts)', () => {
+  // snap/draw.ts places PlayerGuide.aimLabel at aimLabelAnchor(g.aimLabel, m) and keeps it off the
+  // strike label. A draw.ts that passes the photo-px `at`/`r` straight to placedLabel fails all three;
+  // one that maps them but lets the label sit on the strike label fails the third.
+  it('drawGuide writes "Not makeable" at the cue ball on the canvas for the snooker touching-ball plan', () => {
     const { p, g } = touching();
     expect(g.aimLabel!.text).toBe('Not makeable');
     for (const { name, W, H, m } of mappingsFor(g)) expectLabelAt(drawOn(g, W, H, m, playable(p)), 'Not makeable', wantAnchor(g, m), name);
   });
-  it.fails("drawGuide writes the frozen stroke's words at the stroke line's end on the canvas (needs snap/draw.ts)", () => {
+  it("drawGuide writes the frozen stroke's words at the stroke line's end on the canvas", () => {
     const { p, g } = frozen8();
     expect(g.aimLabel!.text).toMatch(/^Frozen · stroke \d+° (left|right)$/);
     for (const { name, W, H, m } of mappingsFor(g)) {
@@ -849,7 +846,7 @@ describe('r2 Snap photo: the label without a ghost ball sits at its anchor on th
   // ball 1), with the cue ball frozen straight behind ball 1 toward the top-right corner, drawn as the
   // app draws it on a 412 × 523 phone canvas zoomed onto the shot: the stroke's end is right next to
   // the cue ball, so its label and the strike label compete for the same space.
-  it.fails("from the player's own viewpoint the frozen stroke's label stays clear of the strike label (needs snap/draw.ts)", () => {
+  it("from the player's own viewpoint the frozen stroke's label stays clear of the strike label", () => {
     const fx = JSON.parse(readFileSync('tests/fixtures/snap-layout.json', 'utf8')) as { photos: { player: { pose: CameraPose } }; balls: { id: string; pos: Vec2 }[] };
     const pose = fx.photos.player.pose;
     const { lay, cue, ob } = frozenLayout('TR', fx.balls.find((b) => b.id === '1')!.pos);

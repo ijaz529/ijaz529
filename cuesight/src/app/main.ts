@@ -63,8 +63,8 @@ import { hydrateIcons } from './ui/icons';
 import { mountOnboarding } from './ui/onboarding';
 import { createSheet } from './ui/sheet';
 import { createBallTags } from './ui/ball-tags';
-import { createShotLabel, type LabelContent } from './ui/scene-labels';
-import { renderShotCard } from './ui/shot-card';
+import { createShotLabel, planLabelContent, type LabelContent } from './ui/scene-labels';
+import { recommendationContext, renderShotCard } from './ui/shot-card';
 import { hideSplash } from './ui/splash';
 import { buildViewControls } from './ui/view-controls';
 
@@ -143,20 +143,7 @@ function labelShown(s: AppState): boolean {
 /** What the in-scene label says (refreshed on every render; the label itself follows every 3D frame). */
 let labelContent: LabelContent | null = null;
 function labelContentOf(s: AppState, names: Record<PocketId, string>): LabelContent | null {
-  const p = s.plan;
-  if (!p) return null;
-  // A provisional stroke about to be replaced by the recommended one is not shown (it would flip from
-  // "4.5/10 centre ball" to "3/10 1 tip above centre" a moment later); the card says "optimising…".
-  if (s.strokeMode === 'recommended' && s.recommended?.pending && p.strokeSource !== 'player' && p.makeable) return null;
-  // A shot that cannot happen as planned gets no stroke: why, and what to try instead.
-  if (!p.makeable) {
-    const alt = p.alternatives[0];
-    const blocked = p.warnings.some((w) => w.code === 'blocked-cue' || w.code === 'blocked-object');
-    return { kind: 'warn', text: blocked ? 'Not makeable · a ball is in the way' : 'Not makeable', sub: alt ? `Try the ${names[alt.pocketId]}` : 'Try another ball, or play safe' };
-  }
-  if (p.warnings.some((w) => w.code === 'cb-short'))
-    return { kind: 'warn', text: 'Too soft: the cue ball stops short', sub: p.minPower <= 10 ? `Use power ${Math.ceil(p.minPower * 2) / 2}+` : 'Too far even at full power' };
-  return { kind: 'stroke', stroke: p.stroke, name: p.strokeName };
+  return planLabelContent(s.plan, names, { pending: s.strokeMode === 'recommended' && !!s.recommended?.pending, snooker: s.table.id === 'snooker12' });
 }
 function updateLabel(): void {
   shotLabel.update(lastFrame, labelContent, labelShown(S));
@@ -1592,6 +1579,8 @@ function render(s: AppState): void {
     pockets: s.targetId ? s.table.pockets.map((p) => ({ id: p.id, name: names[p.id], selected: (s.plan?.pocketId ?? s.pocketId) === p.id })) : [],
     ...(cueB && s.plan ? { cbDistance: dist(cueB.pos, s.plan.ghost), ballRadius: s.table.ballRadius } : {}),
     risks: planRisks(s).map((r) => ({ scratchIf: r.scratchIf, pocketName: names[r.pocketId] })),
+    snooker: s.table.id === 'snooker12',
+    ...recommendationContext(s.recommended, s.plan),
   });
   // A plan whose power advice is still coming is not spoken yet (its too-soft warning has no figure):
   // the announcer starts again with the full plan, a moment later.

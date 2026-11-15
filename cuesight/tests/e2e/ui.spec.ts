@@ -668,6 +668,7 @@ for (const viewport of [
     });
 
     test('frozen cue ball: the tile says "Frozen", the long power advice fits two lines at the peek and shows in full above it', async ({ page }) => {
+      test.setTimeout(120_000);
       await noOnboarding(page);
       await page.goto('/?mode=practice');
       await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
@@ -686,6 +687,19 @@ for (const viewport of [
         r.dispatchEvent(new Event('change', { bubbles: true }));
       });
       await page.evaluate(() => document.querySelector<HTMLButtonElement>('[data-p="follow"]')!.click());
+      // The main-thread plan skips the frozen power advice; the planner worker's full plan replaces it
+      // (main.ts replan / planner-client 'plan'). Under SwiftShader load that takes seconds, not 120 ms
+      // plus a few: measured, the request left 0.1–2.3 s after the input and the worker answered in
+      // 0.1–3.0 s (4.3–7.4 s from the tap to the advice at load 4–10; over 10 s in a full run at load 13).
+      // So wait for the full plan of this very stroke first, then read its words.
+      await page.waitForFunction(
+        () => {
+          const p = (window as unknown as { __cuesight: { state: { plan: { adviceSkipped?: boolean; stroke: { power: number; vert: number } } | null } } }).__cuesight.state.plan;
+          return !!p && !p.adviceSkipped && p.stroke.power === 1 && p.stroke.vert > 0;
+        },
+        undefined,
+        { timeout: 45_000 },
+      );
       const head = page.locator('#shot-card .head-warn span');
       await expect(head).toContainText('no power with this follow gets it in with pace', { timeout: 10_000 });
       await expect(page.locator('#shot-card .power-meter')).toHaveAttribute('aria-label', /No power gets it in with pace/);

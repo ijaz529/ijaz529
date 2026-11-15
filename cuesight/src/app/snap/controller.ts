@@ -24,7 +24,7 @@ import { Overlay, type OverlayData } from '../render/overlay';
 import { rgbCss } from '../render/palette';
 import type { AppState } from '../store';
 import { iconMarkup, type IconName } from '../ui/icons';
-import { powerMeterSvg, powerText } from '../ui/power-meter';
+import { meterMinPower, meterOptions, powerMeterSvg, powerText } from '../ui/power-meter';
 import { spinBallSvg, spinText } from '../ui/spin-ball';
 import { PhotoCanvas, drawGuide, drawTaps } from './draw';
 import { buildPlayerGuide, confidenceLabel, guideFocus, playable, scaleFocal, strikeHeadline, strikeWords, unplayableHeadline, type PlayerGuide } from './guide';
@@ -890,9 +890,10 @@ export function createSnapController(root: HTMLElement, host: SnapHost) {
     setText(hudStrike, strikeHeadline(st, strikeWords));
     // No minimum on the meter when none is known yet (the worker's power advice is on its way) or when
     // no power works with this tip (minPower 10.5 is then not "more than full power": the warning says why).
-    const minPower = Number.isFinite(plan.minPower) && !plan.noWorkingPower && !plan.adviceSkipped ? plan.minPower : null;
-    setAttr(hudMeter, 'aria-label', powerText(st.power, minPower));
-    setHtml(hudMeter, powerMeterSvg(st.power, minPower));
+    const minPower = meterMinPower(plan);
+    const mo = meterOptions(plan);
+    setAttr(hudMeter, 'aria-label', powerText(st.power, minPower, mo));
+    setHtml(hudMeter, powerMeterSvg(st.power, minPower, mo));
     setHtml(hudPower, `${esc(st.power.toFixed(st.power % 1 ? 1 : 0))}<small>/10</small>`);
     const ref = speedReference(plan.obPocketSpeed, s.table.length, s.params);
     setText(hudSpeed, ref ? `${speedWord(st.power)} · ${ref}` : `${speedWord(st.power)} · ${powerToSpeed(st.power).toFixed(1)} m/s`);
