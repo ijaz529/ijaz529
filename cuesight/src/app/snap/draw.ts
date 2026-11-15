@@ -169,9 +169,6 @@ export function glowLine(c: CanvasRenderingContext2D, pts: Vec2[], color: string
  * A glass pill label (Midnight Felt surface, 12 px radius, 13 px semibold) at `q` (its anchor
  * point per `align`), kept inside the canvas. Returns the pill's box (CSS px).
  */
-/** Weight of each point of the strike label's pill when other labels are placed (a line point weighs 1). */
-const STRIKE_LABEL_WEIGHT = 10;
-
 export function label(c: CanvasRenderingContext2D, text: string, q: Vec2, color: string = UI.text, size = 13, align: CanvasTextAlign = 'left'): Box {
   c.save();
   c.font = `650 ${size}px ${FONT}`;
@@ -405,18 +402,8 @@ export function drawGuide(c: CanvasRenderingContext2D, m: FrameMapping, g: Playe
   for (const r of st.avoidRects ?? []) for (let x = r.left; x <= r.right; x += 10) for (let y = r.top; y <= r.bottom; y += 10) avoid.push({ x, y });
   // A shot that cannot be played as planned: no strike point and no power on the photo (Principle II).
   const strikeBox = st.makeable !== false ? drawStrike(c, m, g, k, labels, st.strikeNote, avoid, free) : null;
-  // The aim label of a frozen shot sits near the cue ball: keep it off the strike label. The pill is
-  // sampled densely, edges included, and each point weighs as much as ten line points, so a wide
-  // font (DejaVu on Linux) cannot make covering a few line points look cheaper than an overlap.
-  if (strikeBox) {
-    const xs: number[] = [];
-    const ys: number[] = [];
-    for (let x = strikeBox.left; x < strikeBox.right; x += 4) xs.push(x);
-    for (let y = strikeBox.top; y < strikeBox.bottom; y += 4) ys.push(y);
-    xs.push(strikeBox.right);
-    ys.push(strikeBox.bottom);
-    for (const x of xs) for (const y of ys) avoid.push({ x, y, w: STRIKE_LABEL_WEIGHT });
-  }
+  // The aim label of a frozen shot sits near the cue ball: keep it off the strike label.
+  if (strikeBox) for (let x = strikeBox.left; x <= strikeBox.right; x += 6) for (let y = strikeBox.top; y <= strikeBox.bottom; y += 6) avoid.push({ x, y });
   if (labels && ghostAnchor) placedLabel(c, st.makeable === false ? 'Not makeable' : 'Aim here', ghostAnchor, avoid, free, st.makeable === false ? '#FF9B66' : UI.text);
   else if (labels && g.aimLabel) placedLabel(c, g.aimLabel.text, aimLabelAnchor(g.aimLabel, m), avoid, free, g.aimLabel.warn ? '#FF9B66' : UI.text);
   const hm = labels ? longestRunMiddle(hiddenRuns) : null;
