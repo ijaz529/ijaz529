@@ -2,7 +2,7 @@
  * Difficulty labels (research.md R-10) and coaching tips in player language (Principle VI).
  */
 import type { Difficulty } from '../types';
-import { describeSpin } from './power';
+import { describeSpin, powerFigure } from './power';
 
 export const DIFFICULTY_THRESHOLDS = { easy: 0.2, medium: 0.08, hard: 0.04 } as const;
 
@@ -41,7 +41,10 @@ export interface TipInput {
   throwShiftMm: number;
   /** Direction of the throw compensation as the player aims it (see ShotPlan.throwAim). */
   throwAim?: ThrowShiftDir | null;
-  /** Same as throwAim (the wave-1 name); throwAim wins when both are set. Default 'thinner'. */
+  /**
+   * Same as throwAim (the wave-1 name); throwAim wins when both are set. With neither, the throw
+   * sentence only says the shift is already allowed for in the ghost ball shown.
+   */
   shiftDir?: ThrowShiftDir;
   squirtDeg: number;
   side: number;
@@ -52,7 +55,10 @@ export interface TipInput {
   makeable: boolean;
   /** False when the cue ball stops before it reaches the object ball (default true). */
   cbReachesOb?: boolean;
-  /** Power to advise in the "too soft" tip (planShot passes ShotPlan.minPower; > 10: full power won't do). */
+  /**
+   * Power to advise in the "too soft" tip, quoted as given (one decimal at most). planShot passes
+   * advisePower(ShotPlan.minPower), the figure its warnings quote; > 10: full power won't do.
+   */
   minPower?: number;
   /** Same as minPower (an earlier name); minPower wins when both are set. */
   needPower?: number;
@@ -133,10 +139,11 @@ export function coachingTip(t: TipInput): string {
       : 'Another ball is in the way. No other pocket is clear for this ball: pick another ball or play a safety.';
   if (t.cbReachesOb === false || t.contact === 'short') {
     const p = t.minPower ?? t.needPower;
-    if (p !== undefined && p > 10) return 'Too far: the cue ball stops before it reaches the object ball, even at full power.';
+    const ball = theBall(t.targetLabel);
+    if (p !== undefined && p > 10) return `Too far: the cue ball stops before it reaches ${ball}, even at full power.`;
     // minPower is for this stroke's tip height: only a stroke without draw is told draw needs more.
     const more = (t.vert ?? 0) > -0.04 ? '; draw needs more pace still' : '';
-    return `Too soft: the cue ball stops before it reaches the object ball.${p !== undefined ? ` Use power ${p.toFixed(1)}+${more}.` : ' Hit it harder.'}`;
+    return `Too soft: the cue ball stops before it reaches ${ball}.${p !== undefined ? ` Use power ${powerFigure(p)}+${more}.` : ' Hit it harder.'}`;
   }
   const out: string[] = [];
   const straight = t.cutDeg < 3;
@@ -205,7 +212,10 @@ export function throwSentence(t: Pick<TipInput, 'throwDeg' | 'throwShiftMm' | 't
         : `Throw pushes the object ball thin here, so the ghost ball is shifted ${mm} mm thicker.`;
     case 'left':
     case 'right':
-      return `Side-spin throw: the ghost ball is shifted ${mm} mm to the ${dir} of full ball.`;
+      // A centre-ball stroke has no side to blame: the shift is the cut's own throw.
+      return t.side === 0
+        ? `Throw: the ghost ball is shifted ${mm} mm to the ${dir} of full ball.`
+        : `Side-spin throw: the ghost ball is shifted ${mm} mm to the ${dir} of full ball.`;
     default:
       return `Throw ≈ ${deg}° is already allowed for in the ghost ball shown.`;
   }

@@ -24,6 +24,29 @@ export function speedToPower(v: number): number {
   return 10;
 }
 
+/**
+ * Step of the power figures the app lets a player set and the advice quotes. ASSUMPTION (UI
+ * convention, not physics): the app's power control moves in half steps (src/app/ui/controls.ts).
+ */
+export const POWER_ADVICE_STEP = 0.5;
+
+/**
+ * The power to advise when a stroke is too soft ("Use power X+"): minPower rounded UP to the next
+ * half step, at least 1, so the figure is one the player can set and, played at it, nothing says
+ * "too soft" or "stops before" (it is ≥ minPower; the planner's own checks allow 1e-6). The cb-short
+ * and too-soft warnings, the coaching tip and the app's 3D label quote this one figure.
+ * minPower > 10 (not even full power) is returned as is.
+ */
+export function advisePower(minPower: number): number {
+  if (!(minPower <= 10)) return minPower;
+  return Math.min(10, Math.max(1, Math.ceil(minPower / POWER_ADVICE_STEP - 1e-6) * POWER_ADVICE_STEP));
+}
+
+/** A power figure as the app writes it: one decimal at most, none when whole ("4", "4.5", "3.4"). */
+export function powerFigure(power: number): string {
+  return (Math.round(power * 10) / 10).toString();
+}
+
 export function speedWord(power: number): string {
   const p = Math.round(power);
   if (p <= 2) return 'soft';

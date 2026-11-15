@@ -253,13 +253,15 @@ describe('the cue ball never reaches the object ball (stun-tip-when-cb-never-arr
     const plan = planShot(layout({ cue, ob }), { targetId: 'ob', pocketId: 'TR', stroke: { power: 1, side: 0, vert: -0.4 } }, P);
     expect(plan.tip).not.toMatch(/stun/i);
     expect(plan.tip).not.toMatch(/stop shot/i);
-    expect(plan.tip).toMatch(/cue ball stops before it reaches the object ball/);
+    // Named as the card's cb-short warning names it (the test layout labels the ball 'ob').
+    expect(plan.tip).toMatch(/cue ball stops before it reaches the ob\b/);
   });
   it('cut shot, cue (−0.9, 0) → ob (0.4, 0) into BR at power 2 with draw: no stun tip', () => {
     const plan = planShot(layout({ cue: v2(-0.9, 0), ob: v2(0.4, 0) }), { targetId: 'ob', pocketId: 'BR', stroke: { power: 2, side: 0, vert: -0.4 } }, P);
     expect(plan.tip).not.toMatch(/stun/i);
     expect(plan.tip).not.toMatch(/stop shot/i);
-    expect(plan.tip).toMatch(/cue ball stops before it reaches the object ball/);
+    // Named as the card's cb-short warning names it (the test layout labels the ball 'ob').
+    expect(plan.tip).toMatch(/cue ball stops before it reaches the ob\b/);
   });
 });
 

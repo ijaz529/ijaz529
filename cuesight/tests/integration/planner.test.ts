@@ -5,7 +5,7 @@ import { simulate } from '../../src/core/physics/simulate';
 import { strikeBall } from '../../src/core/physics/strike';
 import { planShot, stunVert } from '../../src/core/shot/planner';
 import { pocketWindow } from '../../src/core/shot/pocket-window';
-import { powerToSpeed } from '../../src/core/shot/power';
+import { advisePower, powerFigure, powerToSpeed } from '../../src/core/shot/power';
 import { makeTable, pocketById } from '../../src/core/table';
 import type { ShotPlan, Trajectory } from '../../src/core/types';
 import { add, angleBetween, angleOf, deg, fromAngle, norm, rad, rotate, scale, sub, v2, type Vec2 } from '../../src/core/vec';
@@ -167,10 +167,14 @@ describe('planShot', () => {
       const atMin = planShot(lay, { targetId: 'ob', pocketId: base.pocketId, stroke: { power: base.minPower, side: 0, vert: 0 } }, P, { record: false });
       expect(atMin.obPocketed, where).toBe(true);
       expect(has(atMin, 'too-soft'), where).toBe(false);
-      // Below it the advice quotes the same number the power meter shows.
+      // Below it the advice quotes the one figure the app shows for it (the 3D label's
+      // ceil-to-half of minPower): a power the half-step control can set, never below minPower.
       const below = planShot(lay, { targetId: 'ob', pocketId: base.pocketId, stroke: { power: Math.max(1, base.minPower - 0.5), side: 0, vert: 0 } }, P, { record: false });
       const soft = below.warnings.find((w) => w.code === 'too-soft');
-      if (soft && /Use power|Power \d/.test(soft.message)) expect(soft.message, where).toContain(base.minPower.toFixed(1));
+      const advised = advisePower(base.minPower);
+      expect(advised, where).toBeGreaterThanOrEqual(base.minPower - 1e-6);
+      expect(advised, where).toBe(Math.ceil(base.minPower * 2) / 2);
+      if (soft && /Use power|Power \d/.test(soft.message)) expect(soft.message, where).toContain(`${powerFigure(advised)}+`);
     }
     expect(n).toBe(40);
   });

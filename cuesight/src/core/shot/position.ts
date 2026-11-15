@@ -18,13 +18,19 @@
  * Coaching rules on top of the score: side spin is a last resort, as coaches teach it — it costs
  * SIDE_PENALTY·|side|, is not used on a near-straight shot without a landing spot while any
  * centre-line stroke works, and must beat the best centre-line stroke by SIDE_MIN_GAIN after the
- * robustness checks; pace well past pocket speed costs per diamond; and among strokes about as good
- * as the best (SOFTEST_WITHIN), the softest wins.
+ * robustness checks; a stroke whose own plan says "too soft" (below minPower, the ball only just
+ * drops) is a last resort too (TOO_SOFT_PENALTY); pace well past pocket speed costs per diamond;
+ * and among strokes about as good as the best (SOFTEST_WITHIN), the softest wins.
  *
  * Deterministic (Constitution III): the search is budgeted by evaluation count, coarse to fine, so a
- * smaller budget thins every power evenly instead of dropping the hard ones. The core never reads
- * the clock unless the caller sets the optional `timeCapMs` safety net, and the result reports when
- * that cap cut the search short.
+ * smaller budget thins every power evenly instead of dropping the hard ones. A budget is spent in
+ * this order, so a device-sized one keeps the speed check: the grid; the soft-end half steps, only
+ * while the robustness walk's whole allowance (WALK_RESERVE) still fits after them; the speed check
+ * down the ranking until ROBUST_FINALISTS pass; the tip/aim/shaft probes of those survivors; then
+ * the polish finalists (centre-line rivals, the softest powers), each checked in full. Only strokes
+ * whose checks all ran compete with each other. The core never reads the clock unless the caller
+ * sets the optional `timeCapMs` safety net, and the result reports when that cap cut the search
+ * short.
  */
 import { simulate } from '../physics/simulate';
 import { strikeBall } from '../physics/strike';
@@ -61,6 +67,15 @@ export const NO_SIDE_CUT_DEG = 5;
  * centre-line stroke pots the ball.
  */
 export const NO_SIDE_PENALTY = 10;
+/**
+ * Extra cost of a stroke whose own plan warns 'too-soft' ("Very soft — the object ball only just
+ * drops; any roll-off will miss": below minPower, the analytic chain's "arrives with pace" minimum).
+ * ASSUMPTION (coaching rule, not a measurement): the same size as NO_SIDE_PENALTY, so any potting
+ * stroke the card would not call too soft outranks it and such a stroke is recommended only when
+ * none of those survives the checks — the card never shows "recommended" next to "too soft" while
+ * a firmer stroke works (Principle VI).
+ */
+export const TOO_SOFT_PENALTY = 10;
 /** Tip placement error (fraction of R) and shaft mass ratio used by the robustness probes. ASSUMPTION. */
 export const TIP_ERROR = 0.05;
 export const PROBE_SQUIRT_MASS_RATIO = 23;
@@ -87,9 +102,14 @@ const SOFT_PROBES = 5;
 /** Default objective: the softest potting powers are refined by this many half steps. */
 const HALF_STEPS = 2;
 
+/**
+ * Evaluations the robustness walk is allowed by default: ROBUST_CANDIDATES strokes, each with its
+ * speed variants and tip/aim/shaft probes. The half steps run only while this still fits after them.
+ */
+export const WALK_RESERVE = ROBUST_CANDIDATES * (SPEED_VARIANTS.length + SOFT_PROBES);
+
 /** Default evaluation budget: the whole grid (powers 1..10), the half steps, and the robustness walk. */
-export const FULL_EVALUATIONS =
-  10 * VERTS.length * SIDES.length + HALF_STEPS * VERTS.length * SIDES.length + ROBUST_CANDIDATES * (SPEED_VARIANTS.length + SOFT_PROBES);
+export const FULL_EVALUATIONS = 10 * VERTS.length * SIDES.length + HALF_STEPS * VERTS.length * SIDES.length + WALK_RESERVE;
 
 /** Map a CB aim tolerance (deg) to 0..1 (0.02° → 0, ≥1° → 1) on a log scale. */
 export function toleranceQuality(tolDeg: number): number {
@@ -161,6 +181,8 @@ export interface RecommendOptions {
 interface Scored {
   stroke: Stroke;
   score: number;
+  /** Its own plan warns 'too-soft' (see TOO_SOFT_PENALTY). */
+  soft: boolean;
   /** Outcome part of the score (landing error or next-shot quality), without the stroke penalty. */
   objective: number;
   penalty: number;
@@ -177,12 +199,14 @@ type MisHit = { objective: number } | { fail: 'scratch'; pocketId: PocketId } | 
 /** A candidate after the robustness walk. */
 interface Checked {
   r: Scored;
-  /** Final robust score (see the header). */
+  /** Robust score: the speed check's, then (once probed) blended with the tip/aim/shaft probes (see the header). */
   robust: number;
   /** Passed every testable speed variant. */
   passed: boolean;
   /** Some speed variant was an untestable overhit past full power. */
   untestable: boolean;
+  /** The tip/aim/shaft probes ran (only for a stroke that passed the speed check). */
+  probed: boolean;
   risks: StrokeRisk[];
 }
 
@@ -195,8 +219,9 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const pocketId = base.pocketId;
   const landing = opts.landing ?? request.landing;
   let evaluated = 0;
-  // From the bare capture minimum: between it and minPower the ball only just drops, which can still
-  // be the stroke that leaves the cue ball best.
+  // From the bare capture minimum: between it and minPower the ball only just drops. Those strokes
+  // are searched (with some tip heights they arrive with pace after all, and one may be the only
+  // stroke that works) but one the card would call too soft is a last resort (TOO_SOFT_PENALTY).
   const lo = Math.max(1, Math.floor(base.minPowerCapture ?? base.minPower));
   const powers: number[] = [];
   for (let p = lo; p <= 10; p++) powers.push(p);
@@ -209,12 +234,14 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   // Side on a near-straight shot with no spot to reach is a last resort (see NO_SIDE_PENALTY).
   const noSide = !landing && base.cutAngleDeg < NO_SIDE_CUT_DEG;
 
-  /** Room for `n` more simulations? */
+  /** Room for `n` more simulations? (Reads the clock only when a time cap is set.) */
   const room = (n: number): boolean => {
     if (evaluated + n > maxEvaluations) return false;
     if (cap !== undefined && !timedOut && performance.now() - t0 > cap) timedOut = true;
     return !timedOut;
   };
+  /** Do `n` more simulations fit the evaluation budget? (Never reads the clock: planning only.) */
+  const fits = (n: number): boolean => evaluated + n <= maxEvaluations;
 
   /** Outcome part of the score for a cue-ball rest spot and the other balls' paths. */
   const outcome = (rest: Vec2, otherPaths: Trajectory[]): { objective: number; restError: number; nextQuality?: number } => {
@@ -234,6 +261,8 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
       return null;
     }
     const kiss = plan.warnings.some((w) => w.code === 'kiss');
+    // The card would call this stroke too soft (a potting plan's only too-soft case: "Very soft").
+    const soft = plan.warnings.some((w) => w.code === 'too-soft');
     // Any cue-ball contact with another ball moves the layout in ways a player can't control (R-11).
     const contact = plan.cuePath.events.some((e) => e.kind === 'ball' && e.otherId !== request.targetId);
     const rest = plan.cueRest;
@@ -250,12 +279,13 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
       CB_TRAVEL_COST * Math.max(0, travel - 1) +
       SIDE_PENALTY * Math.abs(stroke.side) +
       (noSide && stroke.side !== 0 ? NO_SIDE_PENALTY : 0) +
+      (soft ? TOO_SOFT_PENALTY : 0) +
       0.3 * Math.abs(stroke.vert) +
       (kiss ? 1 : 0) +
       (contact ? 0.5 : 0);
     const score = objective - penalty;
     opts.onEvaluate?.(stroke, score);
-    return { stroke, score, objective, penalty, rest, restError, aimDir: plan.aimDir, ...(nextQuality !== undefined ? { nextQuality } : {}) };
+    return { stroke, score, soft, objective, penalty, rest, restError, aimDir: plan.aimDir, ...(nextQuality !== undefined ? { nextQuality } : {}) };
   };
 
   /**
@@ -292,19 +322,24 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
     const r = evaluate(s);
     if (r) results.push(r);
   }
-  // Default objective: the softest strokes that pot are refined in half steps (just below the
-  // softest potting whole power, and just above it): a stroke between whole numbers often pockets
-  // the ball at pocket speed with a better leave. Never below the first searched power.
+  // Default objective: the softest strokes that pot (and that the card would not call too soft)
+  // are refined in half steps, just below and just above that softest whole power: a stroke between
+  // whole numbers often pockets the ball at pocket speed with a better leave. Never below the first
+  // searched power, and only when the robustness walk's whole allowance still fits after them, so a
+  // device-sized budget keeps its speed checks instead.
   if (!landing && results.length) {
-    const p1 = Math.min(...results.map((r) => r.stroke.power));
+    const firm = results.filter((r) => !r.soft);
+    const p1 = Math.min(...(firm.length ? firm : results).map((r) => r.stroke.power));
     const halves = [p1 - 0.5, p1 + 0.5].filter((p) => p > lo && p <= 10).slice(0, HALF_STEPS);
-    halfSteps: for (const power of halves)
-      for (const vert of VERTS)
-        for (const side of noSide ? [0] : SIDES) {
-          if (!room(1)) break halfSteps;
-          const r = evaluate({ power, side, vert });
-          if (r) results.push(r);
-        }
+    const halfSides = noSide ? [0] : SIDES;
+    if (fits(halves.length * VERTS.length * halfSides.length + WALK_RESERVE))
+      halfSteps: for (const power of halves)
+        for (const vert of VERTS)
+          for (const side of halfSides) {
+            if (!room(1)) break halfSteps;
+            const r = evaluate({ power, side, vert });
+            if (r) results.push(r);
+          }
   }
   if (!results.length) return { stroke: base.stroke, score: -Infinity, reachable: false, evaluated, rest: base.cueRest, ...capped() };
   results.sort((a, b) => b.score - a.score); // stable: ties keep evaluation order
@@ -313,14 +348,22 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const reachable = landing ? results.some((r) => r.restError <= LANDING_RADIUS) : true;
   const pool = landing && reachable ? results.filter((r) => r.restError <= LANDING_RADIUS) : results;
 
-  // Robustness: one candidate's checks (speed first; tip, aim and shaft for a survivor).
+  // --- Robustness checks -------------------------------------------------------------------------
   const aimErr = Math.max(1e-4, (AIM_ERROR_SHARE * base.toleranceDeg * Math.PI) / 180);
   const squirtOf = (s: Stroke, ratio: number) => (s.side === 0 ? 0 : strikeBall(base.aimDir, 1, s.side, s.vert, R, ratio).squirtRad);
-  const check = (r: Scored): Checked => {
+  const note = (risks: StrokeRisk[], scratchIf: StrokeRisk['scratchIf'], p: PocketId) => {
+    if (!risks.some((x) => x.scratchIf === scratchIf && x.pocketId === p)) risks.push({ scratchIf, pocketId: p });
+  };
+  /** Speed variants of `r` that can be played (overhits past full power can't). */
+  const speedTests = (r: Scored): number => {
+    const v0 = powerToSpeed(r.stroke.power);
+    let n = 0;
+    for (const k of SPEED_VARIANTS) if (v0 * k <= MAX_SPEED + 1e-9) n++;
+    return n;
+  };
+  /** The speed check: any scratch or miss at ±6/±12 % disqualifies. */
+  const speedCheck = (r: Scored): Checked => {
     const risks: StrokeRisk[] = [];
-    const note = (scratchIf: StrokeRisk['scratchIf'], p: PocketId) => {
-      if (!risks.some((x) => x.scratchIf === scratchIf && x.pocketId === p)) risks.push({ scratchIf, pocketId: p });
-    };
     const v0 = powerToSpeed(r.stroke.power);
     let untestable = false;
     let worst = Infinity;
@@ -331,15 +374,18 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
       }
       const m = misHit(r, v0 * k, r.stroke.vert, 0);
       if ('fail' in m) {
-        if (m.fail === 'scratch') note(k < 1 ? 'softer' : 'harder', m.pocketId);
-        return { r, robust: -Infinity, passed: false, untestable, risks };
+        if (m.fail === 'scratch') note(risks, k < 1 ? 'softer' : 'harder', m.pocketId);
+        return { r, robust: -Infinity, passed: false, untestable, probed: false, risks };
       }
       worst = Math.min(worst, m.objective);
     }
     // Worst outcome, charged the nominal stroke's penalty (the variants are the same stroke, mis-hit).
-    const robust = Math.min(r.score, worst - r.penalty);
-    // Tip height, aim, and a standard shaft's squirt instead of the configured one.
-    const soft: { kind: StrokeRisk['scratchIf']; vert: number; turn: number }[] = [
+    return { r, robust: Math.min(r.score, worst - r.penalty), passed: true, untestable, probed: false, risks };
+  };
+  type Probe = { kind: StrokeRisk['scratchIf']; vert: number; turn: number };
+  /** Tip height, aim, and a standard shaft's squirt instead of the configured one (SOFT_PROBES at most). */
+  const probesOf = (r: Scored): Probe[] => {
+    const list: Probe[] = [
       { kind: 'tip', vert: r.stroke.vert - TIP_ERROR, turn: 0 },
       { kind: 'tip', vert: r.stroke.vert + TIP_ERROR, turn: 0 },
       { kind: 'aim', vert: r.stroke.vert, turn: -aimErr },
@@ -348,48 +394,70 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
     // The cue points as compensated for the configured shaft; a standard shaft squirts the ball
     // by its own angle instead (no probe when the two are the same).
     const dSquirt = Math.sign(r.stroke.side) * (squirtOf(r.stroke, PROBE_SQUIRT_MASS_RATIO) - squirtOf(r.stroke, params.squirtMassRatio));
-    if (r.stroke.side !== 0 && Math.abs(dSquirt) > 1e-9) soft.push({ kind: 'aim', vert: r.stroke.vert, turn: dSquirt });
-    let worstSoft = robust;
-    for (const p of soft) {
+    if (r.stroke.side !== 0 && Math.abs(dSquirt) > 1e-9) list.push({ kind: 'aim', vert: r.stroke.vert, turn: dSquirt });
+    return list;
+  };
+  /** Run a speed survivor's probes: half of their worst outcome counts (see the header). */
+  const runProbes = (c: Checked, probes: Probe[]): void => {
+    const r = c.r;
+    const v0 = powerToSpeed(r.stroke.power);
+    let worstSoft = c.robust;
+    for (const p of probes) {
       const m = misHit(r, v0, p.vert, p.turn);
       if (!('fail' in m)) worstSoft = Math.min(worstSoft, m.objective - r.penalty);
       else if (m.fail === 'scratch') {
         worstSoft = Math.min(worstSoft, r.score - PROBE_SCRATCH);
-        note(p.kind, m.pocketId);
+        note(c.risks, p.kind, m.pocketId);
       } else worstSoft = Math.min(worstSoft, r.score - PROBE_FAIL);
     }
-    return { r, robust: 0.5 * robust + 0.5 * worstSoft, passed: true, untestable, risks };
+    c.robust = 0.5 * c.robust + 0.5 * worstSoft;
+    c.probed = true;
   };
-  const cost = (r: Scored) => SPEED_VARIANTS.length + 4 + (r.stroke.side !== 0 ? 1 : 0);
 
-  // Walk the pool in score order until ROBUST_FINALISTS pass; then give the polish finalists their
-  // check too: the best three centre-line strokes (so side has a fair rival) and the best stroke at
-  // each of the two softest powers (so a gentler stroke can win on SOFTEST_WITHIN).
+  // 1. The speed check down the ranking until ROBUST_FINALISTS fully tested strokes pass it.
   const checked = new Map<Scored, Checked>();
   let passedN = 0;
   for (const r of pool) {
-    if (passedN >= ROBUST_FINALISTS || !room(cost(r))) break;
-    const c = check(r);
+    if (passedN >= ROBUST_FINALISTS || !room(speedTests(r))) break;
+    const c = speedCheck(r);
     checked.set(r, c);
     if (c.passed && !c.untestable) passedN++;
   }
-  const extras: Scored[] = pool.filter((x) => x.stroke.side === 0).slice(0, 3);
-  const softest = [...new Set(pool.map((x) => x.stroke.power))].sort((a, b) => a - b).slice(0, 2);
+  // 2. The tip/aim/shaft probes of those survivors: fully tested ones first, best first.
+  const walked = [...checked.values()].filter((c) => c.passed).sort((a, b) => Number(a.untestable) - Number(b.untestable) || b.robust - a.robust);
+  for (const c of walked) {
+    const probes = probesOf(c.r);
+    if (!room(probes.length)) break;
+    runProbes(c, probes);
+  }
+  // 3. The polish finalists, each checked in full: the best three centre-line strokes (so side has a
+  // fair rival) and the best stroke at each of the two softest powers (so a gentler stroke can win
+  // on SOFTEST_WITHIN), among the strokes the card would not call too soft when there are any.
+  const firmPool = pool.filter((x) => !x.soft);
+  const rivals = firmPool.length ? firmPool : pool;
+  const extras: Scored[] = rivals.filter((x) => x.stroke.side === 0).slice(0, 3);
+  const softest = [...new Set(rivals.map((x) => x.stroke.power))].sort((a, b) => a - b).slice(0, 2);
   for (const p of softest) {
-    const r = pool.find((x) => x.stroke.power === p);
+    const r = rivals.find((x) => x.stroke.power === p);
     if (r) extras.push(r);
   }
   for (const r of extras) {
     if (checked.has(r)) continue;
-    if (!room(cost(r))) break;
-    checked.set(r, check(r));
+    const probes = probesOf(r);
+    if (!room(speedTests(r) + probes.length)) break;
+    const c = speedCheck(r);
+    checked.set(r, c);
+    if (c.passed) runProbes(c, probes);
   }
 
-  // Pick among the fully tested survivors (else those that needed an untestable overhit).
+  // Pick among the fully tested survivors (else those that needed an untestable overhit), and among
+  // them only the ones whose checks all ran: a probed stroke is never compared with an unprobed one.
   const survivors = [...checked.values()].filter((c) => c.passed);
   const tested = survivors.filter((c) => !c.untestable);
   let group = tested.length ? tested : survivors;
+  if (group.some((c) => c.probed)) group = group.filter((c) => c.probed);
   if (noSide && group.some((c) => c.r.stroke.side === 0)) group = group.filter((c) => c.r.stroke.side === 0);
+  if (group.some((c) => !c.r.soft)) group = group.filter((c) => !c.r.soft);
   let pick: Checked | null = null;
   if (group.length) {
     const top = (list: Checked[]) => list.reduce((a, b) => (b.robust > a.robust ? b : a));
@@ -405,10 +473,12 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const fragile = !pick;
   const chosen = pick ? pick.r : pool[0]!;
   const score = pick ? pick.robust : chosen.score;
-  // risks: what the chosen stroke's checks saw. A fragile stroke never claims to be safe: its list
-  // is given only when its check found a scratch, and is absent ("not known") otherwise.
+  // risks: what the chosen stroke's checks saw, and only what they can vouch for. A list (empty: no
+  // scratch seen) when every check ran (speed, tip, aim, shaft); absent ("not known") when the budget
+  // ran out before the tip/aim probes. A fragile stroke never claims to be safe: its list is given
+  // only when its check found a scratch.
   const seen = checked.get(chosen)?.risks;
-  const risks = pick ? pick.risks : seen && seen.length ? seen : undefined;
+  const risks = pick ? (pick.probed ? pick.risks : undefined) : seen && seen.length ? seen : undefined;
   return {
     stroke: chosen.stroke,
     score,

@@ -43,7 +43,7 @@ import { coachingTip, contactSpinOf, difficultyOf, strokeName, type ContactSpin,
 import { cutAngle, cutSide, fractionOf, ghostBall, contactPoint } from './geometry';
 import { pathBlockers } from './obstruction';
 import { mouthIntersect, pocketWindow, type PocketWindow } from './pocket-window';
-import { POWER_SPEEDS, powerToSpeed } from './power';
+import { advisePower, POWER_SPEEDS, powerFigure, powerToSpeed } from './power';
 
 export const MAX_CUT_DEG = 88;
 export const THIN_CUT_DEG = 80;
@@ -646,9 +646,11 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   // object ball: the shot cannot happen at this power and spin ('cb-short', not 'too-soft').
   const cueHitTarget = cuePath.events.some((e) => e.kind === 'ball' && e.otherId === target.id);
   const cbShort = geo.makeable && contact.stopped && !cueHitTarget;
-  // Power to advise: minPower (with pace), because the bare capture minimum is optimistic; the same
-  // figure the power meter shows.
-  const advise = minPower > 10 ? 'Use full power.' : `Use power ${minPower.toFixed(1)}+.`;
+  // Power to advise: minPower (with pace), because the bare capture minimum is optimistic, rounded
+  // UP to the half step a player can set (advisePower). One figure for every message, the tip and
+  // the app's label; played at it, none of these warnings fires (it is ≥ minPower).
+  const advised = advisePower(minPower);
+  const advise = minPower > 10 ? 'Use full power.' : `Use power ${powerFigure(advised)}+.`;
   if (cbShort)
     warnings.splice(softAt + (geo.frozen ? 1 : 0), 0, {
       code: 'cb-short',
@@ -671,7 +673,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       if (minPowerCapture > 10) soft = 'Too far: even full power may not reach the pocket.';
       else if (obStoppedShort && slow) soft = `Too soft — object ball stops short. ${advise}`;
     } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10)
-      soft = `Very soft — the object ball only just drops; any roll-off will miss. Power ${minPower.toFixed(1)}+ gives some pace.`;
+      soft = `Very soft — the object ball only just drops; any roll-off will miss. Power ${powerFigure(advised)}+ gives some pace.`;
     if (soft) warnings.splice(softAt + (geo.frozen ? 1 : 0), 0, { code: 'too-soft', message: soft });
   }
   const softWarned = warnings.some((w) => w.code === 'too-soft' || w.code === 'cb-short');
@@ -746,9 +748,11 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     obPocketSpeed: obPocketed ? sim.final[target.id]!.pocketSpeed : 0,
     alternatives,
   };
-  // Spin at contact. A cue ball the analytic chain stops just short but the simulation still gets
-  // there arrives at walking pace: it has long been rolling.
-  const contactSpin: ContactSpin = cbShort ? 'short' : contact.stopped ? 'roll' : contactSpinOf(contact.v, contact.w);
+  // Spin at contact. A cue ball that stops on the way and never touches the object ball has no
+  // contact to name ('short': no stroke name), makeable or not — only a makeable shot gets the
+  // cb-short warning. One the analytic chain stops just short but the simulation still gets there
+  // arrives at walking pace: it has long been rolling.
+  const contactSpin: ContactSpin = contact.stopped && !cueHitTarget ? 'short' : contact.stopped ? 'roll' : contactSpinOf(contact.v, contact.w);
   // Rail and ball together: the cue ball's first cushion within 5 ms of its first ball contact (either
   // order: an object ball on the rail is hit "ball and rail together").
   const firstBall = cuePath.events.find((e) => e.kind === 'ball');
@@ -775,7 +779,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     blocked,
     makeable: geo.makeable,
     cbReachesOb: !cbShort,
-    minPower, // the power to advise (with pace)
+    minPower: advised, // the power to advise: minPower (with pace) rounded up to a settable half step
     ...(alternatives[0] ? { altPocketName: nameOf(alternatives[0].pocketId) } : {}),
     frozen: geo.frozen,
   });

@@ -197,8 +197,9 @@ export interface ShotPlan {
   strokeSource: 'player' | 'recommended' | 'default';
   /**
    * Lowest power (analytic chain) at which the object ball reaches the pocket mouth with some pace
-   * (≥ params.pocketArrivalSpeed); > 10: not even at full power. The minimum the app shows and the
-   * figure the "too soft" advice quotes (unchanged meaning).
+   * (≥ params.pocketArrivalSpeed); > 10: not even at full power (unchanged meaning). The minimum the
+   * app shows; the cb-short / too-soft advice and the tip quote it rounded UP to a settable half
+   * step (power.ts advisePower), so the figure they quote never triggers them.
    */
   minPower: number;
   /**
@@ -258,8 +259,10 @@ export interface Recommendation {
   stroke: Stroke;
   /**
    * Robust score: the worst of the nominal stroke and the same cue line mis-hit at ±6/±12 % of its
-   * true speed, averaged half and half with the worst tip/aim/shaft mis-hit (position.ts header);
-   * the nominal score when fragile; −Infinity only when no stroke pots the ball.
+   * true speed, averaged half and half with the worst tip/aim/shaft mis-hit when those probes ran
+   * (position.ts header); the nominal score when fragile; −Infinity only when no stroke pots the
+   * ball. Includes the coaching penalties (a last-resort stroke, e.g. one the card calls too soft,
+   * scores about 10 lower).
    */
   score: number;
   reachable: boolean;
@@ -269,9 +272,11 @@ export interface Recommendation {
   evaluated: number;
   /**
    * Cue-ball scratches seen when the chosen stroke was mis-hit in the robustness checks (speed, tip,
-   * aim, shaft squirt). An array, empty when none scratched, whenever the stroke was checked and
-   * passed (fragile unset). For a fragile stroke it lists the scratches its check found, and is
-   * absent when that check found none or never ran: absent means "not known", never "safe".
+   * aim, shaft squirt). An array, empty when none scratched, whenever the stroke passed and all of
+   * those checks ran (fragile unset). Absent when the evaluation budget ran out before the tip/aim
+   * probes of a stroke that passed the speed check, and for a fragile stroke whose check found no
+   * scratch or never ran; a fragile stroke's list holds the scratches its check found. Absent means
+   * "not known", never "safe".
    */
   risks?: StrokeRisk[];
   /**
