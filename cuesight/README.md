@@ -62,7 +62,7 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 "Starting camera…". Timing tests can fail on a busy CPU; re-run them alone before concluding.
 
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
-**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1032 tests in 68 files**, all
+**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1035 tests in 68 files**, all
 passing (timing guards compare against work measured in the same run, so a busy CPU does not fail them).
 `npm run e2e` runs **137 tests**, all passing, also with a wide fallback font (DejaVu Sans, as on CI).
 
@@ -267,10 +267,12 @@ The power scale itself was not changed; R-12 in research.md lists the travel per
 - **Ball colours.** Colour names are approximate, and a colour it cannot name is shown as an unnamed
   ball. Solid balls the colour of the cloth are found, but a green stripe on green cloth (the 14) is
   lost in most video frames when its stripe faces the camera, and in far views on video frames it can
-  still be flagged as the cue ball (1 of 216 jittered runs).
+  still be flagged as the cue ball (1 of 216 jittered runs). A green stripe on green cloth (or a blue
+  one on blue) lying frozen just inside a cushion can likewise read as a white ball and be flagged as
+  the cue ball, mostly in views from a corner (about 1 in 120 such frames).
 - **Grey cloth.** The table is found on grey cloth, but on mid or light grey cloth the white cue ball
-  and light stripes may not be detected in Live frames or the Snap table photo (a fix is in progress
-  separately). Tap *Cue ball* to mark the cue ball, or add the missing ball in the Snap review.
+  and light stripes may not be detected in Live frames or the Snap table photo. Tap *Cue ball* to mark
+  the cue ball, or add the missing ball in the Snap review.
 - **Clusters.** A ball hidden inside its neighbours' outline (under about 15 % of its outline its own)
   cannot be counted. With a slightly wrong calibration (some of 60 jittered calibrations per scene,
   ±0.15–1 px corners) the end views lose one more ball that shows 28–56 % of its outline (in 6–11 of

@@ -22,7 +22,7 @@ This is the `/speckit-analyze` cross-artifact pass for feature 002 (T172), dated
 
 <!-- RELEASE: keep these counts in step with the README "Test status" line. -->
 **Tests on the release branch**:
-- `npx vitest run`: 1032 tests in 68 files, all passing after the release-verification fixes.
+- `npx vitest run`: 1035 tests in 68 files, all passing after the release-verification fixes.
   - In full runs on a busy 4-core machine, the player-view CPU guard for failing photos has read
     206–256 ms at p95 against a 250 ms limit.
   - Run alone, it reads 214–242 ms.
