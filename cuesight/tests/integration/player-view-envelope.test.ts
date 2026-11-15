@@ -6,9 +6,14 @@
  * table (pool9 / snooker12), HFOV 40/65/100°, camera height 8/20/40 cm, distance 0.3/0.75/1.2 m behind
  * the cue ball, yaw −15/0/+15° off the aim line, roll −10/0/+10° and occlusion (none / a ball partly in
  * front of the target / a ball partly behind the cue ball), so every pair of levels is covered. The
- * two resolutions use different column assignments. Each photo is fitted twice: without hints, and
- * with what the app passes (the overview's cloth and a 1× (65°) focal length — a lens change for the
- * 40° and 100° photos).
+ * two resolutions use different column assignments; the 960 × 720 rows are repeated with a fourth
+ * occlusion level, a ball partly in front of the cue ball. Each photo is fitted twice: without hints,
+ * and with what the app passes (the overview's cloth and a 1× (65°) focal length — a lens change for
+ * the 40° and 100° photos). The per-photo CPU time is guarded at the 95th percentile.
+ *
+ * Further suites: lens changes, grey cloths (tinted, low-tint and untinted), light chromatic cloths, a
+ * stripe ball that shows only white, exposure / noise / 4:2:0, layout error, balls moved since the
+ * table photo (FR-121), and reasons that name the true cause.
  *
  * "Enough evidence" is ground truth from the renderer: the cue ball and at least two more balls each
  * have ≥ 50 % of their disc visible (not hidden by nearer balls, rails or the frame edge), an image
@@ -115,7 +120,7 @@ function snookerBalls(table: TableSpec): SynthBall[] {
   return out;
 }
 
-type Occlusion = 'none' | 'target' | 'behindCue';
+type Occlusion = 'none' | 'target' | 'behindCue' | 'frontCue';
 
 interface Scene {
   name: string;
@@ -132,7 +137,11 @@ interface Scene {
 const isFree = (balls: SynthBall[], p: { x: number; y: number }, table: TableSpec) =>
   Math.abs(p.x) < table.length / 2 - table.ballRadius && Math.abs(p.y) < table.width / 2 - table.ballRadius && balls.every((b) => Math.hypot(b.pos.x - p.x, b.pos.y - p.y) > 2.05 * table.ballRadius);
 
-/** Adds a ball partly in front of the target (on the camera's line of sight) or partly behind the cue ball. */
+/**
+ * Adds a ball partly in front of the target (on the camera's line of sight), partly behind the cue ball,
+ * or partly in front of the cue ball (between the camera and the cue ball: its outline cuts the cue
+ * ball's, and the two touch in the image).
+ */
 function occlude(balls: SynthBall[], occ: Occlusion, cam: { x: number; y: number }, targetIdx: number, table: TableSpec): SynthBall[] {
   if (occ === 'none') return balls;
   const R = table.ballRadius;
@@ -141,13 +150,14 @@ function occlude(balls: SynthBall[], occ: Occlusion, cam: { x: number; y: number
   const L = Math.hypot(anchor.x - cam.x, anchor.y - cam.y);
   const ux = (anchor.x - cam.x) / L;
   const uy = (anchor.y - cam.y) / L;
-  const along = occ === 'target' ? [-0.22, -0.3, -0.38, -0.16] : [0.14, 0.2, 0.26];
-  const sides = occ === 'target' ? [1.3, -1.3, 1.6, -1.6] : [1.1, -1.1, 1.5, -1.5];
+  const along = occ === 'target' ? [-0.22, -0.3, -0.38, -0.16] : occ === 'frontCue' ? [-0.1, -0.15, -0.2, -0.07] : [0.14, 0.2, 0.26];
+  const sides = occ === 'target' ? [1.3, -1.3, 1.6, -1.6] : occ === 'frontCue' ? [1.3, -1.3, 1.7, -1.7] : [1.1, -1.1, 1.5, -1.5];
+  const color = occ === 'target' ? BALL_COLORS.orange! : occ === 'frontCue' ? BALL_COLORS.red! : BALL_COLORS.purple!;
   for (const a of along)
     for (const s of sides) {
       const p = { x: anchor.x + ux * a - uy * s * R, y: anchor.y + uy * a + ux * s * R };
       if (isFree(out, p, table)) {
-        out.push({ pos: p, color: occ === 'target' ? BALL_COLORS.orange! : BALL_COLORS.purple! });
+        out.push({ pos: p, color });
         return out;
       }
     }
@@ -195,6 +205,8 @@ interface Rendered {
   /** Balls in view (ground truth), the cue ball included. */
   inView: number;
   cueInView: boolean;
+  /** Balls with at least a quarter of their disc in view (partly hidden or cut by the frame edge). */
+  partlyInView: number;
 }
 
 function render(sc: Scene): Rendered {
@@ -205,6 +217,7 @@ function render(sc: Scene): Rendered {
   const cloth = sc.cloth ?? [40, 130, 70];
   let inView = 0;
   let cueInView = false;
+  let partlyInView = 0;
   sc.balls.forEach((b, k) => {
     const P = { x: b.pos.x - m.C.x, y: b.pos.y - m.C.y, z: R - m.C.z };
     const D = Math.hypot(P.x, P.y, P.z);
@@ -215,8 +228,9 @@ function render(sc: Scene): Rendered {
     const camo = Math.abs(b.color[0] - cloth[0]) + Math.abs(b.color[1] - cloth[1]) + Math.abs(b.color[2] - cloth[2]) < 60;
     if (visible && !camo) inView++;
     if (k === 0 && visible) cueInView = true;
+    if (area[k]! / (Math.PI * rPx * rPx) >= 0.25 && rPx >= 3 && !camo) partlyInView++;
   });
-  return { frame, inView, cueInView };
+  return { frame, inView, cueInView, partlyInView };
 }
 
 const knownOf = (balls: SynthBall[]): KnownBall[] => balls.map((b, i) => ({ id: i === 0 ? 'cue' : `b${i}`, pos: b.pos, isCue: i === 0, rgb: b.color }));
@@ -269,7 +283,7 @@ const ROLL = [-10, 0, 10];
 const OCC: Occlusion[] = ['none', 'target', 'behindCue'];
 
 /** Column assignment (fov, height, distance, yaw, roll, occlusion) per resolution. */
-const ENVELOPE: Scene[] = (
+const GRID: Scene[] = (
   [
     [960, 720, [1, 2, 3, 4, 5, 6]],
     [1280, 960, [3, 4, 5, 6, 7, 1]],
@@ -289,27 +303,40 @@ const ENVELOPE: Scene[] = (
     }),
   ),
 );
+/**
+ * A fourth occlusion level, a ball partly in front of the cue ball, over the 960 × 720 rows (only the
+ * occlusion column changes, so every pair of the other levels is covered again with it).
+ */
+const FRONT: Scene[] = L18.map((row) =>
+  scene({ preset: row[0] ? 'snooker12' : 'pool9', W: 960, H: 720, fov: FOV[row[1]!]!, h: HEIGHT[row[2]!]!, d: DIST[row[3]!]!, yaw: YAW[row[4]!]!, roll: ROLL[row[5]!]!, occ: 'frontCue' }),
+);
+const ENVELOPE: Scene[] = [...GRID, ...FRONT];
 
 interface Run {
   sc: Scene;
   hints: boolean;
   enough: boolean;
+  /** Three or more balls are at least partly in view (≥ ¼ of the disc), though fewer than enough. */
+  partlyEnough: boolean;
   res: PlayerViewResult;
   err: Errors | null;
 }
 
 describe('SC-106 / SC-107: the player-photo fit over the spec envelope', () => {
   const runs: Run[] = [];
+  /** The 960 × 720 photos, kept for the timing guard. */
+  const frames960: { sc: Scene; frame: Frame }[] = [];
 
   beforeAll(async () => {
     for (const sc of ENVELOPE) {
       // Yield between photos: a minute of synchronous work would starve the test runner's RPC.
       await new Promise((resolve) => setTimeout(resolve, 0));
       const r = render(sc);
+      if (sc.W === 960) frames960.push({ sc, frame: r.frame });
       const enough = r.cueInView && r.inView >= 3;
       for (const hints of [false, true]) {
         const res = run(sc, r.frame, hints ? appHints(sc) : {});
-        runs.push({ sc, hints, enough, res, err: res.pose ? errorsOf(sc, res.pose) : null });
+        runs.push({ sc, hints, enough, partlyEnough: r.partlyInView >= 3, res, err: res.pose ? errorsOf(sc, res.pose) : null });
       }
     }
   }, 600_000);
@@ -338,15 +365,46 @@ describe('SC-106 / SC-107: the player-photo fit over the spec envelope', () => {
       if (r.res.ok) continue;
       expect(r.res.reason, r.sc.name).toBeDefined();
       expect(REASONS.has(r.res.reason!), `${r.sc.name}: ${r.res.reason}`).toBe(true);
-      // These photos are lit, show the cloth, and nothing moved: never "too dark", "no cloth" or "moved".
-      expect([PLAYER_VIEW_REASONS.dark, PLAYER_VIEW_REASONS.noCloth, PLAYER_VIEW_REASONS.moved], r.sc.name).not.toContain(r.res.reason);
-      if (!r.enough) expect([PLAYER_VIEW_REASONS.tooFewBalls, PLAYER_VIEW_REASONS.noCue], r.sc.name).toContain(r.res.reason);
+      // These photos are lit, clean, show the cloth, and nothing moved: never "too dark", "too grainy",
+      // "no cloth" or "moved".
+      expect([PLAYER_VIEW_REASONS.dark, PLAYER_VIEW_REASONS.noisy, PLAYER_VIEW_REASONS.noCloth, PLAYER_VIEW_REASONS.moved], r.sc.name).not.toContain(r.res.reason);
+      // Without enough evidence: too few balls, or no cue ball — or, when three or more balls are in view
+      // but some only in part (behind a nearer ball, cut by the frame edge), no fit: the photo does show
+      // balls, too little of them to pin the pose.
+      if (!r.enough) expect([PLAYER_VIEW_REASONS.tooFewBalls, PLAYER_VIEW_REASONS.noCue, ...(r.partlyEnough ? [PLAYER_VIEW_REASONS.noFit] : [])], r.sc.name).toContain(r.res.reason);
+      // A photo that shows the cue ball and two more balls never says "I can't see enough balls".
+      if (r.enough) expect(r.res.reason, r.sc.name).not.toBe(PLAYER_VIEW_REASONS.tooFewBalls);
     }
   });
 
-  // Timing is reported here; the guards are player-view.test.ts's (< 250 ms median per 960×720 photo,
-  // SC-109's 0.5 s at 1280 px), measured on repeated runs of one photo rather than over a minute of
-  // rendering that a loaded CI machine stretches.
+  it('a ball in front of the cue ball (cutting its outline) still fits within tolerance on ≥ 85 % of those photos', () => {
+    const front = runs.filter((r) => r.enough && r.sc.name.endsWith('frontCue'));
+    const good = front.filter((r) => r.res.ok && r.err && within(r.err));
+    console.log(`player-view, a ball in front of the cue ball: ${good.length}/${front.length} runs within tolerance`);
+    expect(front.length).toBeGreaterThanOrEqual(20);
+    expect(good.length / front.length).toBeGreaterThanOrEqual(0.85);
+  });
+
+  // The budget is per photo (< 250 ms at 960 × 720), so the tail counts: the 95th percentile over the
+  // envelope's 960 × 720 photos, in CPU time of this process (wall time on a shared CI machine measures
+  // its other jobs), once the code is warm (a process's first fits run in the interpreter), with what
+  // the app passes.
+  it('fits a 960×720 photo in < 250 ms CPU at the 95th percentile over the envelope', () => {
+    for (const { sc, frame } of frames960.slice(0, 4)) run(sc, frame, appHints(sc));
+    const t: number[] = [];
+    for (const { sc, frame } of frames960) {
+      const c0 = process.cpuUsage();
+      run(sc, frame, appHints(sc));
+      const c = process.cpuUsage(c0);
+      t.push((c.user + c.system) / 1000);
+    }
+    t.sort((a, b) => a - b);
+    const q = (p: number) => t[Math.min(t.length - 1, Math.floor(p * t.length))]!;
+    console.log(`player-view 960×720 CPU over ${t.length} envelope photos: median ${q(0.5).toFixed(0)} ms, p95 ${q(0.95).toFixed(0)} ms, max ${t[t.length - 1]!.toFixed(0)} ms`);
+    expect(q(0.95)).toBeLessThan(250);
+  });
+
+  // Wall time is reported here (it includes the first, cold fits).
   it('reports the per-photo time over the envelope (median, p95)', () => {
     for (const W of [960, 1280]) {
       const t = runs
@@ -494,10 +552,10 @@ describe('a camera a few cm above the bed, behind the end rail', () => {
 // --- exposure, sensor noise, 4:2:0 chroma --------------------------------------------------------------
 
 /** Deterministic perturbations of a rendered photo: exposure gain, per-channel noise, 4:2:0 chroma. */
-function perturb(f: Frame, o: { gain?: number; noise?: number; chroma420?: boolean }): Frame {
+function perturb(f: Frame, o: { gain?: number; noise?: number; chroma420?: boolean; seed?: number }): Frame {
   const { width: w, height: h } = f;
   const d = new Uint8ClampedArray(f.data.length);
-  let s = 4242;
+  let s = o.seed ?? 4242;
   const gauss = () => {
     s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
     const u = (s + 1) / 4294967297;
@@ -675,4 +733,257 @@ describe('failure reasons name the true cause (Principle II)', () => {
     expect(res.ok).toBe(false);
     expect(res.reason).toBe(PLAYER_VIEW_REASONS.tooFewBalls);
   });
+});
+
+// --- light chromatic cloths -----------------------------------------------------------------------
+
+describe('light chromatic cloths: a light cloth is not an over-exposed photo', () => {
+  // The colour thresholds once followed the cloth's brightness (read as exposure), so on a light-blue or
+  // pale-green cloth the white cue ball's shaded side counted as "dark" and the cue ball was lost.
+  const poses: Omit<Params, 'cloth'>[] = [
+    { preset: 'pool9', W: 960, H: 720, fov: 65, h: 0.2, d: 0.6, yaw: 10 },
+    { preset: 'snooker12', W: 960, H: 720, fov: 65, h: 0.3, d: 0.5, roll: -8 },
+    { preset: 'pool9', W: 960, H: 720, fov: 40, h: 0.15, d: 0.9, yaw: -12, occ: 'target' },
+    { preset: 'snooker12', W: 1280, H: 960, fov: 100, h: 0.12, d: 0.75, yaw: 8, roll: 6 },
+  ];
+  for (const cloth of [
+    [70, 140, 200],
+    [110, 190, 130],
+    [90, 150, 210],
+  ] as RGB[])
+    it(`cloth ${cloth.join(',')}: fits within tolerance, with and without the overview's cloth`, () => {
+      for (const p of poses) {
+        const sc = scene({ ...p, cloth });
+        const { frame } = render(sc);
+        for (const extra of [{}, appHints(sc)]) {
+          const res = run(sc, frame, extra);
+          expect(res.ok, `${sc.name}: ${res.reason}`).toBe(true);
+          const e = errorsOf(sc, res.pose!);
+          expect(e.ghost, sc.name).toBeLessThanOrEqual(0.015);
+          expect(e.dot, sc.name).toBeLessThanOrEqual(0.1);
+        }
+      }
+    });
+});
+
+// --- a stripe ball that shows only its white band --------------------------------------------------
+
+describe('a stripe ball whose band is lost in the cloth is not taken for the cue ball', () => {
+  it('green stripe on green cloth, a red ball in front of the cue ball (random-layout sweep scene s60050)', () => {
+    // The green stripe's band disappears into the green cloth, so the ball shows as a white circle —
+    // larger and whiter than the real cue ball, half hidden behind a red ball. Taken for the cue ball, it
+    // gave an "ok" fit with the camera 1.2 m off (ghost 4.5 % of the diagonal: an SC-107 violation).
+    const table = tables.pool9;
+    const C = BALL_COLORS;
+    const balls: SynthBall[] = [
+      { pos: { x: -0.37207, y: -0.11162 }, color: C.cue! },
+      { pos: { x: -0.95397, y: -0.35577 }, color: C.green! },
+      { pos: { x: 0.28195, y: 0.58899 }, color: C.red!, stripe: true },
+      { pos: { x: 1.14685, y: -0.0563 }, color: C.maroon!, stripe: true },
+      { pos: { x: 0.69283, y: -0.04149 }, color: C.blue!, stripe: true },
+      { pos: { x: -1.16791, y: 0.062 }, color: C.black! },
+      { pos: { x: -0.51087, y: -0.36864 }, color: C.green!, stripe: true },
+      { pos: { x: -0.20723, y: -0.06023 }, color: C.red! },
+    ];
+    const cam: SynthCamera = { pos: { x: 0.084392, y: 0.144281, z: 0.082051 }, target: { x: -0.812266, y: -0.288501, z: 0.175349 }, fovDeg: 54.8675, rollDeg: 0.62639 };
+    const sc: Scene = { name: 's60050', table, balls, targetIdx: 1, cam, W: 1280, H: 960 };
+    const { frame } = render(sc);
+    for (const extra of [{}, appHints(sc)]) {
+      const res = run(sc, frame, extra);
+      if (!res.ok) continue;
+      const e = errorsOf(sc, res.pose!);
+      expect(e.ghost).toBeLessThanOrEqual(0.015);
+      expect(e.dot).toBeLessThanOrEqual(0.1);
+    }
+    // The true cue ball explains the photo cleanly: the fit finds it.
+    expect(run(sc, frame).ok).toBe(true);
+  });
+});
+
+// --- balls moved since the table photo (FR-121) ------------------------------------------------------
+
+describe('FR-121: balls moved since the table photo → "The balls seem to have moved"', () => {
+  /** A photo of `moved` (the table now), fitted with the overview's layout `layout`, camera placed from the layout. */
+  function movedRun(preset: 'pool9' | 'snooker12', moved: (layout: SynthBall[], targetIdx: number) => SynthBall[], pose: { d: number; h: number; yaw?: number; fov?: number; roll?: number }) {
+    const base = scene({ preset, W: 960, H: 720, fov: pose.fov ?? 65, h: pose.h, d: pose.d, ...(pose.yaw ? { yaw: pose.yaw } : {}), ...(pose.roll ? { roll: pose.roll } : {}) });
+    const now: Scene = { ...base, balls: moved(base.balls, base.targetIdx) };
+    const res = run(base, render(now).frame);
+    // The guide the app would draw: from the overview's layout, on the fitted pose, against the table now.
+    const err = res.pose ? errorsOf(now, res.pose, knownOf(base.balls)) : null;
+    return { res, err, name: base.name };
+  }
+  /** Moved: "moved", or an ok fit whose guide (from the old layout) is still right. Never an ok with a wrong guide. */
+  const verdict = (r: ReturnType<typeof movedRun>) => (r.res.ok ? (r.err && within(r.err) ? 'okRight' : 'okWrong') : r.res.reason === PLAYER_VIEW_REASONS.moved ? 'moved' : `other: ${r.res.reason}`);
+  const sideways = (off: number) => (layout: SynthBall[], ti: number) => {
+    const cue = layout[0]!.pos;
+    const tg = layout[ti]!.pos;
+    const L = Math.hypot(tg.x - cue.x, tg.y - cue.y);
+    return layout.map((b, i) => (i === 0 ? { ...b, pos: { x: cue.x - (off * (tg.y - cue.y)) / L, y: cue.y + (off * (tg.x - cue.x)) / L } } : b));
+  };
+
+  for (const preset of ['pool9', 'snooker12'] as const)
+    it(`${preset}: the cue ball moved 8–20 cm to either side`, () => {
+      // A moved cue ball pulls every hypothesis anchored on it (the layout's cue ball is put on the
+      // photo's), so the pose comes from another ball; there the cue ball is on bare cloth and a white
+      // circle of its size rests elsewhere on the bed.
+      const rows: string[] = [];
+      for (const side of [1, -1])
+        for (const off of [0.08, 0.1, 0.12, 0.15, 0.2]) {
+          const r = movedRun(preset, sideways(side * off), { d: 0.5, h: 0.3 });
+          rows.push(`${side * off}: ${verdict(r)}`);
+        }
+      console.log(`${preset} cue ball moved: ${rows.join(', ')}`);
+      expect(rows.filter((x) => x.endsWith('moved') || x.endsWith('okRight')).length).toBe(rows.length);
+    });
+
+  it('the whole layout moved 10–12 cm (the cue ball stayed): "moved" on ≥ 75 % and never an ok with a wrong guide', () => {
+    const shift = (layout: SynthBall[]) => layout.map((b, i) => (i === 0 ? b : { ...b, pos: { x: b.pos.x + (i % 2 ? 0.12 : -0.1), y: Math.max(-0.6, Math.min(0.6, b.pos.y + (i % 3 === 0 ? 0.1 : -0.08))) } }));
+    const poses = [{ d: 0.5, h: 0.3 }, { d: 0.3, h: 0.15 }, { d: 0.8, h: 0.4, yaw: 10 }, { d: 0.6, h: 0.2, roll: 10, yaw: 5 }];
+    const out: string[] = [];
+    for (const preset of ['pool9', 'snooker12'] as const) for (const p of poses) out.push(verdict(movedRun(preset, shift, p)));
+    console.log(`whole layout moved: ${out.join(', ')}`);
+    expect(out).not.toContain('okWrong');
+    expect(out.filter((x) => x === 'moved').length / out.length).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('the target ball moved 12–25 cm: "moved", not an ok fit that draws the guide from where it was', () => {
+    // The pose is right (the cue ball and the other balls did not move), so the fit was ok; but the
+    // target is on bare cloth and a circle of its colour rests elsewhere: drawing from the layout would
+    // aim at an empty spot.
+    const poses = [{ d: 0.5, h: 0.3 }, { d: 0.3, h: 0.15 }, { d: 0.8, h: 0.4, yaw: 10 }, { d: 0.6, h: 0.2, roll: 10, yaw: 5 }];
+    const out: string[] = [];
+    for (const preset of ['pool9', 'snooker12'] as const)
+      poses.forEach((p, k) => {
+        const off = (k % 2 ? 1 : -1) * (0.12 + 0.04 * k);
+        const moveTarget = (layout: SynthBall[], ti: number) => {
+          const cue = layout[0]!.pos;
+          const tg = layout[ti]!.pos;
+          const L = Math.hypot(tg.x - cue.x, tg.y - cue.y);
+          return layout.map((b, i) => (i === ti ? { ...b, pos: { x: tg.x - (off * (tg.y - cue.y)) / L, y: tg.y + (off * (tg.x - cue.x)) / L } } : b));
+        };
+        out.push(verdict(movedRun(preset, moveTarget, p)));
+      });
+    console.log(`target moved: ${out.join(', ')}`);
+    expect(out.every((x) => x === 'moved')).toBe(true);
+  });
+
+  it('the target ball is gone (pocketed since the table photo): "moved", not a guide to an empty spot', () => {
+    // No circle of its colour anywhere: the evidence is the bare cloth where the layout puts it.
+    const out: string[] = [];
+    for (const preset of ['pool9', 'snooker12'] as const)
+      for (const p of [{ d: 0.5, h: 0.3 }, { d: 0.8, h: 0.4, yaw: 10 }]) {
+        const r = movedRun(preset, (layout, ti) => layout.filter((_, i) => i !== ti), p);
+        out.push(r.res.ok ? 'ok' : r.res.reason === PLAYER_VIEW_REASONS.moved ? 'moved' : `other: ${r.res.reason}`);
+      }
+    console.log(`target gone: ${out.join(', ')}`);
+    expect(out.every((x) => x === 'moved')).toBe(true);
+  });
+});
+
+// --- grainy photos -----------------------------------------------------------------------------------
+
+describe('grainy photos (sensor noise)', () => {
+  it('σ 6 and σ 8 (independent noise) on three envelope photos: fits within tolerance', () => {
+    const scenes: Params[] = [
+      { preset: 'pool9', W: 960, H: 720, fov: 65, h: 0.2, d: 0.75, roll: 10 },
+      { preset: 'snooker12', W: 960, H: 720, fov: 40, h: 0.4, d: 1.2, yaw: -15, occ: 'target' },
+      { preset: 'pool9', W: 1280, H: 960, fov: 100, h: 0.08, d: 0.3, yaw: 15 },
+    ];
+    for (const p of scenes) {
+      const sc = scene(p);
+      const { frame } = render(sc);
+      for (const [noise, seed] of [
+        [6, 17],
+        [8, 29],
+      ] as const) {
+        const res = run(sc, perturb(frame, { noise, seed }), appHints(sc));
+        expect(res.ok, `${sc.name} σ ${noise}: ${res.reason}`).toBe(true);
+        const e = errorsOf(sc, res.pose!);
+        expect(e.ghost, `${sc.name} σ ${noise}`).toBeLessThanOrEqual(0.015);
+        expect(e.dot, `${sc.name} σ ${noise}`).toBeLessThanOrEqual(0.1);
+      }
+    }
+  });
+
+  it('a photo too grainy to line up says so ("too grainy"), never "no cloth", "can\'t see enough balls" or "moved"', () => {
+    // The table is in view and lit; the noise (σ 28) is what defeats the fit, and the reason says so.
+    const sc = scene({ preset: 'snooker12', W: 960, H: 720, fov: 65, h: 0.2, d: 0.75, yaw: 5 });
+    const { frame } = render(sc);
+    for (const extra of [{}, appHints(sc)]) {
+      const res = run(sc, perturb(frame, { noise: 28, seed: 5 }), extra);
+      if (res.ok) {
+        expect(errorsOf(sc, res.pose!).ghost).toBeLessThanOrEqual(0.015);
+        continue;
+      }
+      expect(res.reason).toBe(PLAYER_VIEW_REASONS.noisy);
+    }
+  });
+});
+
+// --- reasons follow the stated rules ---------------------------------------------------------------------
+
+describe('"I can\'t see enough balls" means fewer than three ball circles in the photo', () => {
+  it('a full 15-ball rack in view never gives "can\'t see enough balls"', () => {
+    const table = tables.pool9;
+    const R = table.ballRadius;
+    const cols = ['yellow', 'blue', 'red', 'purple', 'orange', 'green', 'maroon', 'black', 'yellow', 'blue', 'red', 'purple', 'orange', 'green', 'maroon'];
+    const balls: SynthBall[] = [{ pos: { x: -0.7, y: 0.05 }, color: BALL_COLORS.cue! }];
+    let k = 0;
+    for (let row = 0; row < 5; row++)
+      for (let i = 0; i <= row; i++) {
+        balls.push({ pos: { x: 0.6 + row * R * Math.sqrt(3) * 1.002, y: (i - row / 2) * 2 * R * 1.002 }, color: BALL_COLORS[cols[k]!]!, ...(k >= 8 ? { stripe: true } : {}) });
+        k++;
+      }
+    for (const [h, d] of [
+      [0.3, 0.5],
+      [0.12, 0.8],
+    ] as const) {
+      const cam = playerViewCamera({ cue: balls[0]!.pos, aimAt: balls[1]!.pos, distance: d, height: h, cueRow: 0.72, fovDeg: 65, imageWidth: 960, imageHeight: 720, ballRadius: R });
+      const sc: Scene = { name: `rack h ${h} d ${d}`, table, balls, targetIdx: 1, cam, W: 960, H: 720 };
+      const res = run(sc, render(sc).frame);
+      if (res.ok) expect(errorsOf(sc, res.pose!).ghost, sc.name).toBeLessThanOrEqual(0.015);
+      else expect(res.reason, sc.name).not.toBe(PLAYER_VIEW_REASONS.tooFewBalls);
+    }
+  });
+});
+
+// --- low-tint and untinted grey cloths ---------------------------------------------------------------------
+
+describe('low-tint and untinted grey cloths (S 0–0.06): honest when the cloth hides the cue ball', () => {
+  // On an untinted grey cloth a white ball's side-lit face, the cushion faces and ball shadows all have
+  // the cloth's own grey, so the cue ball can be lost (R-24 limitation). The fit must then fail with the
+  // true reason — never "ok" off tolerance, never "moved", "too dark" or "no cloth" — and the two taps fit.
+  const poses: Omit<Params, 'cloth'>[] = [
+    { preset: 'pool9', W: 960, H: 720, fov: 65, h: 0.2, d: 0.6, yaw: 10 },
+    { preset: 'snooker12', W: 960, H: 720, fov: 65, h: 0.3, d: 0.5, roll: -8 },
+  ];
+  for (const cloth of [
+    [128, 128, 128],
+    [100, 104, 108],
+    [120, 118, 112],
+    [95, 95, 98],
+  ] as RGB[])
+    it(`cloth ${cloth.join(',')}`, () => {
+      const diag = Math.hypot(960, 720);
+      for (const p of poses) {
+        const sc = scene({ ...p, cloth });
+        const { frame } = render(sc);
+        const res = run(sc, frame, appHints(sc));
+        if (res.ok) {
+          const e = errorsOf(sc, res.pose!);
+          expect(e.ghost, sc.name).toBeLessThanOrEqual(0.015);
+          expect(e.dot, sc.name).toBeLessThanOrEqual(0.1);
+          continue;
+        }
+        expect([PLAYER_VIEW_REASONS.noCue, PLAYER_VIEW_REASONS.noFit, PLAYER_VIEW_REASONS.tooFewBalls], `${sc.name}: ${res.reason}`).toContain(res.reason);
+        const m = cameraModel(sc.cam, sc.W, sc.H);
+        const R = sc.table.ballRadius;
+        const cue = m.project({ x: sc.balls[0]!.pos.x, y: sc.balls[0]!.pos.y, z: R });
+        const tgt = m.project({ x: sc.balls[sc.targetIdx]!.pos.x, y: sc.balls[sc.targetIdx]!.pos.y, z: R });
+        const off = 0.007 * diag;
+        const manual = run(sc, frame, { ...appHints(sc), manualTaps: { cue: { x: cue.x + off, y: cue.y - off }, target: { x: tgt.x - off, y: tgt.y + off } } });
+        expect(manual.ok, `${sc.name} (taps): ${manual.reason}`).toBe(true);
+        expect(errorsOf(sc, manual.pose!).ghost).toBeLessThan(0.025);
+      }
+    });
 });

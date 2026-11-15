@@ -17,6 +17,9 @@
 import { hueDiff, rgbToHsv, type Frame } from './image';
 import { HUE_TOL, isCloth, type ClothModel } from './table-detect';
 
+/** √(x² + y²): Math.hypot's overflow care is not needed here and it is slow in hot loops. */
+const hyp2 = (x: number, y: number) => Math.sqrt(x * x + y * y);
+
 // ---------------------------------------------------------------------------------------------------
 // Scratch
 // ---------------------------------------------------------------------------------------------------
@@ -82,6 +85,59 @@ const satHist = new Float64Array(101);
 const valHist = new Float64Array(101);
 const hsvTmp = [0, 0, 0];
 
+/**
+ * The photo's coarse sample grid (≈ 320 samples across the long side) in HSV, computed once per photo
+ * and shared by every cloth statistic and structure score (module-level, grown on demand).
+ */
+interface Grid {
+  gw: number;
+  gh: number;
+  H: Float32Array;
+  S: Float32Array;
+  V: Float32Array;
+}
+const grid: Grid = { gw: 0, gh: 0, H: new Float32Array(0), S: new Float32Array(0), V: new Float32Array(0) };
+
+function sampleGrid(frame: Frame): Grid {
+  const { width: w, height: h, data } = frame;
+  const st = strideOf(w, h);
+  const gw = Math.floor(w / st);
+  const gh = Math.floor(h / st);
+  const n = gw * gh;
+  if (grid.H.length < n) {
+    grid.H = new Float32Array(n);
+    grid.S = new Float32Array(n);
+    grid.V = new Float32Array(n);
+  }
+  grid.gw = gw;
+  grid.gh = gh;
+  // Each cell is the mean of its st × st block (a proper downsample, not a point sample): sensor noise
+  // drops by a factor st, so at σ 6–8 a noisy cloth still reads as one colour mode with clean holes,
+  // instead of losing its share and its structure to speckle (the green cloth sliver of a photo from
+  // 10 cm up then did not even make the candidate list).
+  const inv = 1 / (st * st);
+  for (let gy = 0; gy < gh; gy++)
+    for (let gx = 0; gx < gw; gx++) {
+      let r = 0;
+      let gg = 0;
+      let b = 0;
+      for (let dy = 0; dy < st; dy++) {
+        let i = ((gy * st + dy) * w + gx * st) * 4;
+        for (let dx = 0; dx < st; dx++, i += 4) {
+          r += data[i]!;
+          gg += data[i + 1]!;
+          b += data[i + 2]!;
+        }
+      }
+      rgbToHsv(r * inv, gg * inv, b * inv, hsvTmp);
+      const g = gy * gw + gx;
+      grid.H[g] = hsvTmp[0]!;
+      grid.S[g] = hsvTmp[1]!;
+      grid.V[g] = hsvTmp[2]!;
+    }
+  return grid;
+}
+
 export interface PhotoCloth {
   /** Cloth models to try, most plausible first (empty when the photo shows no candidate surface). */
   models: ClothModel[];
@@ -113,27 +169,26 @@ const histMedian = (hist: Float64Array, cnt: number) => histQuantile(hist, cnt, 
 const strideOf = (w: number, h: number) => Math.max(2, Math.round(Math.max(w, h) / 320));
 
 /** Chromatic model around hue `centre` (±20°): circular-mean hue and median S, V; null if too rare. */
-function chromaticModel(frame: Frame, centre: number, minCount: number): ClothModel | null {
-  const { width: w, height: h, data } = frame;
-  const st = strideOf(w, h);
+function chromaticModel(g: Grid, centre: number, minCount: number): ClothModel | null {
   satHist.fill(0);
   valHist.fill(0);
   let sx = 0;
   let sy = 0;
   let cnt = 0;
-  for (let y = st >> 1; y < h; y += st)
-    for (let x = st >> 1; x < w; x += st) {
-      const i = (y * w + x) * 4;
-      rgbToHsv(data[i]!, data[i + 1]!, data[i + 2]!, hsvTmp);
-      if (hsvTmp[1]! > SAT_S && hsvTmp[2]! > SAT_V && hueDiff(hsvTmp[0]!, centre) < 20) {
-        const a = (hsvTmp[0]! * Math.PI) / 180;
-        sx += Math.cos(a);
-        sy += Math.sin(a);
-        satHist[Math.round(hsvTmp[1]! * 100)]! += 1;
-        valHist[Math.round(hsvTmp[2]! * 100)]! += 1;
-        cnt++;
-      }
+  const n = g.gw * g.gh;
+  for (let i = 0; i < n; i++) {
+    const hh = g.H[i]!;
+    const ss = g.S[i]!;
+    const vv = g.V[i]!;
+    if (ss > SAT_S && vv > SAT_V && hueDiff(hh, centre) < 20) {
+      const a = (hh * Math.PI) / 180;
+      sx += Math.cos(a);
+      sy += Math.sin(a);
+      satHist[Math.round(ss * 100)]! += 1;
+      valHist[Math.round(vv * 100)]! += 1;
+      cnt++;
     }
+  }
   if (cnt < minCount) return null;
   let hue = (Math.atan2(sy, sx) * 180) / Math.PI;
   if (hue < 0) hue += 360;
@@ -147,24 +202,20 @@ function chromaticModel(frame: Frame, centre: number, minCount: number): ClothMo
  * the median down to ≈ 0.8 of the lit level, which would put the brightest cloth outside the band (as
  * spurious "white balls"); the 75th percentile sits at the lit level, and shadows (≈ 0.55×) stay inside.
  */
-function neutralModel(frame: Frame, v0: number, minCount: number): ClothModel | null {
-  const { width: w, height: h, data } = frame;
-  const st = strideOf(w, h);
+function neutralModel(g: Grid, v0: number, minCount: number): ClothModel | null {
   satHist.fill(0);
   valHist.fill(0);
   let cnt = 0;
-  for (let y = st >> 1; y < h; y += st)
-    for (let x = st >> 1; x < w; x += st) {
-      const i = (y * w + x) * 4;
-      rgbToHsv(data[i]!, data[i + 1]!, data[i + 2]!, hsvTmp);
-      const s = hsvTmp[1]!;
-      const v = hsvTmp[2]!;
-      if (s < GREY_S && v > GREY_V0 && v < GREY_V1 && v > 0.7 * v0 && v < 1.4 * v0) {
-        satHist[Math.round(s * 100)]! += 1;
-        valHist[Math.round(v * 100)]! += 1;
-        cnt++;
-      }
+  const n = g.gw * g.gh;
+  for (let i = 0; i < n; i++) {
+    const s = g.S[i]!;
+    const v = g.V[i]!;
+    if (s < GREY_S && v > GREY_V0 && v < GREY_V1 && v > 0.7 * v0 && v < 1.4 * v0) {
+      satHist[Math.round(s * 100)]! += 1;
+      valHist[Math.round(v * 100)]! += 1;
+      cnt++;
     }
+  }
   if (cnt < minCount) return null;
   return { hue: 0, sat: histMedian(satHist, cnt), val: histQuantile(valHist, cnt, 0.75), kind: 'neutral' };
 }
@@ -200,18 +251,11 @@ export function clothTest(r: number, g: number, b: number, m: ClothModel): boole
  * break, discounted by speckle. Balls and pocket holes make holes in the cloth; a rail band, a floor or
  * a wall has (almost) none, however large it is.
  */
-function structureScore(frame: Frame, m: ClothModel, sc: Scratch): { score: number; enclosed: number } {
-  const { width: w, height: h, data } = frame;
-  const st = strideOf(w, h);
-  const gw = Math.floor(w / st);
-  const gh = Math.floor(h / st);
+function structureScore(g: Grid, m: ClothModel, sc: Scratch): { score: number; enclosed: number } {
+  const { gw, gh } = g;
   const n = gw * gh;
   const { mask, label, queue } = sc;
-  for (let gy = 0; gy < gh; gy++)
-    for (let gx = 0; gx < gw; gx++) {
-      const i = ((gy * st + (st >> 1)) * w + gx * st + (st >> 1)) * 4;
-      mask[gy * gw + gx] = clothTest(data[i]!, data[i + 1]!, data[i + 2]!, m) ? 1 : 0;
-    }
+  for (let i = 0; i < n; i++) mask[i] = isCloth(g.H[i]!, g.S[i]!, g.V[i]!, m) ? 1 : 0;
   // Cloth components; the main region is the largest and every comparable one (≥ 25 % of it, ≥ 1 % of
   // the frame), as in buildEvidence: a dark room of the same grey must not hide the cloth below it.
   label.fill(0, 0, n);
@@ -314,25 +358,20 @@ function structureScore(frame: Frame, m: ClothModel, sc: Scratch): { score: numb
  * within 25° of its hue (re-estimated in this photo: exposure and white balance differ between photos).
  */
 export function learnPlayerCloth(frame: Frame, hint: ClothModel | null | undefined, sc: Scratch): PhotoCloth {
-  const { width: w, height: h, data } = frame;
-  const st = strideOf(w, h);
+  const g = sampleGrid(frame);
   hueBins.fill(0);
   greyBins.fill(0);
-  let n = 0;
+  const n = g.gw * g.gh;
   let vSum = 0;
   let dark = 0;
-  for (let y = st >> 1; y < h; y += st)
-    for (let x = st >> 1; x < w; x += st) {
-      const i = (y * w + x) * 4;
-      rgbToHsv(data[i]!, data[i + 1]!, data[i + 2]!, hsvTmp);
-      const s = hsvTmp[1]!;
-      const v = hsvTmp[2]!;
-      n++;
-      vSum += v;
-      if (v < SAT_V) dark++;
-      if (s > SAT_S && v > SAT_V) hueBins[Math.min(35, Math.floor(hsvTmp[0]! / 10))]! += 1;
-      else if (s < GREY_S && v > GREY_V0 && v < GREY_V1) greyBins[Math.min(63, Math.floor(v * 64))]! += 1;
-    }
+  for (let i = 0; i < n; i++) {
+    const s = g.S[i]!;
+    const v = g.V[i]!;
+    vSum += v;
+    if (v < SAT_V) dark++;
+    if (s > SAT_S && v > SAT_V) hueBins[Math.min(35, Math.floor(g.H[i]! / 10))]! += 1;
+    else if (s < GREY_S && v > GREY_V0 && v < GREY_V1) greyBins[Math.min(63, Math.floor(v * 64))]! += 1;
+  }
   const meanV = n ? vSum / n : 0;
   const darkFrac = n ? dark / n : 1;
   const minCount = MIN_CANDIDATE_SHARE * n;
@@ -349,7 +388,7 @@ export function learnPlayerCloth(frame: Frame, hint: ClothModel | null | undefin
     }
     if (mb < 0) break;
     takenHue.push(mb);
-    const m = chromaticModel(frame, mb * 10 + 5, minCount);
+    const m = chromaticModel(g, mb * 10 + 5, minCount);
     if (m && m.val >= SAT_V) found.push({ m, score: 0, enclosed: 0, hinted: false });
   }
   // Grey value modes (5-bin windows), at least a factor 1.5 apart.
@@ -370,12 +409,12 @@ export function learnPlayerCloth(frame: Frame, hint: ClothModel | null | undefin
     if (mb < 0) break;
     const v0 = (mb + 0.5) / 64;
     takenGrey.push(v0);
-    const m = neutralModel(frame, v0, minCount);
+    const m = neutralModel(g, v0, minCount);
     if (m) found.push({ m, score: 0, enclosed: 0, hinted: false });
   }
   if (!found.length) return { models: [], enclosed: [], scores: [], meanV, darkFrac };
   for (const f of found) {
-    const st = structureScore(frame, f.m, sc);
+    const st = structureScore(g, f.m, sc);
     f.score = st.score;
     f.enclosed = st.enclosed;
   }
@@ -455,6 +494,9 @@ export function solveN(A: Float64Array, b: Float64Array, n: number): Float64Arra
 // ---------------------------------------------------------------------------------------------------
 // Evidence: cloth mask, non-cloth components, cloth-boundary cracks
 // ---------------------------------------------------------------------------------------------------
+
+/** Non-cloth specks inside the cloth below this area (px) are noise (findCandidates needs ≥ 12 px). */
+const SPECK_AREA = 10;
 
 /** Mask (0/1), main cloth region (2), non-cloth components and cloth-boundary cracks. */
 export function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { nCracks: number; comps: Comp[]; mainArea: number } {
@@ -592,6 +634,28 @@ export function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { n
     }
     comps.push({ area: tail, minX, maxX, minY, maxY });
   }
+  // Sensor-noise speckle: non-cloth specks inside the cloth smaller than any ball circle the detector
+  // can fit (SPECK_AREA) are the cloth's own noisy pixels, not objects; left in, every speck adds four
+  // cracks that no model element explains (noise σ 6 on a shaded cloth: thousands). Area opening: they
+  // join the cloth (frame-edge specks may be cut-off objects and stay).
+  let specks = 0;
+  for (let id = 1; id < comps.length; id++) {
+    const cp = comps[id]!;
+    if (cp.area < SPECK_AREA && cp.minX > 0 && cp.minY > 0 && cp.maxX < w - 1 && cp.maxY < h - 1) {
+      cp.area = -cp.area;
+      specks++;
+    }
+  }
+  if (specks)
+    for (let i = 0; i < n; i++) {
+      const l = label[i]!;
+      if (l > 0 && comps[l]!.area < 0) {
+        mask[i] = 2;
+        label[i] = 0;
+        mainArea++;
+      }
+    }
+  for (let id = 1; id < comps.length; id++) if (comps[id]!.area < 0) comps[id]!.area = 0;
   // Cracks: unit edges between a main-cloth pixel and a non-cloth pixel, at the shared pixel border.
   const { crackX, crackY, crackL } = sc;
   let nc = 0;
@@ -623,6 +687,40 @@ export function buildEvidence(frame: Frame, cloth: ClothModel, sc: Scratch): { n
     }
   }
   return { nCracks: nc, comps, mainArea };
+}
+
+/** |ΔG| histogram of clothNoise (module-level scratch). */
+const dHist = new Uint32Array(256);
+
+/**
+ * Sensor noise of the photo (σ, 0–255 levels), read off the main cloth region after buildEvidence: the
+ * median absolute difference of the green channel between horizontally adjacent cloth pixels, over
+ * 0.954 (the median of |N(0, σ)·√2|). A lit cloth is smooth (its shading changes by < 1 level per
+ * pixel), so this is the noise, not the scene. NaN when too little cloth is in view.
+ */
+export function clothNoise(frame: Frame, sc: Scratch): number {
+  const { w, h, mask } = sc;
+  const d = frame.data;
+  dHist.fill(0);
+  let n = 0;
+  for (let y = 0; y < h; y += 2)
+    for (let x = 0; x + 1 < w; x++) {
+      const i = y * w + x;
+      if (mask[i] !== 2 || mask[i + 1] !== 2) continue;
+      dHist[Math.abs(d[i * 4 + 1]! - d[i * 4 + 5]!)]! += 1;
+      n++;
+    }
+  if (n < 200) return NaN;
+  let acc = 0;
+  for (let k = 0; k < 256; k++) {
+    acc += dHist[k]!;
+    if (acc >= 0.5 * n) {
+      // Interpolate within the bin (|Δ| is an integer: bin k holds [k, k + 1)).
+      const below = acc - dHist[k]!;
+      return (k + (0.5 * n - below) / Math.max(1, dHist[k]!)) / 0.954;
+    }
+  }
+  return NaN;
 }
 
 export interface Comp {
@@ -754,7 +852,7 @@ function refineCircle(X: Float32Array, Y: Float32Array, idx: Int32Array, n: numb
     for (let q = 0; q < n; q++) {
       const dx = X[idx[q]!]! - a;
       const dy = Y[idx[q]!]! - b;
-      const d = Math.hypot(dx, dy) || 1e-9;
+      const d = hyp2(dx, dy) || 1e-9;
       const res = d - r;
       const j0 = -dx / d;
       const j1 = -dy / d;
@@ -871,7 +969,7 @@ function localCircles(X: Float32Array, Y: Float32Array, pts: Int32Array, n: numb
       const c = kasa(X, Y, near, nNear);
       if (!c || c.r < Math.max(rMin, 0.45 * rho) || c.r > Math.min(rLimit, 2.5 * rho)) continue;
       let e2 = 0;
-      for (let k = 0; k < nNear; k++) e2 += (Math.hypot(X[near[k]!]! - c.x, Y[near[k]!]! - c.y) - c.r) ** 2;
+      for (let k = 0; k < nNear; k++) e2 += (hyp2(X[near[k]!]! - c.x, Y[near[k]!]! - c.y) - c.r) ** 2;
       const rms = Math.sqrt(e2 / nNear);
       if (rms > 0.6 + 0.03 * c.r || coverage(X, Y, near, nNear, c.x, c.y) < 50) continue;
       prop.push(c.x, c.y, c.r, nNear / (rms + 0.3));
@@ -930,13 +1028,13 @@ function localCircles(X: Float32Array, Y: Float32Array, pts: Int32Array, n: numb
     const r = acc[c + 3]! / acc[c + 4]!;
     let dup = false;
     // tried: (x, y, r, tolerance) — 30 % around a verified circle, 10 % around a rejected proposal.
-    for (let t = 0; t < tried.length && !dup; t += 4) if (Math.hypot(tried[t]! - ux, tried[t + 1]! - uy) < tried[t + 3]! * tried[t + 2]! && Math.abs(tried[t + 2]! - r) < tried[t + 3]! * tried[t + 2]!) dup = true;
+    for (let t = 0; t < tried.length && !dup; t += 4) if (hyp2(tried[t]! - ux, tried[t + 1]! - uy) < tried[t + 3]! * tried[t + 2]! && Math.abs(tried[t + 2]! - r) < tried[t + 3]! * tried[t + 2]!) dup = true;
     if (dup) continue;
     tried.push(ux, uy, r, 0.1);
     gather(ux, uy, r + 3);
     const tol = Math.max(1.0, 0.06 * r);
     let m = 0;
-    for (let k = 0; k < nNear; k++) if (Math.abs(Math.hypot(X[near[k]!]! - ux, Y[near[k]!]! - uy) - r) < tol) idx[m++] = near[k]!;
+    for (let k = 0; k < nNear; k++) if (Math.abs(hyp2(X[near[k]!]! - ux, Y[near[k]!]! - uy) - r) < tol) idx[m++] = near[k]!;
     if (m < 10) continue;
     const cov = coverage(X, Y, idx, m, ux, uy);
     if (cov < LOCAL_MIN_ARC || m < 0.5 * 1.27 * r * ((cov * Math.PI) / 180)) continue;
@@ -948,20 +1046,20 @@ function localCircles(X: Float32Array, Y: Float32Array, pts: Int32Array, n: numb
     gather(fit.x, fit.y, fit.r + 3);
     const tol2 = Math.max(1.0, 0.06 * fit.r);
     let m2 = 0;
-    for (let k = 0; k < nNear; k++) if (Math.abs(Math.hypot(X[near[k]!]! - fit.x, Y[near[k]!]! - fit.y) - fit.r) < tol2) idx[m2++] = near[k]!;
+    for (let k = 0; k < nNear; k++) if (Math.abs(hyp2(X[near[k]!]! - fit.x, Y[near[k]!]! - fit.y) - fit.r) < tol2) idx[m2++] = near[k]!;
     const cov2 = coverage(X, Y, idx, m2, fit.x, fit.y);
     if (cov2 < LOCAL_MIN_ARC || m2 < 0.5 * 1.27 * fit.r * ((cov2 * Math.PI) / 180)) continue;
     // Rank by support within a tight band: the 6 %·r band lets a too-large circle through the arcs of two
     // touching balls collect more points than either ball's true circle, the tight band does not.
     const tolT = Math.max(1.0, 0.025 * fit.r);
     let tight = 0;
-    for (let k = 0; k < m2; k++) if (Math.abs(Math.hypot(X[idx[k]!]! - fit.x, Y[idx[k]!]! - fit.y) - fit.r) < tolT) tight++;
+    for (let k = 0; k < m2; k++) if (Math.abs(hyp2(X[idx[k]!]! - fit.x, Y[idx[k]!]! - fit.y) - fit.r) < tolT) tight++;
     hits.push({ c: fit, tight, cov: cov2 });
     tried.push(fit.x, fit.y, fit.r, 0.3);
   }
   hits.sort((p, q) => q.tight - p.tight);
   const out: { c: Circle; cov: number }[] = [];
-  for (const hh of hits) if (out.every((o) => Math.hypot(o.c.x - hh.c.x, o.c.y - hh.c.y) > 0.8 * Math.max(o.c.r, hh.c.r))) out.push({ c: hh.c, cov: hh.cov });
+  for (const hh of hits) if (out.every((o) => hyp2(o.c.x - hh.c.x, o.c.y - hh.c.y) > 0.8 * Math.max(o.c.r, hh.c.r))) out.push({ c: hh.c, cov: hh.cov });
   return out;
 }
 
@@ -972,20 +1070,92 @@ const isLargeBlob = (cp: Comp, w: number, h: number) => cp.area > 0.2 * w * h ||
 const BIG_BALL = 0.2;
 
 /**
- * Circles in the cloth-bordered boundary of each compact non-cloth blob: one Kåsa fit when it explains
- * the blob, else deterministic RANSAC that peels off up to four circles (balls overlapping in depth).
+ * Exposure of a photo relative to the nominal one the colour thresholds (dark, white) were set on. It is
+ * read off the balls, not the cloth: a light-blue or pale-green cloth is not an over-exposed photo (a
+ * cloth-based scale took the cloth's albedo for exposure, raised the thresholds and lost the cue ball on
+ * light cloths). The brightest part of the brightest ball circle — the lit side of the white cue ball,
+ * or a specular highlight on any ball — sits near the top of the range in a well-exposed photo
+ * (V ≈ BRIGHT_NOMINAL) and scales with exposure in an under-exposed one, whatever the cloth. Scaled
+ * thresholds only ever go down (an under-exposed photo darkens the shaded side of the white cue ball
+ * below the nominal "white" threshold); over-exposure clips the brightest ball at V = 1 and needs none.
  */
-/**
- * Exposure of a photo relative to the nominal one the colour thresholds (dark, white) were set on, read
- * off the cloth — the surface under the same light: its lit value over NOMINAL_CLOTH_V, within
- * [0.6, 1.4]. ASSUMPTION (synthetic renders): a lit cloth reads V ≈ 0.45–0.5 at nominal exposure; an
- * under-exposed photo (×0.7) darkens the shaded side of the white cue ball below the fixed "white"
- * threshold, and it was lost (noCue) in 83 % of the envelope scenes.
- */
-export const exposureScale = (cloth: ClothModel) => Math.max(0.6, Math.min(1.4, cloth.val / NOMINAL_CLOTH_V));
-const NOMINAL_CLOTH_V = 0.47;
+export const exposureOf = (brightV: number) => Math.max(MIN_EXPOSURE, Math.min(1, brightV / BRIGHT_NOMINAL));
+/** V of the brightest 10 % of the brightest ball circle at nominal exposure (lit white ball / highlight). */
+const BRIGHT_NOMINAL = 0.9;
+const MIN_EXPOSURE = 0.5;
 
-export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks: number, vScale = 1): Candidate[] {
+/** Per-circle V histogram (64 bins) for the brightest-part estimate (module-level scratch). */
+const vHist = new Uint32Array(64);
+
+/** Crack colour classes: 0 dark, 1 white, 2–7 hue sextants (findCandidates' colour split). */
+const N_CLS = 8;
+const clsCount = new Int32Array(N_CLS);
+let crackCls = new Int8Array(1024);
+const clsHsv = [0, 0, 0];
+
+/**
+ * Colour class of the blob pixel two pixels inside crack q (away from the cloth pixel it borders; the
+ * pixel on the crack itself mixes with the cloth), or −1 when that pixel is not blob k's.
+ */
+function crackClass(frame: Frame, sc: Scratch, q: number, k: number): number {
+  const { w, h, mask, label, crackX, crackY } = sc;
+  const cx = crackX[q]!;
+  const cy = crackY[q]!;
+  let x: number;
+  let y: number;
+  let dx = 0;
+  let dy = 0;
+  if (Number.isInteger(cx)) {
+    // Vertical edge between pixels (cx − 1, y) and (cx, y).
+    y = Math.floor(cy);
+    const left = cx - 1;
+    if (left >= 0 && mask[y * w + left] !== 2) {
+      x = left;
+      dx = -1;
+    } else {
+      x = cx;
+      dx = 1;
+    }
+  } else {
+    x = Math.floor(cx);
+    const up = cy - 1;
+    if (up >= 0 && mask[up * w + x] !== 2) {
+      y = up;
+      dy = -1;
+    } else {
+      y = cy;
+      dy = 1;
+    }
+  }
+  for (let step = 2; step >= 0; step--) {
+    const xx = x + dx * step;
+    const yy = y + dy * step;
+    if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+    const i = yy * w + xx;
+    if (label[i] !== k || mask[i] === 2) continue;
+    const d = frame.data;
+    rgbToHsv(d[i * 4]!, d[i * 4 + 1]!, d[i * 4 + 2]!, clsHsv);
+    if (clsHsv[2]! < 0.2) return 0;
+    if (clsHsv[1]! < 0.25) return 1;
+    return 2 + (Math.floor((clsHsv[0]! + 30) / 60) % 6);
+  }
+  return -1;
+}
+
+/** Extra output of findCandidates. */
+export interface CandidateInfo {
+  /** The photo's exposure relative to nominal (exposureOf), as used for the colour thresholds. */
+  exposure: number;
+}
+
+/**
+ * Circles in the cloth-bordered boundary of each compact non-cloth blob: one Kåsa fit when it explains
+ * the blob, else deterministic RANSAC that peels off up to four circles (balls overlapping in depth);
+ * local-arc proposals on large blobs. Each circle's colour comes from its own blob's pixels inside 0.8 r
+ * that no nearer circle covers: of two equal balls overlapping in the image the nearer has the larger
+ * image radius, and the overlap is its surface (a red ball in front of the cue ball must not tint it).
+ */
+export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks: number, opts: { info?: CandidateInfo } = {}): Candidate[] {
   const { w, h, crackX, crackY, crackL, mask, label } = sc;
   const nComp = comps.length;
   const start = new Int32Array(nComp + 1);
@@ -1000,7 +1170,8 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
   const pts = new Int32Array(Math.max(16, nCracks));
   const inl = new Int32Array(Math.max(16, nCracks));
   const hsv = [0, 0, 0];
-  const acc = new ColourAcc(vScale);
+  const raw: { c: Circle; cov: number; k: number }[] = [];
+  if (crackCls.length < nCracks) crackCls = new Int8Array(nCracks);
   for (let k = 1; k < nComp; k++) {
     const cp = comps[k]!;
     const n0 = start[k + 1]! - start[k]!;
@@ -1010,7 +1181,7 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
     // A circle with a cloth-bordered arc of ≥ 120° has a chord ≥ √3·r inside the blob, so r ≤ diag/√3
     // (diag/1.5 leaves slack for the arc's blur). Without this cap, RANSAC on a blob of two touching
     // balls prefers a huge circle whose 6 %·r tolerance band swallows most of the blob.
-    const rBlob = Math.min(rMax, Math.max(4, Math.hypot(cp.maxX - cp.minX + 1, cp.maxY - cp.minY + 1) / 1.5));
+    const rBlob = Math.min(rMax, Math.max(4, hyp2(cp.maxX - cp.minX + 1, cp.maxY - cp.minY + 1) / 1.5));
     const circles: { c: Circle; cov: number }[] = [];
     if (isLargeBlob(cp, w, h)) {
       // A large blob (rail, floor, background): balls touching it from the cloth side show up as arcs
@@ -1025,78 +1196,218 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
       return seed % m;
     };
     const tolOf = (r: number) => Math.max(1.0, 0.06 * r);
-    const countIn = (c: Circle) => {
-      const tol = tolOf(c.r);
-      let m = 0;
-      for (let q = 0; q < n; q++) if (Math.abs(Math.hypot(crackX[pts[q]!]! - c.x, crackY[pts[q]!]! - c.y) - c.r) < tol) m++;
-      return m;
-    };
-    for (let round = 0; round < 4 && n >= 10; round++) {
-      let best: Circle | null = null;
-      let bestIn = 0;
-      const all = kasa(crackX, crackY, pts, n);
-      if (all && all.r >= 2.5 && all.r <= rBlob) {
-        best = all;
-        bestIn = countIn(all);
-      }
-      if (!best || bestIn < 0.9 * n) {
-        const iters = Math.min(250, 20 + n);
-        for (let it = 0; it < iters; it++) {
-          const a = pts[rand(n)]!;
-          const b = pts[rand(n)]!;
-          const c = pts[rand(n)]!;
-          const ax = crackX[a]!;
-          const ay = crackY[a]!;
-          const bx = crackX[b]!;
-          const by = crackY[b]!;
-          const cx2 = crackX[c]!;
-          const cy2 = crackY[c]!;
-          const d = 2 * (ax * (by - cy2) + bx * (cy2 - ay) + cx2 * (ay - by));
-          if (Math.abs(d) < 1e-6) continue;
-          const a2 = ax * ax + ay * ay;
-          const b2 = bx * bx + by * by;
-          const c2 = cx2 * cx2 + cy2 * cy2;
-          const ux = (a2 * (by - cy2) + b2 * (cy2 - ay) + c2 * (ay - by)) / d;
-          const uy = (a2 * (cx2 - bx) + b2 * (ax - cx2) + c2 * (bx - ax)) / d;
-          const r = Math.hypot(ax - ux, ay - uy);
-          if (r < 2.5 || r > rBlob) continue;
-          const cand = { x: ux, y: uy, r };
-          const m = countIn(cand);
-          if (m > bestIn) {
-            bestIn = m;
-            best = cand;
+    // Deterministic RANSAC that peels up to four circles off the cracks pts[0..n), radius ≤ rLim.
+    const peel = (n: number, rLim: number, out: { c: Circle; cov: number }[]) => {
+      const countIn = (c: Circle) => {
+        const tol = tolOf(c.r);
+        let m = 0;
+        for (let q = 0; q < n; q++) if (Math.abs(hyp2(crackX[pts[q]!]! - c.x, crackY[pts[q]!]! - c.y) - c.r) < tol) m++;
+        return m;
+      };
+      for (let round = 0; round < 4 && n >= 10; round++) {
+        let best: Circle | null = null;
+        let bestIn = 0;
+        const all = kasa(crackX, crackY, pts, n);
+        if (all && all.r >= 2.5 && all.r <= rLim) {
+          best = all;
+          bestIn = countIn(all);
+        }
+        if (!best || bestIn < 0.9 * n) {
+          const iters = Math.min(250, 20 + n);
+          for (let it = 0; it < iters; it++) {
+            const a = pts[rand(n)]!;
+            const b = pts[rand(n)]!;
+            const c = pts[rand(n)]!;
+            const ax = crackX[a]!;
+            const ay = crackY[a]!;
+            const bx = crackX[b]!;
+            const by = crackY[b]!;
+            const cx2 = crackX[c]!;
+            const cy2 = crackY[c]!;
+            const d = 2 * (ax * (by - cy2) + bx * (cy2 - ay) + cx2 * (ay - by));
+            if (Math.abs(d) < 1e-6) continue;
+            const a2 = ax * ax + ay * ay;
+            const b2 = bx * bx + by * by;
+            const c2 = cx2 * cx2 + cy2 * cy2;
+            const ux = (a2 * (by - cy2) + b2 * (cy2 - ay) + c2 * (ay - by)) / d;
+            const uy = (a2 * (cx2 - bx) + b2 * (ax - cx2) + c2 * (bx - ax)) / d;
+            const r = hyp2(ax - ux, ay - uy);
+            if (r < 2.5 || r > rLim) continue;
+            const cand = { x: ux, y: uy, r };
+            const m = countIn(cand);
+            if (m > bestIn) {
+              bestIn = m;
+              best = cand;
+            }
           }
         }
-      }
-      if (!best) break;
-      // Refine on the inliers (repeatedly: the inlier set grows as the fit improves).
-      let fit: Circle = best;
-      let ni = 0;
-      for (let pass = 0; pass < 3; pass++) {
+        if (!best) break;
+        // Refine on the inliers (repeatedly: the inlier set grows as the fit improves).
+        let fit: Circle = best;
+        let ni = 0;
+        for (let pass = 0; pass < 3; pass++) {
+          const tol = 1.5 * tolOf(fit.r);
+          let m = 0;
+          for (let q = 0; q < n; q++) if (Math.abs(hyp2(crackX[pts[q]!]! - fit.x, crackY[pts[q]!]! - fit.y) - fit.r) < tol) inl[m++] = pts[q]!;
+          if (m < 8) break;
+          const k2 = kasa(crackX, crackY, inl, m);
+          if (!k2) break;
+          const g2 = refineCircle(crackX, crackY, inl, m, k2);
+          if (!(g2.r >= 2.5 && g2.r <= rLim)) break;
+          fit = g2;
+          ni = m;
+        }
+        if (ni < 8) break;
+        const cov = coverage(crackX, crackY, inl, ni, fit.x, fit.y);
+        const expected = 1.27 * fit.r * ((cov * Math.PI) / 180);
+        if (cov >= 120 && ni >= Math.max(8, 0.45 * expected)) out.push({ c: fit, cov });
+        // Remove this circle's points and look for the next one in the rest of the blob.
         const tol = 1.5 * tolOf(fit.r);
         let m = 0;
-        for (let q = 0; q < n; q++) if (Math.abs(Math.hypot(crackX[pts[q]!]! - fit.x, crackY[pts[q]!]! - fit.y) - fit.r) < tol) inl[m++] = pts[q]!;
-        if (m < 8) break;
-        const k2 = kasa(crackX, crackY, inl, m);
-        if (!k2) break;
-        const g2 = refineCircle(crackX, crackY, inl, m, k2);
-        if (!(g2.r >= 2.5 && g2.r <= rBlob)) break;
-        fit = g2;
-        ni = m;
+        for (let q = 0; q < n; q++) if (!(Math.abs(hyp2(crackX[pts[q]!]! - fit.x, crackY[pts[q]!]! - fit.y) - fit.r) < tol)) pts[m++] = pts[q]!;
+        if (m === n) break;
+        n = m;
       }
-      if (ni < 8) break;
-      const cov = coverage(crackX, crackY, inl, ni, fit.x, fit.y);
-      const expected = 1.27 * fit.r * ((cov * Math.PI) / 180);
-      if (cov >= 120 && ni >= Math.max(8, 0.45 * expected)) circles.push({ c: fit, cov });
-      // Remove this circle's points and look for the next one in the rest of the blob.
-      const tol = 1.5 * tolOf(fit.r);
-      let m = 0;
-      for (let q = 0; q < n; q++) if (!(Math.abs(Math.hypot(crackX[pts[q]!]! - fit.x, crackY[pts[q]!]! - fit.y) - fit.r) < tol)) pts[m++] = pts[q]!;
-      if (m === n) break;
-      n = m;
+    };
+    if (n >= 10) {
+      peel(n, rBlob, circles);
+      // Balls of different colours that touch in the image (a red ball in front of the cue ball) form one
+      // blob whose outline no single circle fits, and the whole-blob fit can be a large circle around
+      // the pair. Each crack's colour class (the blob pixel just inside it: dark, white or a hue sextant)
+      // tells the balls apart: every class with an arc of its own is peeled on its own cracks too, with
+      // the radius cap of its own extent.
+      let nCls = 0;
+      clsCount.fill(0);
+      for (let q = 0; q < n0; q++) {
+        const cl = crackClass(frame, sc, order[start[k]! + q]!, k);
+        crackCls[q] = cl;
+        if (cl >= 0 && clsCount[cl]!++ === 9) nCls++;
+      }
+      if (nCls >= 2)
+        for (let cl = 0; cl < N_CLS; cl++) {
+          if (clsCount[cl]! < 10) continue;
+          let m = 0;
+          let bx0 = Infinity;
+          let bx1 = -Infinity;
+          let by0 = Infinity;
+          let by1 = -Infinity;
+          for (let q = 0; q < n0; q++) {
+            if (crackCls[q] !== cl) continue;
+            const id = order[start[k]! + q]!;
+            pts[m++] = id;
+            bx0 = Math.min(bx0, crackX[id]!);
+            bx1 = Math.max(bx1, crackX[id]!);
+            by0 = Math.min(by0, crackY[id]!);
+            by1 = Math.max(by1, crackY[id]!);
+          }
+          const sub: { c: Circle; cov: number }[] = [];
+          peel(m, Math.min(rBlob, Math.max(4, hyp2(bx1 - bx0 + 1, by1 - by0 + 1) / 1.5)), sub);
+          for (const cc of sub)
+            if (circles.every((o) => hyp2(o.c.x - cc.c.x, o.c.y - cc.c.y) > 0.3 * Math.max(o.c.r, cc.c.r) || Math.abs(o.c.r - cc.c.r) > 0.25 * Math.max(o.c.r, cc.c.r))) circles.push(cc);
+        }
     }
-    for (const { c, cov } of circles) {
-      // Mean colour and colour descriptor of this blob's pixels inside 0.8 r.
+    for (const { c, cov } of circles) raw.push({ c, cov, k });
+  }
+  // Sectors (10°) of each circle where it borders the cloth (its inlier cracks, ± one sector). Where it
+  // does not, something else is in front of it or beside it — a nearer ball whose circle was not found,
+  // the rail, the frame edge — so its pixels there may not be this ball's.
+  const sectors = new Uint8Array(raw.length * 36);
+  for (let q = 0; q < raw.length; q++) {
+    const { c, k } = raw[q]!;
+    const tol = 1.5 * Math.max(1.0, 0.06 * c.r);
+    for (let t = start[k]!; t < start[k + 1]!; t++) {
+      const id = order[t]!;
+      const dx = crackX[id]! - c.x;
+      const dy = crackY[id]! - c.y;
+      if (Math.abs(Math.sqrt(dx * dx + dy * dy) - c.r) >= tol) continue;
+      const b = Math.min(35, Math.floor(((Math.atan2(dy, dx) + Math.PI) / (2 * Math.PI)) * 36));
+      sectors[q * 36 + b] = 1;
+      sectors[q * 36 + ((b + 1) % 36)] = 1;
+      sectors[q * 36 + ((b + 35) % 36)] = 1;
+    }
+  }
+  // Is pixel (x, y) of circle q not this ball's: covered by a nearer (larger) circle of the same blob, or
+  // in a sector where the circle does not border the cloth?
+  const hidden = (q: number, x: number, y: number): boolean => {
+    const a = raw[q]!;
+    const ax = x + 0.5 - a.c.x;
+    const ay = y + 0.5 - a.c.y;
+    // Pixels near the centre are this ball's whatever is beside it.
+    if (ax * ax + ay * ay > 0.09 * a.c.r * a.c.r && !sectors[q * 36 + Math.min(35, Math.floor(((Math.atan2(ay, ax) + Math.PI) / (2 * Math.PI)) * 36))]) return true;
+    for (let o = 0; o < raw.length; o++) {
+      const b = raw[o]!;
+      if (o === q || b.k !== a.k || b.c.r <= a.c.r) continue;
+      // A circle that contains this one is no nearer ball (it would hide this one entirely).
+      if (hyp2(a.c.x - b.c.x, a.c.y - b.c.y) < b.c.r - a.c.r) continue;
+      const dx = x + 0.5 - b.c.x;
+      const dy = y + 0.5 - b.c.y;
+      if (dx * dx + dy * dy < b.c.r * b.c.r) return true;
+    }
+    return false;
+  };
+  // 1. Exposure from the brightest part of the brightest circle.
+  let brightV = 0;
+  for (let q = 0; q < raw.length; q++) {
+    const { c, k } = raw[q]!;
+    vHist.fill(0);
+    let cnt = 0;
+    const rr = 0.8 * c.r;
+    const x0 = Math.max(0, Math.floor(c.x - rr));
+    const x1 = Math.min(w - 1, Math.ceil(c.x + rr));
+    const y0 = Math.max(0, Math.floor(c.y - rr));
+    const y1 = Math.min(h - 1, Math.ceil(c.y + rr));
+    for (let y = y0; y <= y1; y++)
+      for (let x = x0; x <= x1; x++) {
+        if ((x + 0.5 - c.x) ** 2 + (y + 0.5 - c.y) ** 2 > rr * rr) continue;
+        const i = y * w + x;
+        if (mask[i] === 2 || label[i] !== k || hidden(q, x, y)) continue;
+        const d = frame.data;
+        const mx = Math.max(d[i * 4]!, d[i * 4 + 1]!, d[i * 4 + 2]!);
+        vHist[mx >> 2]! += 1;
+        cnt++;
+      }
+    if (cnt < 5) continue;
+    let accN = 0;
+    for (let b = 63; b >= 0; b--) {
+      accN += vHist[b]!;
+      if (accN >= 0.1 * cnt) {
+        brightV = Math.max(brightV, (b * 4 + 2) / 255);
+        break;
+      }
+    }
+  }
+  // …and of every compact blob (a ball whose circle was not found, e.g. one merged with its neighbour,
+  // still shows its lit side): a missed white ball must not read as an under-exposed photo.
+  for (let k = 1; k < nComp && brightV < BRIGHT_NOMINAL; k++) {
+    const cp = comps[k]!;
+    if (cp.area < 12 || isLargeBlob(cp, w, h)) continue;
+    vHist.fill(0);
+    let cnt = 0;
+    const d = frame.data;
+    for (let y = cp.minY; y <= cp.maxY; y++)
+      for (let x = cp.minX; x <= cp.maxX; x++) {
+        const i = y * w + x;
+        if (label[i] !== k || mask[i] === 2) continue;
+        vHist[Math.max(d[i * 4]!, d[i * 4 + 1]!, d[i * 4 + 2]!) >> 2]! += 1;
+        cnt++;
+      }
+    let accN = 0;
+    for (let b = 63; b >= 0; b--) {
+      accN += vHist[b]!;
+      if (accN >= 0.1 * cnt) {
+        brightV = Math.max(brightV, (b * 4 + 2) / 255);
+        break;
+      }
+    }
+  }
+  const vScale = exposureOf(brightV);
+  if (opts.info) opts.info.exposure = vScale;
+  // 2. Colour descriptors with the exposure-scaled thresholds.
+  const acc = new ColourAcc(vScale);
+  for (let q = 0; q < raw.length; q++) {
+    const { c, cov, k } = raw[q]!;
+    {
+      // Mean colour and colour descriptor of this blob's pixels inside 0.8 r that no nearer circle covers.
       let cnt = 0;
       let sr = 0;
       let sg = 0;
@@ -1114,7 +1425,7 @@ export function findCandidates(frame: Frame, sc: Scratch, comps: Comp[], nCracks
         for (let x = x0; x <= x1; x++) {
           if ((x + 0.5 - c.x) ** 2 + (y + 0.5 - c.y) ** 2 > rr * rr) continue;
           const i = y * w + x;
-          if (mask[i] === 2 || label[i] !== k) continue;
+          if (mask[i] === 2 || label[i] !== k || hidden(q, x, y)) continue;
           const R0 = frame.data[i * 4]!;
           const G0 = frame.data[i * 4 + 1]!;
           const B0 = frame.data[i * 4 + 2]!;

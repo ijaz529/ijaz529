@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeTable } from '../../../src/core/table';
 import { createFrame, rgbToHsv, type Frame } from '../../../src/vision/image';
-import { buildEvidence, clothTest, findCandidates, getScratch, learnPlayerCloth, type Candidate } from '../../../src/vision/player-detect';
+import { buildEvidence, clothNoise, clothTest, findCandidates, getScratch, learnPlayerCloth, type Candidate } from '../../../src/vision/player-detect';
 import { fixtureBalls, playerViewCamera, renderSyntheticTable, type RGB } from '../../../src/vision/synth/render';
 import { isCloth, type ClothModel } from '../../../src/vision/table-detect';
 
@@ -158,5 +158,95 @@ describe('findCandidates', () => {
     expect(near(cs, 100, 124, 6), dump).toBeDefined();
     const cue = near(cs, 300, 250, 70)!;
     expect(cue.white).toBeGreaterThan(0.15);
+  });
+});
+
+/** Flat green cloth with Gaussian sensor noise σ (deterministic). */
+function noisyCloth(w: number, h: number, sigma: number, seed = 7): Frame {
+  const f = createFrame(w, h);
+  let s = seed;
+  const gauss = () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    const u = (s + 1) / 4294967297;
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos((2 * Math.PI * s) / 4294967296);
+  };
+  for (let i = 0; i < w * h; i++) {
+    for (let c = 0; c < 3; c++) f.data[i * 4 + c] = GREEN[c]! + sigma * gauss();
+    f.data[i * 4 + 3] = 255;
+  }
+  return f;
+}
+
+/** A shaded ball: lit from the upper left (V from 1 down to `shade` of `rgb`). */
+const shaded = (rgb: RGB, cx: number, cy: number, r: number, x: number, y: number, shade = 0.45): RGB => {
+  const k = shade + (1 - shade) * Math.max(0, Math.min(1, 0.5 - (0.5 * (x - cx + (y - cy))) / (1.4 * r)));
+  return [rgb[0] * k, rgb[1] * k, rgb[2] * k];
+};
+
+describe('findCandidates colour and exposure', () => {
+  it('reads the cue ball as white when a nearer red ball covers part of it, or when no circle was found for that ball', () => {
+    // The red ball (r 40) is in front of the cue ball (r 30): their pixels form one blob. The overlap is
+    // the red ball's surface; the cue ball's colour comes from its own pixels.
+    const f = paint(W, H, (x, y) => {
+      if (Math.hypot(x - 250, y - 210) < 40) return [200, 25, 30];
+      if (Math.hypot(x - 200, y - 180) < 30) return [240, 240, 232];
+      return GREEN;
+    });
+    const cs = circlesOf(f, GREEN_MODEL);
+    const cue = near(cs, 200, 180, 30);
+    expect(cue, JSON.stringify(cs.map((c) => [Math.round(c.u), Math.round(c.v), Math.round(c.r)]))).toBeDefined();
+    expect(cue!.col.satFrac).toBeLessThan(0.1);
+    expect(cue!.col.whiteFrac).toBeGreaterThan(0.8);
+    expect(cue!.white).toBeGreaterThan(0.15);
+  });
+
+  it('takes the exposure from the brightest ball, not the cloth: a light cloth is not over-exposed', () => {
+    const LIGHT: RGB = [70, 140, 200];
+    const model: ClothModel = { hue: 207, sat: 0.65, val: 0.78, kind: 'chromatic' };
+    const scene = (gain: number) =>
+      paint(W, H, (x, y) => {
+        const c: RGB = Math.hypot(x - 240, y - 200) < 36 ? shaded([245, 245, 238], 240, 200, 36, x, y) : Math.hypot(x - 120, y - 150) < 20 ? shaded([200, 25, 30], 120, 150, 20, x, y) : LIGHT;
+        return [c[0] * gain, c[1] * gain, c[2] * gain];
+      });
+    const exposure = (gain: number) => {
+      const f = scene(gain);
+      const sc = getScratch(W, H);
+      const ev = buildEvidence(f, { ...model, val: model.val * gain }, sc);
+      const info = { exposure: 0 };
+      const cs = findCandidates(f, sc, ev.comps, ev.nCracks, { info });
+      return { e: info.exposure, cue: near(cs, 240, 200, 36) };
+    };
+    const nominal = exposure(1);
+    // Nominal (≈ 1) and never above, however bright the cloth: the light cloth does not raise it.
+    expect(nominal.e).toBeGreaterThan(0.95);
+    expect(nominal.e).toBeLessThanOrEqual(1);
+    expect(nominal.cue!.white).toBeGreaterThan(0.15); // the shaded side is still white
+    const under = exposure(0.6);
+    expect(under.e).toBeGreaterThan(0.5);
+    expect(under.e).toBeLessThan(0.75);
+    expect(under.cue!.white).toBeGreaterThan(0.15);
+  });
+});
+
+describe('sensor noise', () => {
+  it('buildEvidence drops noise speckle inside the cloth (no cracks, no circles from it)', () => {
+    const f = noisyCloth(W, H, 14);
+    const sc = getScratch(W, H);
+    const ev = buildEvidence(f, GREEN_MODEL, sc);
+    expect(ev.mainArea).toBeGreaterThan(0.98 * W * H);
+    expect(ev.nCracks).toBeLessThan(0.005 * W * H);
+    expect(findCandidates(f, sc, ev.comps, ev.nCracks)).toHaveLength(0);
+  });
+
+  it('clothNoise reads the sensor σ off the cloth (smooth cloth ≈ 0)', () => {
+    for (const sigma of [0, 3, 6, 10]) {
+      const f = noisyCloth(W, H, sigma, 11 + sigma);
+      const sc = getScratch(W, H);
+      buildEvidence(f, GREEN_MODEL, sc);
+      const est = clothNoise(f, sc);
+      expect(est, `σ ${sigma}`).toBeGreaterThan(0.75 * sigma - 0.01);
+      expect(est, `σ ${sigma}`).toBeLessThan(1.2 * sigma + 0.8);
+    }
   });
 });
