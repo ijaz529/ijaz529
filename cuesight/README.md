@@ -62,9 +62,9 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 "Starting camera…". Timing tests can fail on a busy CPU; re-run them alone before concluding.
 
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
-**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1035 tests in 68 files**, all
+**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1037 tests in 68 files**, all
 passing (timing guards compare against work measured in the same run, so a busy CPU does not fail them).
-`npm run e2e` runs **137 tests**, all passing, also with a wide fallback font (DejaVu Sans, as on CI).
+`npm run e2e` runs **140 tests**, all passing, also with a wide fallback font (DejaVu Sans, as on CI).
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
 HTTPS host (GitHub Pages, Netlify, Cloudflare Pages) and open it on the phone. Then use "Add to Home
@@ -85,7 +85,9 @@ fingers to pan. Double-tap the cloth to go back to the last preset. The glass bu
 between **Top**, **Player** (eye low behind the cue ball, down the aim line, framed so the pocket stays in
 view; the cue takes three slow practice strokes, then rests at address) and **Orbit** (a three-quarter
 broadcast angle). A glass label next to the cue ball shows the power (n/10, speed word, 10-segment bar)
-and the strike point on a face-on cue ball, in every view.
+and the strike point on a face-on cue ball, in every view. When a shot is too long for the space above
+the shot card, Player view keeps the cue ball and the aim line in the middle and lets the far pocket go
+out of view. **Clear** leaves the view on the shot just cleared.
 **Play** replays the simulated shot in real time (½× plays it at half speed): the cue strikes, and the
 balls slide, spin and roll as simulated (a draw shot visibly turns backward) and drop into the pocket.
 The balls' motion takes at most 4 s (longer shots are sped up evenly), and the end position is held
