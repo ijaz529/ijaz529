@@ -529,6 +529,43 @@ test.describe('3D practice table (feature 002 US1)', () => {
     await expect(page.getByTestId('cut')).toHaveText('30.0°');
   });
 
+  test('Player view: Clear leaves the view on the shot just cleared (the ball stays where it was on screen)', async ({ page }) => {
+    test.setTimeout(120_000);
+    await planB1(page);
+    await recommendedPlan(page);
+    const btn = page.getByRole('button', { name: /^Player view/ });
+    await btn.click();
+    await expect.poll(() => camera(page), { timeout: 15_000 }).toBe('player');
+    await settled(page);
+    const vp = page.viewportSize()!;
+    const before = { cue: await screenOf(page, { ball: 'cue' }), b1: await screenOf(page, { ball: 'b1' }) };
+    // Down the shot: the 1-ball ahead of the cue ball, both on screen.
+    expect(before.b1.y).toBeLessThan(before.cue.y);
+    await page.getByRole('button', { name: 'More tools' }).click();
+    await page.getByRole('button', { name: 'Clear the selection' }).click();
+    await expect(page.locator('#shot-card')).toContainText('Tap the ball you want to pocket');
+    // The sheet's peek height changes with the card, and the view re-frames in what is left: wait it out.
+    let last = await screenOf(page, { ball: 'b1' });
+    for (let i = 0; i < 60; i++) {
+      await settled(page);
+      await page.waitForTimeout(150);
+      const q = await screenOf(page, { ball: 'b1' });
+      if (Math.hypot(q.x - last.x, q.y - last.y) < 0.5) break;
+      last = q;
+    }
+    expect(await camera(page)).toBe('player');
+    const after = { cue: await screenOf(page, { ball: 'cue' }), b1: await screenOf(page, { ball: 'b1' }) };
+    // Still down the same shot: both balls on screen, about where they were. (The view used to swing
+    // round to look at the middle of the table, which put the 1-ball far off to the side.)
+    for (const k of ['cue', 'b1'] as const) {
+      expect(after[k].x, `${k} on screen`).toBeGreaterThan(0);
+      expect(after[k].x, `${k} on screen`).toBeLessThan(vp.width);
+      expect(Math.hypot(after[k].x - before[k].x, after[k].y - before[k].y), `${k} about where it was`).toBeLessThan(0.12 * vp.height);
+    }
+    expect(after.b1.y).toBeLessThan(after.cue.y);
+    expect(Math.abs(after.b1.x - before.b1.x), 'not turned off the shot').toBeLessThan(0.06 * vp.width);
+  });
+
   test('drag a ball to move it', async ({ page }) => {
     const before = (await balls(page)).find((b) => b.id === 'b2')!;
     const p = await screenOf(page, { ball: 'b2' });

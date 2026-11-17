@@ -17,7 +17,7 @@ import {
 } from '../../../src/app/render3d/camera';
 import { tableGeom } from '../../../src/app/render3d/geom';
 import { project, type V3 } from '../../../src/app/render3d/math3d';
-import { cuePose } from '../../../src/app/render3d/scene-data';
+import { cueAim, cuePose } from '../../../src/app/render3d/scene-data';
 
 const table = makeTable('pool9');
 const g = tableGeom(table);
@@ -153,6 +153,56 @@ describe('render3d camera presets', () => {
     const fh = Math.hypot(b.forward[0], b.forward[1]);
     const al = Math.hypot(aim.x, aim.y);
     expect((b.forward[0] * aim.x + b.forward[1] * aim.y) / (fh * al)).toBeGreaterThan(Math.cos(0.56));
+  });
+
+  it('player view, a long shot over a raised sheet: the pocket cannot fit, so the cue ball and the ghost ball stay in the middle, down the aim line', () => {
+    // Measured on a 393 × 852 phone with the sheet at its middle height: the free strip is the 35 % of
+    // the screen between the camera pill and the sheet. A 14.6° cut the length of the table into TR.
+    const aspect = 393 / 852;
+    const ins = { top: 0.1385, right: 0, bottom: 0.5117, left: 0 };
+    const cue = { x: -0.95, y: 0.08 };
+    const target = { x: 0.15, y: 0.2 };
+    const hole = g.holes.find((h) => h.id === 'TR')!;
+    const ul = Math.hypot(hole.x - target.x, hole.y - target.y);
+    const ghost = { x: target.x - (2 * g.R * (hole.x - target.x)) / ul, y: target.y - (2 * g.R * (hole.y - target.y)) / ul };
+    const aim = { x: ghost.x - cue.x, y: ghost.y - cue.y };
+    const pocket: V3 = [hole.x, hole.y, 0];
+    const o = playerOrbit(g, cue, aim, ghost, aspect, { keep: [pocket, [ghost.x, ghost.y, g.R], [g.hx, 0.6094, g.R]], insets: ins });
+    const at = (p: V3) => ndc(o, aspect, p, insetShift(ins));
+    const inFree = (q: { x: number; y: number }) => Math.abs(q.x) <= 1 && q.y >= -1 + 2 * ins.bottom && q.y <= 1 - 2 * ins.top;
+    expect(inFree(at(pocket)), 'this shot is too long for the strip: the pocket is the part given up').toBe(false);
+    for (const [name, p] of [['cue ball', [cue.x, cue.y, g.R]], ['ghost ball', [ghost.x, ghost.y, g.R]]] as [string, V3][]) {
+      const q = at(p);
+      expect(inFree(q), `${name} above the sheet and below the camera pill`).toBe(true);
+      expect(Math.abs(q.x), `${name} in the middle third of the width`).toBeLessThan(1 / 3);
+    }
+    // Still down the aim line: not turned toward the pocket it cannot reach.
+    const b = orbitBasis(o);
+    const cos = (b.forward[0] * aim.x + b.forward[1] * aim.y) / (Math.hypot(b.forward[0], b.forward[1]) * Math.hypot(aim.x, aim.y));
+    expect(cos).toBeGreaterThan(Math.cos((1 * Math.PI) / 180));
+  });
+
+  it('player view with nothing picked: stays on the last shot’s line while the cue ball has not moved (Clear), else looks to the middle of the table', () => {
+    const cueBall = { id: 'cue', kind: 'cue' as const, pos: { x: -0.95, y: 0.08 }, label: 'cue' };
+    const other = { id: 'b1', kind: 'object' as const, pos: { x: 0.15, y: 0.2 }, label: '1' };
+    const nothing = { balls: [cueBall, other], plan: null, targetId: null };
+    const last = { cue: { x: -0.95, y: 0.08 }, aim: { x: 0.9955, y: 0.0948 }, ghost: { x: 0.0964, y: 0.1796 } };
+    // Without a last shot (a fresh layout): toward the middle of the table, as before.
+    const fresh = cueAim(nothing)!;
+    expect(fresh.aim.x * 0.08 + fresh.aim.y * 0.95).toBeCloseTo(0, 9); // parallel to −cue.pos (cross product 0)
+    expect(fresh.aim.x).toBeGreaterThan(0);
+    // After Clear: the line and the ghost ball of the shot just cleared, so the view is framed as it was.
+    const kept = cueAim(nothing, last)!;
+    expect(kept.aim).toEqual(last.aim);
+    expect(kept.cueDir).toEqual(last.aim);
+    expect(kept.ghost).toEqual(last.ghost);
+    // The cue ball moved since: that shot is gone, so the middle of the table again.
+    const movedCue = { ...nothing, balls: [{ ...cueBall, pos: { x: -0.5, y: 0.3 } }, other] };
+    const again = cueAim(movedCue, last)!;
+    expect(again.aim.x * 0.3 + again.aim.y * 0.5).toBeCloseTo(0, 9);
+    expect(again.aim.x).toBeGreaterThan(0);
+    // A picked ball always wins over the last line.
+    expect(cueAim({ ...nothing, targetId: 'b1' }, last)!.ghost).toEqual(other.pos);
   });
 
   it('interpolates orbits along the shortest yaw and clamps user pitch', () => {

@@ -339,10 +339,15 @@ export function mouthArc(p: { jawA: Vec2; jawB: Vec2; inward: Vec2 }, hole: { x:
 
 /**
  * Cue ball, the cue-ball path direction (aim), the cue's own direction (stickDir: squirt-corrected)
- * and the ghost ball (null for a frozen cue ball, which has none). Without a plan: toward the target,
- * else toward the table centre. Null without a cue ball.
+ * and the ghost ball (null for a frozen cue ball, which has none). Without a plan: toward the target.
+ * With nothing picked: `last`, the line and ghost ball of the shot just cleared, while the cue ball is
+ * still where that shot was played from (so Clear does not swing the Player view round), else toward
+ * the table centre. Null without a cue ball.
  */
-export function cueAim(d: { balls: readonly Ball[]; plan: ShotPlan | null; targetId: string | null }): { cue: Vec2; aim: Vec2; cueDir: Vec2; ghost: Vec2 | null } | null {
+export function cueAim(
+  d: { balls: readonly Ball[]; plan: ShotPlan | null; targetId: string | null },
+  last?: { cue: Vec2; aim: Vec2; ghost: Vec2 | null } | null,
+): { cue: Vec2; aim: Vec2; cueDir: Vec2; ghost: Vec2 | null } | null {
   const cue = d.balls.find((b) => b.kind === 'cue');
   if (!cue) return null;
   if (d.plan) return { cue: cue.pos, aim: d.plan.aimDir, cueDir: stickDir(d.plan), ghost: aimLine(d.plan, cue.pos, 0).ghost };
@@ -351,6 +356,7 @@ export function cueAim(d: { balls: readonly Ball[]; plan: ShotPlan | null; targe
     const v = { x: t.pos.x - cue.pos.x, y: t.pos.y - cue.pos.y };
     if (Math.hypot(v.x, v.y) > 1e-6) return { cue: cue.pos, aim: v, cueDir: v, ghost: t.pos };
   }
+  if (last && Math.hypot(cue.pos.x - last.cue.x, cue.pos.y - last.cue.y) <= 1e-3) return { cue: cue.pos, aim: last.aim, cueDir: last.aim, ghost: last.ghost };
   const v = Math.hypot(cue.pos.x, cue.pos.y) > 0.05 ? { x: -cue.pos.x, y: -cue.pos.y } : { x: 1, y: 0 };
   return { cue: cue.pos, aim: v, cueDir: v, ghost: null };
 }

@@ -304,8 +304,13 @@ export function playerOrbit(g: TableGeom, cue: Vec2, aimDir: Vec2, ghost: Vec2 |
   for (const p of keep) side += Math.sign(ax * (p[1] - cue.y) - ay * (p[0] - cue.x));
   const turnDir = side >= 0 ? 1 : -1;
   let best = base;
-  let bestOver = overflow(base);
   let bestCost = Infinity;
+  // When nothing frames everything (a long shot in the strip over a raised sheet), stay straight down
+  // the aim line, which keeps the cue ball and the ghost ball in the middle, and back off and widen as
+  // far as it helps: the far pocket is what gets cut off. A turned view that loses least would push
+  // the cue ball to the edge of the screen instead.
+  let straight = base;
+  let straightOver = overflow(base);
   for (const db of FIT_BACKS)
     for (const df of FIT_FOVS)
       for (let t = 0; t <= FIT_TURN_MAX + 1e-9; t += FIT_TURN_STEP) {
@@ -316,13 +321,12 @@ export function playerOrbit(g: TableGeom, cue: Vec2, aimDir: Vec2, ghost: Vec2 |
         if (v <= 0) {
           best = o;
           bestCost = cost;
-          bestOver = v;
-        } else if (bestCost === Infinity && v < bestOver) {
-          best = o;
-          bestOver = v;
+        } else if (t === 0 && v < straightOver) {
+          straight = o;
+          straightOver = v;
         }
       }
-  return best;
+  return bestCost < Infinity ? best : straight;
 }
 
 export function lerpOrbit(a: Orbit, b: Orbit, t: number): Orbit {

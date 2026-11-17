@@ -227,9 +227,14 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
   // -------------------------------------------------------------------------------------------
   // Camera
   // -------------------------------------------------------------------------------------------
+  /**
+   * The last shot picked: its cue ball, line, ghost ball and what its Player view kept in frame. With
+   * nothing picked (Clear) and the cue ball still there, the Player view frames that shot (cueAim).
+   */
+  let lastShot: { cue: Vec2; aim: Vec2; ghost: Vec2 | null; keep: V3[] } | null = null;
   /** Cue ball, aim (ball path), the cue's own direction (stickDir) and the ghost ball (scene-data cueAim). */
   function cueAndAim(): ReturnType<typeof cueAim> {
-    return data ? cueAim(data) : null;
+    return data ? cueAim(data, lastShot) : null;
   }
 
   /** What the Player view must keep in frame: the pocket, where the object ball goes, the ghost ball. */
@@ -253,7 +258,7 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     } else if (d0.targetId) {
       const t = d0.balls.find((b) => b.id === d0.targetId);
       if (t) keep.push([t.pos.x, t.pos.y, g.R]);
-    }
+    } else if (lastShot && !moved(lastShot.cue, cuePos(d0))) return lastShot.keep;
     return keep;
   }
 
@@ -356,6 +361,11 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
     if (tableChanged) {
       renderer.setTable(d.table);
       g = renderer.geom ?? tableGeom(d.table);
+      lastShot = null;
+    }
+    if (d.plan || d.targetId) {
+      const ca = cueAim(d);
+      if (ca) lastShot = { cue: ca.cue, aim: ca.aim, ghost: ca.ghost, keep: playerKeep() };
     }
     const clothKey = d.clothRgb ? d.clothRgb.join(',') : undefined;
     if (tableChanged || clothKey !== lastCloth) {
@@ -385,7 +395,10 @@ export function createTable3D(canvas: HTMLCanvasElement, events: Table3DEvents =
       if (o) goTo(o, !!orbit && !tableChanged);
     } else if (preset === 'player') {
       const movedAim = !prev || moved(prev.plan?.ghost, d.plan?.ghost) || prev.targetId !== d.targetId || moved(cuePos(prev), cuePos(d));
-      if (movedAim && !drag) {
+      // Clear (nothing picked any more, the cue ball where it was): there is no new shot to frame, so
+      // the view stays exactly as it is, on the shot just cleared.
+      const cleared = !!prev && !d.plan && !d.targetId && !moved(cuePos(prev), cuePos(d));
+      if (movedAim && !drag && !cleared) {
         const o = presetOrbit('player');
         if (o) goTo(o, true);
       }
