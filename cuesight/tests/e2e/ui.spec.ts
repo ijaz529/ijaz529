@@ -274,8 +274,13 @@ for (const viewport of [
       await hookEval(page, (h) => h.selectBall('b1'));
       await hookEval(page, (h) => h.selectPocket('TR'));
       await expect(page.getByTestId('cut')).toHaveText('30.0°');
+      // The whole stroke is set here, spin first: the power slider alone keeps whatever spin is on
+      // show, which is the basic stroke's (centre) or the recommended one's (follow) depending on
+      // whether the planner has answered yet, and at power 2 those give different warnings ("Too
+      // soft … Use power 3.5+." or "Very soft … Power 2.5+ gives some pace.").
+      await page.evaluate(() => document.querySelector<HTMLButtonElement>('[data-p="follow"]')!.click());
       await page.locator('#power').evaluate((r: HTMLInputElement) => {
-        r.value = '2';
+        r.value = '1';
         r.dispatchEvent(new Event('input', { bubbles: true }));
       });
       const head = page.locator('#shot-card .head-warn');
@@ -392,13 +397,15 @@ for (const viewport of [
           };
         });
 
-      // The headline warning at the peek (power 2: "Too soft … Use power 3.5+."), then the 85-character
-      // frozen one in its place.
+      // The headline warning at the peek (follow at power 1: "Too soft … Use power 2.5+."; the spin is
+      // set too, so the planner's recommendation arriving first cannot change the warning), then the
+      // 85-character frozen one in its place.
       await hookEval(page, (h) => h.selectBall('b1'));
       await hookEval(page, (h) => h.selectPocket('TR'));
       await expect(page.getByTestId('cut')).toHaveText('30.0°');
+      await page.evaluate(() => document.querySelector<HTMLButtonElement>('[data-p="follow"]')!.click());
       await page.locator('#power').evaluate((r: HTMLInputElement) => {
-        r.value = '2';
+        r.value = '1';
         r.dispatchEvent(new Event('input', { bubbles: true }));
       });
       await expect(page.locator('#shot-card .head-warn')).toContainText('Use power');
