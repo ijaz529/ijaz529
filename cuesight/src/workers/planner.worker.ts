@@ -8,7 +8,7 @@
 import { planShot } from '../core/shot/planner';
 import { positionHeatmap, recommendStroke } from '../core/shot/position';
 import { suggestShots } from '../core/shot/suggest';
-import { createEvaluationBudget, type EvaluationBudget } from './eval-budget';
+import { BANK_EVALUATION_COST, MIN_EVALUATIONS, createEvaluationBudget, type EvaluationBudget } from './eval-budget';
 import { PROTOCOL_VERSION, isSupported, type PlannerIn, type PlannerOut } from './protocol';
 
 /**
@@ -34,15 +34,18 @@ export function createPlannerHandler(evalBudget: EvaluationBudget = createEvalua
       switch (msg.type) {
         case 'recommend': {
           evalBudget.seed(msg.perEvalMs);
-          const maxEvaluations = evalBudget.budget(msg.layout, msg.request, msg.params);
-          // Timed: the first real search refines the budget's figure from its own ms per evaluation.
-          const r = evalBudget.measure(msg.layout, () =>
+          // A bank's evaluations cost several direct ones: fewer of them, and no part in the figure.
+          const bank = !!msg.request.bank;
+          const direct = evalBudget.budget(msg.layout, msg.request, msg.params);
+          const maxEvaluations = bank ? Math.max(MIN_EVALUATIONS, Math.floor(direct / BANK_EVALUATION_COST)) : direct;
+          const search = () =>
             recommendStroke(msg.layout, msg.request, msg.params, {
               ...(msg.request.landing ? { landing: msg.request.landing } : {}),
               maxEvaluations,
               timeCapMs: RECOMMEND_TIME_CAP_MS,
-            }),
-          );
+            });
+          // Timed: the first real search refines the budget's figure from its own ms per evaluation.
+          const r = bank ? search() : evalBudget.measure(msg.layout, search);
           post({ v: PROTOCOL_VERSION, type: 'recommendation', id: msg.id, ...r, perEvalMs: evalBudget.figures() });
           break;
         }

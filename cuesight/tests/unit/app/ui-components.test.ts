@@ -150,6 +150,20 @@ describe('shot card (001 regression contract)', () => {
     expect(el.innerHTML).toContain('data-card-act="suggest"');
   });
 
+  it('offers "Bank it" on a shot that is not makeable when a bank is open: the main action unless another pocket is offered', () => {
+    const plan = planShot(layoutOf('blocked'), { targetId: 'b1', pocketId: 'TR' }, params);
+    const html = (over: Partial<CardContext>) => {
+      const el = stubEl();
+      renderShotCard(el, plan, ctx(over));
+      return el.innerHTML;
+    };
+    expect(html({})).not.toContain('data-card-act="bank"');
+    expect(html({ bankOption: { pocketName: null } })).toMatch(/class="btn primary" data-card-act="bank">.*<span>Bank it off a cushion<\/span>/s);
+    const both = html({ bankOption: { pocketName: 'far left corner' }, altPocket: { id: 'TL', name: 'far left corner' } });
+    expect(both).toMatch(/class="btn primary" data-card-act="alt"/);
+    expect(both).toMatch(/class="btn secondary" data-card-act="bank">.*<span>Bank it into the far left corner<\/span>/s);
+  });
+
   it('shows the hint (and the status) when there is no plan', () => {
     const el = stubEl();
     renderShotCard(el, null, ctx({ status: 'Table locked' }));

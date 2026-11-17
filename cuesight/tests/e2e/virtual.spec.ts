@@ -242,3 +242,63 @@ test.describe('recommendation toasts follow the stroke on show', () => {
     await expect(page.locator('#shot-card')).toContainText('basic stroke');
   });
 });
+
+test.describe('bank shots (one cushion)', () => {
+  type BankHook = {
+    state: {
+      practice: { balls: unknown[] };
+      plan: { makeable: boolean; obPocketed: boolean; strokeSource: string; bank?: { rail: string } } | null;
+      recommended: { pending: boolean } | null;
+    };
+    selectBall(id: string): void;
+    selectPocket(id: string): void;
+  };
+
+  test('a pocket that cannot be played directly offers "Bank it": the shot is planned off the cushion, and picking the pocket again is the direct shot', async ({ page }) => {
+    // No first-run hint over the card: its buttons are used here.
+    await page.addInitScript(() => {
+      try {
+        localStorage.setItem('cuesight.onboarded', '1');
+      } catch {
+        /* storage unavailable: the hint stays */
+      }
+    });
+    await page.goto('/?mode=practice');
+    // The cue ball up-table of the ball: the top-right corner is on the wrong side, and only goes off the bottom cushion.
+    await page.evaluate(() => {
+      const h = (window as unknown as { __cuesight: BankHook }).__cuesight;
+      h.state.practice.balls = [
+        { id: 'cue', kind: 'cue', pos: { x: 0.65, y: 0.33 }, label: 'cue' },
+        { id: 'b1', kind: 'object', pos: { x: 0.63, y: -0.27 }, label: '5', color: '#e8590c' },
+      ];
+      h.selectBall('b1');
+      h.selectPocket('TR');
+    });
+    const card = page.getByTestId('shot-card');
+    await expect(card).toContainText('wrong side');
+    await expect(card.locator('.pocket-name')).not.toContainText('bank');
+    await card.getByRole('button', { name: 'Bank it off a cushion' }).click();
+    await expect(card.locator('.pocket-name')).toContainText('(bank)');
+    await expect(page.getByTestId('tip')).toContainText('Bank shot');
+    // The stroke search runs on the bank too, and the stroke it recommends pots the ball off the bottom cushion.
+    await page.waitForFunction(
+      () => {
+        const s = (window as unknown as { __cuesight: BankHook }).__cuesight.state;
+        return !!s.recommended && !s.recommended.pending && s.plan?.strokeSource === 'recommended';
+      },
+      undefined,
+      { timeout: 45_000 },
+    );
+    const plan = await page.evaluate(() => {
+      const p = (window as unknown as { __cuesight: BankHook }).__cuesight.state.plan!;
+      return { makeable: p.makeable, obPocketed: p.obPocketed, rail: p.bank?.rail };
+    });
+    expect(plan).toEqual({ makeable: true, obPocketed: true, rail: 'bottom' });
+    await expect(page.getByTestId('difficulty')).toContainText('hard');
+    // The pocket picked again: the direct shot, with its reason, and the bank on offer once more.
+    await page.evaluate(() => (window as unknown as { __cuesight: BankHook }).__cuesight.selectPocket('TR'));
+    await expect(card).toContainText('wrong side');
+    await expect(card.locator('.pocket-name')).not.toContainText('bank');
+    await expect(card.getByRole('button', { name: 'Bank it off a cushion' })).toBeVisible();
+  });
+});

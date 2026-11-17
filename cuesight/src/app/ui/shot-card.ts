@@ -40,6 +40,8 @@ export interface CardContext {
   speedRef?: string | null;
   /** Name of the best other pocket, offered when this one is not makeable. */
   altPocket?: { id: string; name: string } | null;
+  /** A one-cushion bank is open for a shot that is not makeable (ShotPlan.bankOption): into this pocket, or with null the card's own. */
+  bankOption?: { pocketName: string | null } | null;
   /** Balls that can be picked (object balls), for keyboard and screen-reader users. */
   balls?: { id: string; label: string; color?: string; stripe?: boolean }[];
   /** Pockets by name once a ball is picked. */
@@ -335,7 +337,7 @@ export function renderShotCard(el: HTMLElement, plan: ShotPlan | null, ctx: Card
     <p class="strike-line">${iconMarkup('target', 14)}<span>${plan.strokeName ? `<b>${esc(plan.strokeName)}</b> · ` : ''}strike <span data-testid="spin">${esc(spinWords)}</span></span></p>`
     : `<div class="hero blocked">
       <ul class="warnings" aria-label="Why it is not makeable">${chips(shown)}</ul>
-      <div class="blocked-acts">${ctx.altPocket ? `<button type="button" class="btn primary" data-card-act="alt" data-pocket="${esc(ctx.altPocket.id)}">${iconMarkup('target', 18)}<span>Try the ${esc(ctx.altPocket.name)}</span></button>` : ''}<button type="button" class="btn secondary" data-card-act="suggest">${iconMarkup('sparkles', 18)}<span>Suggest a shot</span></button></div>
+      <div class="blocked-acts">${ctx.altPocket ? `<button type="button" class="btn primary" data-card-act="alt" data-pocket="${esc(ctx.altPocket.id)}">${iconMarkup('target', 18)}<span>Try the ${esc(ctx.altPocket.name)}</span></button>` : ''}${ctx.bankOption ? `<button type="button" class="btn ${ctx.altPocket ? 'secondary' : 'primary'}" data-card-act="bank">${iconMarkup('swap', 18)}<span>${ctx.bankOption.pocketName ? `Bank it into the ${esc(ctx.bankOption.pocketName)}` : 'Bank it off a cushion'}</span></button>` : ''}<button type="button" class="btn secondary" data-card-act="suggest">${iconMarkup('sparkles', 18)}<span>Suggest a shot</span></button></div>
       <span class="sr-only">${frozen ? `Balls frozen together.<span hidden data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>` : `Cut <span data-testid="cut">${plan.cutAngleDeg.toFixed(1)}°</span>, ${esc(phrase)}.`} No stroke: this shot is not makeable.<span hidden data-testid="power">${powerStr}<small>/10</small></span><span hidden data-testid="spin">${esc(spinWords)}</span></span>
     </div>`;
   const html = `

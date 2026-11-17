@@ -61,6 +61,14 @@ describe('plan announcements', () => {
     a.update(planShot(lay('cut30'), { targetId: 'b1', pocketId: 'TR', stroke: { power: 7, side: 0, vert: 0 } }, params), false, names, label);
     expect(t.pending()).toBe(false);
   });
+  it('a bank is spoken as one', () => {
+    // The cue ball up-table of the ball: the top-right corner only goes off the bottom cushion.
+    const layout: TableLayout = { table, balls: [{ id: 'cue', kind: 'cue', pos: { x: 0.65, y: 0.33 } }, { id: 'b1', kind: 'object', pos: { x: 0.63, y: -0.27 } }], source: 'virtual', frozen: false };
+    const bank = planShot(layout, { targetId: 'b1', pocketId: 'TR', bank: 'bottom' }, params);
+    expect(bank.makeable).toBe(true);
+    expect(planSentence(bank, names, label)).toMatch(/^Ball 1 to the far right corner, off a cushion: cut \d+ degrees/);
+  });
+
   it('a shot that cannot happen is not given a stroke', () => {
     const blocked = planShot(lay('blocked'), { targetId: 'b1', pocketId: 'TR' }, params);
     const s = planSentence(blocked, names, label);

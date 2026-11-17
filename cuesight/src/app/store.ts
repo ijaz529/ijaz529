@@ -2,7 +2,7 @@
  * Tiny observable store: a single mutable state object; `update()` mutates and schedules one
  * render per animation frame for all subscribers.
  */
-import type { Ball, PocketId, ShotPlan, ShotSuggestion, Stroke, StrokeRisk, TableLayout, TableSpec, PhysicsParams, Vec2 } from '../core/types';
+import type { Ball, PocketId, RailId, ShotPlan, ShotSuggestion, Stroke, StrokeRisk, TableLayout, TableSpec, PhysicsParams, Vec2 } from '../core/types';
 import type { Calibration } from '../vision/calibration';
 import type { LockStatus } from '../vision/tracker';
 import type { Settings } from './settings';
@@ -47,6 +47,11 @@ export interface AppState {
   targetMem: SelectionMemory | null;
   cueMem: SelectionMemory | null;
   pocketId: PocketId | null;
+  /**
+   * "Bank it": play `targetId` into `pocketId` off this cushion. It applies only while that ball and
+   * pocket are the ones selected (main.ts bankRail), so nothing has to clear it when they change.
+   */
+  bank: { targetId: string; pocketId: PocketId; rail: RailId } | null;
   strokeMode: 'recommended' | 'mine';
   myStroke: Stroke;
   /**

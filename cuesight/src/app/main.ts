@@ -6,7 +6,7 @@ import './styles.css';
 import { planShot, stunVert } from '../core/shot/planner';
 import { powerToSpeed, speedReference } from '../core/shot/power';
 import { POCKET_NAMES, clampToTable } from '../core/table';
-import type { Ball, PocketId, ShotPlan, ShotRequest, ShotSuggestion, Stroke, StrokeRisk, TableLayout, Vec2 } from '../core/types';
+import type { Ball, PocketId, RailId, ShotPlan, ShotRequest, ShotSuggestion, Stroke, StrokeRisk, TableLayout, Vec2 } from '../core/types';
 import { dist } from '../core/vec';
 import { PROTOCOL_VERSION, type PlannerPlanOptions, type VisionOut } from '../workers/protocol';
 import { applyH, invert3 } from '../vision/homography';
@@ -95,6 +95,7 @@ const store = createStore({
   targetMem: null,
   cueMem: null,
   pocketId: null,
+  bank: null,
   strokeMode: 'recommended',
   myStroke: { power: 4, side: 0, vert: 0 },
   recommended: null,
@@ -463,16 +464,23 @@ function layoutKey(l: TableLayout): string {
   return l.balls.map((b) => `${b.id}:${Math.round(b.pos.x * 200)},${Math.round(b.pos.y * 200)}:${b.kind}`).join('|');
 }
 
+/** The cushion to bank the selected ball off: the player's "Bank it", while it is for the ball and pocket selected now. */
+function bankRail(): RailId | undefined {
+  const b = S.bank;
+  return b && b.targetId === S.targetId && b.pocketId === S.pocketId ? b.rail : undefined;
+}
+
 function requestRecommendation(layout: TableLayout): void {
   if (!S.targetId) return;
-  const key = `${layoutKey(layout)}#${S.targetId}#${S.pocketId}#${S.landing ? `${S.landing.x.toFixed(2)},${S.landing.y.toFixed(2)}` : ''}#${JSON.stringify(S.params)}`;
+  const bank = bankRail();
+  const key = `${layoutKey(layout)}#${S.targetId}#${S.pocketId}#${bank ?? ''}#${S.landing ? `${S.landing.x.toFixed(2)},${S.landing.y.toFixed(2)}` : ''}#${JSON.stringify(S.params)}`;
   if (S.recommended?.key === key) return;
   store.update((s) => (s.recommended = { key, stroke: null, pending: true, reachable: true, evaluated: 0 }));
   // The request is fixed now (debounced in the client): a later tap supersedes it, never rewrites it.
   planner.recommend(key, {
     type: 'recommend',
     layout,
-    request: { targetId: S.targetId, ...(S.pocketId ? { pocketId: S.pocketId } : {}), ...(S.landing ? { landing: S.landing } : {}) },
+    request: { targetId: S.targetId, ...(S.pocketId ? { pocketId: S.pocketId } : {}), ...(bank ? { bank } : {}), ...(S.landing ? { landing: S.landing } : {}) },
     params: S.params,
   });
 }
@@ -494,7 +502,8 @@ function replan(): void {
     const hasCue = layout.balls.some((b) => b.kind === 'cue');
     if (target && target.kind !== 'cue' && hasCue) {
       const rec = S.recommended && !S.recommended.pending && S.recommended.stroke ? S.recommended.stroke : undefined;
-      const request: ShotRequest = { targetId: S.targetId, ...(S.pocketId ? { pocketId: S.pocketId } : {}), ...(S.strokeMode === 'mine' ? { stroke: S.myStroke } : {}) };
+      const bank = bankRail();
+      const request: ShotRequest = { targetId: S.targetId, ...(S.pocketId ? { pocketId: S.pocketId } : {}), ...(bank ? { bank } : {}), ...(S.strokeMode === 'mine' ? { stroke: S.myStroke } : {}) };
       const opts: PlannerPlanOptions = { names: pocketNames(), ...(rec ? { recommended: rec } : {}) };
       try {
         // Without the frozen power advice: for a too-soft frozen cue ball it re-plans the stroke at
@@ -607,6 +616,20 @@ function selectPocket(p: PocketId): void {
   }
   store.update((s) => {
     s.pocketId = p;
+    s.bank = null;
+    s.recommended = null;
+  });
+  replan();
+}
+
+/** "Bank it" on a pocket that cannot be played directly: the bank the plan says is open (ShotPlan.bankOption). */
+function bankIt(): void {
+  const o = S.plan?.bankOption;
+  const targetId = S.targetId;
+  if (!o || !targetId) return;
+  store.update((s) => {
+    s.pocketId = o.pocketId;
+    s.bank = { targetId, pocketId: o.pocketId, rail: o.rail };
     s.recommended = null;
   });
   replan();
@@ -1572,13 +1595,15 @@ function render(s: AppState): void {
     ...(tb?.color ? { targetColor: tb.color } : {}),
     targetStripe: !!tb?.stripe,
     targetLabel: s.targetId ? labelOf(s.targetId) : '',
-    pocketName: s.plan ? names[s.plan.pocketId] : '',
+    pocketName: s.plan ? `${names[s.plan.pocketId]}${s.plan.bank ? ' (bank)' : ''}` : '',
     status: s.mode === 'camera' && s.vision ? STATUS_TEXT[s.vision.status] : null,
     recommendedPending: !!s.recommended?.pending,
     showDetails: cardDetailsShown(s.plan, s.settings.showDetails),
     hint,
     speedRef: s.plan ? speedReference(s.plan.obPocketSpeed, s.table.length, s.params) : null,
     altPocket: alt ? { id: alt.pocketId, name: names[alt.pocketId] } : null,
+    // A bank into another pocket than the one on the card (none was chosen) is offered by that pocket's name.
+    bankOption: s.plan?.bankOption ? { pocketName: s.plan.bankOption.pocketId === s.plan.pocketId ? null : names[s.plan.bankOption.pocketId] } : null,
     // Keyboard / screen-reader (and big-finger) way to pick: the balls, then the pockets by name.
     balls: (layout?.balls ?? [])
       .filter((b) => b.kind !== 'cue')
@@ -1625,6 +1650,7 @@ card.addEventListener('click', (e) => {
     const ball = currentLayout()?.balls.find((x) => x.id === b.dataset.id);
     if (ball) selectBall(ball);
   }
+  else if (b.dataset.cardAct === 'bank') bankIt();
   else if (b.dataset.cardAct === 'suggest') {
     if (!S.suggestions) actions.suggest();
   }

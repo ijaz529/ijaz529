@@ -74,3 +74,42 @@ describe("planner worker 'recommend'", () => {
     expect(bad[0]).toMatchObject({ type: 'error' });
   });
 });
+
+describe("planner worker 'recommend' on a bank", () => {
+  it('searches fewer strokes (each costs several direct ones) and does not refine the device figure', () => {
+    // The top-right corner off the bottom cushion: the cue ball is up-table of the ball.
+    const bankLayout: TableLayout = {
+      table: T,
+      balls: [
+        { id: 'cue', kind: 'cue', pos: { x: 0.65, y: 0.33 }, label: 'cue' },
+        { id: 'b1', kind: 'object', pos: { x: 0.63, y: -0.27 }, label: '1' },
+      ] satisfies Ball[],
+      source: 'virtual',
+      frozen: false,
+    };
+    let measured = 0;
+    const budget = {
+      budget: () => 300,
+      measure: <R extends { evaluated: number }>(_l: TableLayout, run: () => R): R => {
+        measured++;
+        return run();
+      },
+      seed: () => {},
+      figures: () => ({}),
+    };
+    const ask = (request: Extract<PlannerIn, { type: 'recommend' }>['request']) => {
+      const out: PlannerOut[] = [];
+      createPlannerHandler(budget)({ v: PROTOCOL_VERSION, type: 'recommend', id: 1, layout: bankLayout, request, params: P }, (m) => out.push(m));
+      return out[0] as Extract<PlannerOut, { type: 'recommendation' }>;
+    };
+    const bank = ask({ targetId: 'b1', pocketId: 'TR', bank: 'bottom' });
+    expect(bank.type).toBe('recommendation');
+    expect(bank.reachable).toBe(true);
+    expect(bank.evaluated).toBeGreaterThan(0);
+    expect(bank.evaluated).toBeLessThanOrEqual(60); // 300 / BANK_EVALUATION_COST, never under MIN_EVALUATIONS
+    expect(measured).toBe(0);
+    const direct = ask({ targetId: 'b1', pocketId: 'BR' });
+    expect(direct.evaluated).toBeGreaterThan(60);
+    expect(measured).toBe(1);
+  });
+});

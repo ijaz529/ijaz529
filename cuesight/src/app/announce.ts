@@ -18,7 +18,7 @@ export const ANNOUNCE_DEBOUNCE_MS = 600;
 export function planSentence(p: ShotPlan, names: Partial<Record<PocketId, string>>, labelOf: (id: string) => string): string {
   // "Ball 3", "Ball red"; a ball vision could not name: "Unnamed ball" (never "Ball ball").
   const ball = ballWords(labelOf(p.targetId));
-  const pocket = names[p.pocketId] ?? p.pocketId;
+  const pocket = `${names[p.pocketId] ?? p.pocketId}${p.bank ? ', off a cushion' : ''}`;
   if (!p.makeable) {
     const why = p.warnings.find((w) => w.code === 'not-makeable' || w.code === 'blocked-cue' || w.code === 'blocked-object');
     const alt = p.alternatives[0];

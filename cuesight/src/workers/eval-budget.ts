@@ -48,6 +48,14 @@ export const TIMED_PLANS = 3;
 export const REFINE_MIN_EVALUATIONS = 30;
 /** The refined figure stays within this factor of the calibration, either way. */
 export const REFINE_RANGE = 4;
+/**
+ * A bank's evaluation against a direct shot's: its aim search simulates the cue ball and the object
+ * ball to the pocket up to six times, where a direct plan runs four probes that stop at the first
+ * contact. Measured on a desktop: 1.2–1.5 ms a bank plan against 0.3 ms (two balls, pool9). The
+ * figures above are a direct plan's, so a bank search gets this many times fewer evaluations and
+ * does not refine them (planner.worker.ts).
+ */
+export const BANK_EVALUATION_COST = 5;
 /** Floor of any figure (ms), so a budget never divides by zero. */
 const MIN_MS = 0.05;
 
