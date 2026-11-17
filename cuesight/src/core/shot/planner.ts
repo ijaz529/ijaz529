@@ -32,6 +32,7 @@ import type {
   PhysicsParams,
   PocketId,
   PocketSpec,
+  RailId,
   ShotPlan,
   ShotRequest,
   Stroke,
@@ -41,8 +42,8 @@ import type {
   Vec2,
   Warning,
 } from '../types';
-import { angleBetween, cross, deg, dist, fromAngle, angleOf, norm, rad, sub } from '../vec';
-import { coachingTip, contactSpinOf, difficultyOf, strokeName, type ContactSpin, type ThrowShiftDir } from './coach';
+import { angleBetween, cross, deg, dist, dot, fromAngle, angleOf, norm, rad, sub } from '../vec';
+import { coachingTip, contactSpinOf, DIFFICULTY_THRESHOLDS, difficultyOf, strokeName, type ContactSpin, type ThrowShiftDir } from './coach';
 import { cutAngle, cutSide, fractionOf, ghostBall, contactPoint } from './geometry';
 import { pathBlockers } from './obstruction';
 import { mouthIntersect, pocketWindow, type PocketWindow } from './pocket-window';
@@ -68,6 +69,16 @@ export const CAPTURE_MIN_SPEED = 0.02;
  */
 const THROW_SEARCH_RAD = rad(8);
 const THROW_PROBES = 4;
+/**
+ * Bank: how far past the mirror-rule window (rad) the object-ball aim may go. The simulated cushion
+ * sends a soft, rolling ball up to ≈8° wide of the mirror line and a firm one ≈2° inside it (pool9,
+ * default physics, balls 0.1–0.6 m off the cushion), so 12° covers it.
+ */
+const BANK_SEARCH_RAD = rad(12);
+/** Bank: probes of the aim search (bankSolve), each a cue ball + object ball simulation to the pocket. */
+const BANK_PROBES = 6;
+/** Inward unit normal of each cushion. */
+const RAIL_NORMALS: Record<RailId, Vec2> = { bottom: { x: 0, y: 1 }, right: { x: -1, y: 0 }, top: { x: 0, y: -1 }, left: { x: 1, y: 0 } };
 /** Frozen CB: stroke angles scanned (rad) on the pocket side, and the scan step. */
 const FROZEN_MAX_STROKE = rad(60);
 const FROZEN_SCAN_STEP = rad(2.5);
@@ -141,7 +152,7 @@ function frozenThrowBound(window: PocketWindow, captureDistance: number, params:
 export const FROZEN_MAX_THROW = frozenThrowMax(DEFAULT_PHYSICS, POWER_SPEEDS[0]).rad;
 
 /** Why a pocket can't be played directly (player text is built in planShot). */
-export type NotMakeableReason = 'no-window' | 'wrong-side' | 'ghost-off-table' | 'too-thin' | 'frozen-line' | 'touching-ball';
+export type NotMakeableReason = 'no-window' | 'wrong-side' | 'ghost-off-table' | 'too-thin' | 'frozen-line' | 'touching-ball' | 'no-bank';
 
 export interface ShotGeometry {
   pocket: PocketSpec;
@@ -176,6 +187,12 @@ export interface ShotGeometry {
   frozen: boolean;
   /** Frozen CB: the most throw (rad) the model allows for this shot (see frozenThrowBound). */
   frozenMaxThrow?: number;
+  /**
+   * A one-cushion bank (bankGeometry): the cushion, where the ball's centre meets it, how far along
+   * the path that is, and the cosine of the angle between the path and the cushion's normal there.
+   * `window` is then the whole path's: dir the object ball's departure, distance both legs.
+   */
+  bank?: { rail: RailId; point: Vec2; railDistance: number; cosIn: number };
 }
 
 /** Distance along `dir` from `p` (inside the nose rectangle) to where it leaves the rectangle. */
@@ -383,6 +400,88 @@ export function shotGeometry(
   };
 }
 
+/**
+ * Geometry of a one-cushion bank: `target` off `rail` into `pocket`, by the mirror rule. The pocket
+ * is reflected in the line the ball's centre turns on (R inside the cushion nose), which unfolds the
+ * two legs into one straight path, so the window, cut, blockers and tolerance are shotGeometry's for
+ * the reflected pocket. Real cushions do not mirror (collide.ts): planShot moves the aim by
+ * simulation (bankSolve), and this is its starting point and its window.
+ * Not makeable with 'no-bank' when the pocket is on that cushion, the path would meet the cushion in
+ * a pocket mouth or within R of a jaw, the ball is already on that cushion, or the cue ball is frozen
+ * to it (ASSUMPTION: frozen banks are not planned).
+ */
+export function bankGeometry(
+  table: TableSpec,
+  balls: Ball[],
+  cue: Ball,
+  target: Ball,
+  pocket: PocketSpec,
+  rail: RailId,
+  params: PhysicsParams = DEFAULT_PHYSICS,
+): ShotGeometry {
+  const R = table.ballRadius;
+  const hx = table.length / 2;
+  const hy = table.width / 2;
+  const n = RAIL_NORMALS[rail];
+  const h = Math.abs(n.x) * hx + Math.abs(n.y) * hy; // the cushion nose is the line p·n = −h
+  const c = R - h; // the ball's centre turns on p·n = c
+  const mirror = (p: Vec2): Vec2 => {
+    const k = 2 * (dot(p, n) - c);
+    return { x: p.x - k * n.x, y: p.y - k * n.y };
+  };
+  const turn = (d: Vec2): Vec2 => ({ x: d.x - 2 * dot(d, n) * n.x, y: d.y - 2 * dot(d, n) * n.y });
+  const image: PocketSpec = { ...pocket, jawA: mirror(pocket.jawA), jawB: mirror(pocket.jawB), mouthCenter: mirror(pocket.mouthCenter), inward: turn(pocket.inward) };
+  const g = shotGeometry(table, balls, cue, target, image, params);
+  const ob = target.pos;
+  const dir = g.window.dir;
+  const dn = dot(dir, n);
+  const railDistance = dn < -1e-9 ? (c - dot(ob, n)) / dn : 0;
+  const point = { x: ob.x + dir.x * railDistance, y: ob.y + dir.y * railDistance };
+  // On the cushion itself: R clear of the jaws at both ends of one of its segments.
+  const along = (p: Vec2) => p.y * n.x - p.x * n.y;
+  const onCushion = table.cushions.some(
+    (s) => s.n.x === n.x && s.n.y === n.y && along(point) >= Math.min(along(s.a), along(s.b)) + R && along(point) <= Math.max(along(s.a), along(s.b)) - R,
+  );
+  const pocketOnRail = Math.abs(dot(pocket.jawA, n) + h) < 1e-6 || Math.abs(dot(pocket.jawB, n) + h) < 1e-6;
+  const path = !g.frozen && !pocketOnRail && g.window.ok && railDistance > 1e-6 && g.window.distance > railDistance && onCushion;
+  const reason: NotMakeableReason | undefined = path ? g.reason : 'no-bank';
+  const makeable = reason === undefined;
+  // The leg back from the cushion (the unfolded path covers the leg to it).
+  const mouth = mirror(g.window.mouthHit);
+  const blockersObject = [...g.blockersObject];
+  if (path) for (const b of pathBlockers(point, mouth, balls, 2 * R - 5e-4, [cue.id, target.id])) if (!blockersObject.includes(b)) blockersObject.push(b);
+  const range = makeable ? throwAimRange(ob, angleOf(dir), g.window.halfRad + BANK_SEARCH_RAD, R, hx - R - GHOST_CLEAR, hy - R - GHOST_CLEAR) : null;
+  return {
+    ...g,
+    pocket,
+    toleranceRad: makeable ? g.toleranceRad : 0,
+    toleranceMm: makeable ? g.toleranceMm : 0,
+    blockersObject,
+    makeable,
+    reason,
+    aimLo: range ? range[0] : angleOf(dir),
+    aimHi: range ? range[1] : angleOf(dir),
+    captureDistance: g.window.distance + (path ? exitDistance(mouth, turn(dir), hx, hy) : 0),
+    bank: { rail, point, railDistance, cosIn: Math.max(0, -dn) },
+  };
+}
+
+/**
+ * Speed of a ball without side spin after a cushion (collide.ts resolveCushion in closed form): `v`
+ * its speed, `w` its topspin surface speed (analytic.ts StraightState), `cosIn` the cosine of the
+ * angle between its path and the cushion's normal.
+ */
+function railSpeed(v: number, w: number, cosIn: number, p: PhysicsParams): number {
+  const vn = v * cosIn;
+  const vt = v * Math.sqrt(Math.max(0, 1 - cosIn * cosIn));
+  const e = Math.max(p.cushionEMin, p.cushionE0 - p.cushionESlope * vn);
+  const cap = p.muCushion * (1 + e) * vn;
+  let pt = vt / 3.5;
+  const pf = Math.hypot(pt, (w * cosIn) / 2.5);
+  if (pf > cap) pt *= cap / pf;
+  return Math.hypot(e * vn, vt - pt);
+}
+
 export interface Arrival {
   /** The CB stops before it reaches the OB. */
   cbStopped: boolean;
@@ -396,17 +495,27 @@ export interface Arrival {
   obReachesCapture: boolean;
 }
 
-type ArrivalGeo = Pick<ShotGeometry, 'cbDistance' | 'cut' | 'window' | 'captureDistance'>;
+type ArrivalGeo = Pick<ShotGeometry, 'cbDistance' | 'cut' | 'window' | 'captureDistance' | 'bank'>;
 
-/** Analytic chain at `power`: CB slides/rolls to the ghost, OB leaves at v·cos(cut)·(1+e)/2 without spin. */
+/**
+ * Analytic chain at `power`: CB slides/rolls to the ghost, OB leaves at v·cos(cut)·(1+e)/2 without spin.
+ * A bank: the OB meets the cushion on the way (railSpeed) and leaves it sliding, with no spin
+ * (ASSUMPTION: what topspin the cushion leaves it is ignored).
+ */
 export function arrivalAt(power: number, geo: ArrivalGeo, vert: number, params: PhysicsParams): Arrival {
   const v0 = powerToSpeed(power);
   const cb = straightLineState(v0, 2.5 * v0 * vert, Math.max(0, geo.cbDistance), params);
   if (cb.stopped) return { cbStopped: true, cbSpeed: 0, obMouthSpeed: 0, obCaptureSpeed: 0, obReachesCapture: false };
   const vob = cb.v * Math.cos(geo.cut) * ((1 + params.eBall) / 2);
   if (!(vob > 0)) return { cbStopped: false, cbSpeed: cb.v, obMouthSpeed: 0, obCaptureSpeed: 0, obReachesCapture: false };
-  const mouth = straightLineState(vob, 0, geo.window.distance, params);
-  const cap = straightLineState(vob, 0, geo.captureDistance, params);
+  const after = (d: number) => {
+    const b = geo.bank;
+    if (!b || d <= b.railDistance) return straightLineState(vob, 0, d, params);
+    const at = straightLineState(vob, 0, b.railDistance, params);
+    return at.stopped ? at : straightLineState(railSpeed(at.v, at.w, b.cosIn, params), 0, d - b.railDistance, params);
+  };
+  const mouth = after(geo.window.distance);
+  const cap = after(geo.captureDistance);
   const obCaptureSpeed = cap.stopped ? 0 : cap.v;
   return {
     cbStopped: false,
@@ -495,7 +604,33 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       Number(b.window.ok) - Number(a.window.ok) ||
       b.window.halfRad - a.window.halfRad,
   );
-  const geo = request.pocketId ? geos.find((g) => g.pocket.id === request.pocketId)! : ranked[0]!;
+  const direct = request.pocketId ? geos.find((g) => g.pocket.id === request.pocketId)! : ranked[0]!;
+  let geo = request.bank && request.pocketId ? bankGeometry(table, balls, cue, target, direct.pocket, request.bank, params) : direct;
+  // A bank: the aim that pots it off the cushion at this stroke's pace and spin, and the geometry of
+  // that path. The default stroke follows the minimum power, which follows the path: solved once
+  // more if that moves it, and the stroke solved for is the one planned.
+  const powerVert = (request.stroke ?? opts.recommended ?? { vert: 0 }).vert;
+  let bankAim: SearchResult | null = null;
+  let bankStroke: Stroke | null = null;
+  if (geo.bank && geo.makeable) {
+    const given = request.stroke ?? opts.recommended;
+    bankStroke = given ?? defaultStroke(minimumPower(geo, { vert: powerVert }, params, 'pace'));
+    let solved = bankSolve(table, cue, target, geo, bankStroke, params);
+    if (solved && !given) {
+      const again = defaultStroke(minimumPower(solved.geo, { vert: powerVert }, params, 'pace'));
+      if (again.power !== bankStroke.power) {
+        const s2 = bankSolve(table, cue, target, geo, again, params);
+        if (s2) {
+          solved = s2;
+          bankStroke = again;
+        }
+      }
+    }
+    if (solved) {
+      geo = solved.geo;
+      bankAim = solved.aim;
+    }
+  }
   const alternatives = ranked
     .filter((g) => g.pocket.id !== geo.pocket.id && usable(g))
     .map((g) => ({ pocketId: g.pocket.id as PocketId, toleranceDeg: deg(g.toleranceRad) }));
@@ -503,13 +638,12 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   const warnings: Warning[] = [];
   const cutDeg = deg(geo.cut);
   const fr = fractionOf(geo.cut);
-  const powerVert = (request.stroke ?? opts.recommended ?? { vert: 0 }).vert;
   // minPower: "arrives with pace" (what the app shows and the advice quotes); minPowerCapture: the
   // bare analytic minimum below which the ball stops short (see ShotPlan).
   let minPower = minimumPower(geo, { vert: powerVert }, params, 'pace');
   let minPowerCapture = minimumPower(geo, { vert: powerVert }, params, 'capture');
   const strokeSource: ShotPlan['strokeSource'] = request.stroke ? 'player' : opts.recommended ? 'recommended' : 'default';
-  let stroke = request.stroke ?? opts.recommended ?? defaultStroke(minPower);
+  let stroke = request.stroke ?? opts.recommended ?? bankStroke ?? defaultStroke(minPower);
   let speed = powerToSpeed(stroke.power);
 
   if (!geo.makeable) {
@@ -575,7 +709,8 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
   let frozenTolRad = 0; // frozen: stroke-angle tolerance of the stroke found (0 when it misses)
   let frozenTolMm = 0; // frozen: the object ball's departure margin inside the window, as contact mm
   if (geo.makeable && !geo.frozen) {
-    const r = throwSearch(geo, (a) => probe(norm(sub(ghostBall(target.pos, fromAngle(a), R), cue.pos)), geo.window.dir));
+    // A bank's aim was found through the cushion (bankSolve); with no clean probe there, the mirror rule's.
+    const r = bankAim ?? throwSearch(geo, (a) => probe(norm(sub(ghostBall(target.pos, fromAngle(a), R), cue.pos)), geo.window.dir));
     aimAngle = r.aim;
     throwRad = r.throwRad;
     ghost = ghostBall(target.pos, fromAngle(aimAngle), R);
@@ -695,6 +830,19 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     }
   }
 
+  if (geo.bank && geo.makeable && obHit) {
+    const ev = objectPath.events;
+    const first = ev.findIndex((e) => e.kind === 'ball');
+    const again = ev.findIndex((e, i) => i > first && e.kind === 'ball' && e.otherId === cue.id);
+    const pocketIdx = ev.findIndex((e) => e.kind === 'pocket');
+    if (again >= 0 && (pocketIdx < 0 || again < pocketIdx))
+      warnings.push({
+        code: 'kiss',
+        message: 'Double kiss: the object ball comes back off the cushion into the cue ball. Change the spin so the cue ball clears its way back, or play it from more of an angle.',
+        ballId: cue.id,
+      });
+  }
+
   // --- Cue ball short / too soft? (after the simulation, so it never contradicts it) -------------
   const contact = straightLineState(speed, 2.5 * speed * stroke.vert, geo.cbDistance, params);
   const geoP = geo.frozen ? { ...geo, cut: Math.abs(strokeOffset) } : geo;
@@ -796,11 +944,17 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
       let obStoppedShort = false;
       if (obHit && obPocket === null) {
         const k = objectPath.events.findIndex((e) => e.kind === 'ball');
-        obStoppedShort = !objectPath.events.some((e, i) => i > k && (e.kind === 'cushion' || e.kind === 'jaw' || e.kind === 'ball'));
+        const met = objectPath.events.filter((e, i) => i > k && (e.kind === 'cushion' || e.kind === 'jaw' || e.kind === 'ball'));
+        // A bank: its one cushion on the way is not a miss.
+        obStoppedShort = met.length === 0 || (!!geo.bank && met.length === 1 && met[0]!.kind === 'cushion');
       }
       if (minPowerCapture > 10) soft = 'Too far: even full power may not reach the pocket.';
       else if (obStoppedShort && slow) kind = 'short';
-    } else if (arrival.obMouthSpeed < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10) kind = 'very-soft';
+      // A bank the simulation stops short at a power the analytic chain passes (its cushion is the
+      // rougher estimate): the simulation decides, and no figure is quoted.
+      else if (obStoppedShort && geo.bank) soft = 'Too soft — object ball stops short. Hit it harder.';
+    } else if ((geo.bank ? sim.final[target.id]!.pocketSpeed : arrival.obMouthSpeed) < params.pocketArrivalSpeed && stroke.power < minPower - 1e-6 && minPower <= 10)
+      kind = 'very-soft';
     if (kind) {
       const head = kind === 'short' ? 'Too soft — object ball stops short.' : 'Very soft — the object ball only just drops; any roll-off will miss.';
       if (geo.frozen && !advice) {
@@ -827,7 +981,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
         code: 'throw-uncompensable',
         message: `Frozen: no stroke angle throws the object ball into the ${nameOf(geo.pocket.id)} at this speed — the best still misses by ${deg(frozenMiss).toFixed(1)}°. A softer centre-ball stroke gives the most throw.`,
       });
-    else if (uncompensable)
+    else if (uncompensable && !geo.bank)
       warnings.push({ code: 'throw-uncompensable', message: 'Throw pushes the ball into the rail at this speed and spin — use more pace or different spin.' });
     else
       warnings.push({
@@ -897,7 +1051,9 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     windowHalfDeg: deg(geo.window.halfRad),
     toleranceDeg: tolDeg,
     toleranceMm: tolMm,
-    difficulty: difficultyOf(tolDeg),
+    // A bank is rated no easier than hard: the aim's tolerance does not hold the cushion's own
+    // uncertainty, a few degrees in this model (collide.ts) against a window under one. ASSUMPTION.
+    difficulty: geo.bank && tolDeg >= DIFFICULTY_THRESHOLDS.hard ? 'hard' : difficultyOf(tolDeg),
     warnings,
     tip: '',
     strokeName: null,
@@ -906,6 +1062,20 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     obPocketSpeed: obPocketed ? sim.final[target.id]!.pocketSpeed : 0,
     alternatives,
   };
+  if (geo.bank) {
+    // Where the simulated ball met the cushion (the first thing it met after the cue ball), else the planned point.
+    const ev = objectPath.events.filter((e) => e.kind !== 'roll');
+    const met = ev[ev.findIndex((e) => e.kind === 'ball') + 1];
+    plan.bank = { rail: geo.bank.rail, point: obHit && met?.kind === 'cushion' ? met.pos : geo.bank.point };
+  } else if (!plan.makeable && (opts.record ?? true)) {
+    let best: ShotGeometry | null = null;
+    for (const p of request.pocketId ? [geo.pocket] : table.pockets)
+      for (const rail of Object.keys(RAIL_NORMALS) as RailId[]) {
+        const g = bankGeometry(table, balls, cue, target, p, rail, params);
+        if (usable(g) && (!best || g.toleranceRad > best.toleranceRad)) best = g;
+      }
+    if (best) plan.bankOption = { pocketId: best.pocket.id, rail: best.bank!.rail };
+  }
   // Spin at contact. A cue ball that stops on the way and never touches the object ball has no
   // contact to name ('short': no stroke name), makeable or not — only a makeable shot gets the
   // cb-short warning. One the analytic chain stops just short but the simulation still gets there
@@ -940,6 +1110,7 @@ export function planShot(layout: TableLayout, request: ShotRequest, params: Phys
     minPower: advised, // the power to advise: minPower (with pace) rounded up to a settable half step
     ...(alternatives[0] ? { altPocketName: nameOf(alternatives[0].pocketId) } : {}),
     frozen: geo.frozen,
+    ...(geo.bank ? { bank: true } : {}),
   });
   return plan;
 }
@@ -957,6 +1128,8 @@ function notMakeableText(geo: ShotGeometry, cutDeg: number, nameOf: (id: PocketI
       const t = deg(geo.frozenMaxThrow ?? FROZEN_MAX_THROW);
       return `the balls are frozen together, so the object ball can only go along the line of centres (±${t.toFixed(t < 10 ? 1 : 0)}° of throw at most), and that line is ${deg(off).toFixed(0)}° off the ${nameOf(geo.pocket.id)}`;
     }
+    case 'no-bank':
+      return `there is no one-cushion path into the ${nameOf(geo.pocket.id)} off that cushion`;
     case 'touching-ball':
       return `the cue ball is touching it (or within ${(FROZEN_EPS * 1000).toFixed(0)} mm, too close to tell apart): in snooker you must play away from a touching ball — moving it is a push stroke, a foul`;
     default:
@@ -978,12 +1151,85 @@ interface SearchResult {
 }
 
 /**
+ * A bank's aim, by simulation: real cushions do not mirror (collide.ts), so the object-ball aim that
+ * pots it off the cushion depends on the stroke's pace and spin. Searched like throw (throwSearch),
+ * from the mirror-rule aim inside [geo.aimLo, geo.aimHi]; each probe simulates the cue ball and the
+ * object ball alone. Its error is how far off the pocket the ball comes back, as the angle at the
+ * point where it met the cushion between its way back (to the next thing it meets, or where it
+ * stops) and the pocket window's centre from there, scaled by return leg / whole path — the mirror
+ * rule's ratio of that angle to the angle of departure — so it grows with the aim at a slope near 1
+ * and the window (geo.window.halfRad, an angle of departure) still measures it. A probe counts when
+ * the cue ball hits the object ball first and directly, the object ball then meets this cushion
+ * before anything else, and it does not come back into the cue ball.
+ *
+ * Returns the geometry re-based on the path found — the simulated departure as the object ball's
+ * line (window.dir; the throw is its difference from the aim), ghost, cut and tolerance from that
+ * line, the cushion point it met, both legs' length — and the aim; null when no probe counted (the
+ * caller keeps the mirror-rule geometry).
+ */
+function bankSolve(table: TableSpec, cue: Ball, target: Ball, geo: ShotGeometry, stroke: Stroke, params: PhysicsParams): { geo: ShotGeometry; aim: SearchResult } | null {
+  const R = table.ballRadius;
+  const bank = geo.bank!;
+  const n = RAIL_NORMALS[bank.rail];
+  const line = R - (Math.abs(n.x) * table.length + Math.abs(n.y) * table.width) / 2; // the ball's centre meets the cushion on p·n = line
+  const speed = powerToSpeed(stroke.power);
+  const met = new Map<number, { depart: number; point: Vec2; back: number }>();
+  const errAt = (a: number): number => {
+    const st = strikeBall(norm(sub(ghostBall(target.pos, fromAngle(a), R), cue.pos)), speed, stroke.side, stroke.vert, R, params.squirtMassRatio);
+    const sim = simulate(table, toInit([cue, target], cue.id, st.vel, st.omega), params, { record: false });
+    const hit = sim.firstHits[target.id];
+    if (!hit || hit.other !== cue.id) return NaN;
+    for (const e of sim.trajectories.find((t) => t.ballId === cue.id)!.events) {
+      if (e.kind === 'ball') break;
+      if (e.kind === 'cushion' || e.kind === 'jaw' || e.kind === 'pocket') return NaN;
+    }
+    const ev = sim.trajectories.find((t) => t.ballId === target.id)!.events.filter((e) => e.kind !== 'roll');
+    const k = ev.findIndex((e) => e.kind === 'ball');
+    const rail = ev[k + 1];
+    if (!rail || rail.kind !== 'cushion' || Math.abs(dot(rail.pos, n) - line) > 1e-3) return NaN;
+    const next = ev[k + 2];
+    if (next?.kind === 'ball') return NaN;
+    const way = sub(next ? next.pos : sim.final[target.id]!.pos, rail.pos);
+    const w = pocketWindow(rail.pos, geo.pocket, R);
+    if (!w.ok || Math.hypot(way.x, way.y) < 1e-6) return NaN;
+    const out = dist(target.pos, rail.pos);
+    met.set(a, { depart: angleOf(hit.vel), point: rail.pos, back: w.distance });
+    return (angleBetween(norm(way), w.dir) * w.distance) / (out + w.distance);
+  };
+  const r = throwSearch(geo, errAt, BANK_PROBES);
+  const at = r.residual === null ? undefined : met.get(r.aim);
+  if (!at) return null;
+  const dir = fromAngle(at.depart);
+  const ghost = ghostBall(target.pos, dir, R);
+  const cut = cutAngle(cue.pos, ghost, dir);
+  const cbDistance = dist(cue.pos, ghost);
+  const cosCut = Math.max(0, Math.cos(cut));
+  const railDistance = dist(target.pos, at.point);
+  const distance = railDistance + at.back;
+  return {
+    geo: {
+      ...geo,
+      window: { ...geo.window, dir, distance },
+      ghost,
+      aimDir: norm(sub(ghost, cue.pos)),
+      cut,
+      cbDistance,
+      toleranceRad: (geo.window.halfRad * 2 * R * cosCut) / Math.max(cbDistance, 2 * R),
+      toleranceMm: geo.window.halfRad * 2 * R * cosCut * 1000,
+      captureDistance: distance + (geo.captureDistance - geo.window.distance),
+      bank: { rail: bank.rail, point: at.point, railDistance, cosIn: Math.abs(dot(dir, n)) },
+    },
+    aim: { aim: r.aim, throwRad: angleBetween(fromAngle(r.aim), dir), residual: r.residual },
+  };
+}
+
+/**
  * OB aim that cancels throw: err(a) = OB departure − window direction, which grows with the aim
  * angle (slope ≈ 1). Bracketed secant inside [geo.aimLo, geo.aimHi] (ghost on the table), at most
- * THROW_PROBES probes; invalid probes (cushion/jaw before the ball) shrink the range toward the best
+ * `probes` probes; invalid probes (cushion/jaw before the ball) shrink the range toward the best
  * valid aim. Keeps the aim with the smallest valid |err|; the geometric aim if none is valid.
  */
-function throwSearch(geo: ShotGeometry, errAt: (a: number) => number): SearchResult {
+function throwSearch(geo: ShotGeometry, errAt: (a: number) => number, probes = THROW_PROBES): SearchResult {
   const desired = angleOf(geo.window.dir);
   let lo = geo.aimLo;
   let hi = geo.aimHi;
@@ -993,7 +1239,7 @@ function throwSearch(geo: ShotGeometry, errAt: (a: number) => number): SearchRes
   let best: { a: number; e: number } | null = null;
   let prev: { a: number; e: number } | null = null;
   let throwRad = 0;
-  for (let k = 0; k < THROW_PROBES; k++) {
+  for (let k = 0; k < probes; k++) {
     const e = errAt(a);
     if (Number.isNaN(e)) {
       if (!best) break; // the geometric aim itself isn't a clean ball-first hit: no correction

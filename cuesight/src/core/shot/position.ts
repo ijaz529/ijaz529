@@ -16,7 +16,7 @@
  * Recommendation.risks.
  *
  * Coaching rules on top of the score: side spin is a last resort, as coaches teach it — it costs
- * SIDE_PENALTY·|side|, is not used on a near-straight shot without a landing spot while any
+ * SIDE_PENALTY·|side|, is not used on a near-straight shot or a bank without a landing spot while any
  * centre-line stroke works, and must beat the best centre-line stroke by SIDE_MIN_GAIN after the
  * robustness checks; a stroke whose own plan says "too soft" (below minPower, the ball only just
  * drops) is a last resort too (TOO_SOFT_PENALTY); pace well past pocket speed costs per diamond;
@@ -216,7 +216,8 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   let timedOut = false;
   const maxEvaluations = Math.max(0, Math.floor(opts.maxEvaluations ?? FULL_EVALUATIONS));
   // advice: false — the search reads warning codes only, never the wording (PlanOptions.advice).
-  const base = planShot(layout, { targetId: request.targetId, ...(request.pocketId ? { pocketId: request.pocketId } : {}) }, params, { record: false, advice: false });
+  const bank = request.bank ? { bank: request.bank } : {};
+  const base = planShot(layout, { targetId: request.targetId, ...(request.pocketId ? { pocketId: request.pocketId } : {}), ...bank }, params, { record: false, advice: false });
   const pocketId = base.pocketId;
   const landing = opts.landing ?? request.landing;
   let evaluated = 0;
@@ -232,8 +233,10 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
   const cueBall = layout.balls.find((b) => b.kind === 'cue')!;
   const cueId = cueBall.id;
   const R = layout.table.ballRadius;
-  // Side on a near-straight shot with no spot to reach is a last resort (see NO_SIDE_PENALTY).
-  const noSide = !landing && base.cutAngleDeg < NO_SIDE_CUT_DEG;
+  // Side on a near-straight shot with no spot to reach is a last resort (see NO_SIDE_PENALTY). So is
+  // side on a bank: it turns the object ball, which changes the angle off the cushion, the least
+  // certain part of the model (collide.ts). ASSUMPTION: a coaching rule, as for the straight shot.
+  const noSide = !landing && (base.cutAngleDeg < NO_SIDE_CUT_DEG || !!base.bank);
 
   /** Room for `n` more simulations? (Reads the clock only when a time cap is set.) */
   const room = (n: number): boolean => {
@@ -256,7 +259,7 @@ export function recommendStroke(layout: TableLayout, request: ShotRequest, param
 
   const evaluate = (stroke: Stroke): Scored | null => {
     evaluated++;
-    const plan = planShot(layout, { targetId: request.targetId, pocketId, stroke }, params, { record: false, advice: false });
+    const plan = planShot(layout, { targetId: request.targetId, pocketId, stroke, ...bank }, params, { record: false, advice: false });
     if (!plan.obPocketed || plan.scratch || !plan.cueRest) {
       opts.onEvaluate?.(stroke, null);
       return null;

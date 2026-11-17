@@ -74,6 +74,8 @@ export interface TipInput {
   altPocketName?: string;
   /** The cue ball touches the object ball: the object ball leaves along the line of centres. */
   frozen?: boolean;
+  /** A one-cushion bank (ShotPlan.bank). */
+  bank?: boolean;
 }
 
 /** "the 1" / "the yellow" / "the object ball". */
@@ -147,6 +149,8 @@ export function coachingTip(t: TipInput): string {
   }
   const out: string[] = [];
   const straight = t.cutDeg < 3;
+  // The model's cushion paths are good to a few degrees (collide.ts) and a bank's window is under one: say so.
+  if (t.bank) out.push('Bank shot: pace changes the angle off the cushion and cushions vary, so use the line as a starting point.');
   if (t.frozen) out.push('Frozen balls: the object ball leaves along the line of centres, so aim the stroke, not a ghost ball.');
   else if (t.railFirst)
     out.push(`Rail and ball together: the cue ball meets the cushion as it hits ${theBall(t.targetLabel)}, so aim at the contact point on the ball and trust the line.`);

@@ -98,9 +98,14 @@ export interface Stroke {
   vert: number;
 }
 
+/** A cushion, by its side of the table as the pocket ids name them ('bottom' is y = −width/2, 'left' x = −length/2). */
+export type RailId = 'bottom' | 'right' | 'top' | 'left';
+
 export interface ShotRequest {
   targetId: string;
   pocketId?: PocketId;
+  /** With pocketId: play the ball into that pocket off this cushion (a one-cushion bank), not directly. */
+  bank?: RailId;
   stroke?: Stroke;
   landing?: Vec2;
 }
@@ -269,6 +274,21 @@ export interface ShotPlan {
   obPocketSpeed: number;
   /** Alternative pockets ranked by tolerance (for not-makeable or comparison). */
   alternatives: { pocketId: PocketId; toleranceDeg: number }[];
+  /**
+   * A bank plan (ShotRequest.bank): the cushion the object ball goes off, and where the ball's centre
+   * is when it meets it — in the simulated shot, or by the mirror rule when the ball never gets there.
+   * The aim, cut and line (obDir) are those of the simulated bounce at this stroke's pace and spin,
+   * not the mirror rule's: the model's cushion paths are good to a few degrees (collide.ts), so the
+   * app presents a bank's line as a starting point and a bank is rated no easier than 'hard'. Absent
+   * for a direct shot.
+   */
+  bank?: { rail: RailId; point: Vec2 };
+  /**
+   * A direct plan that cannot be played (not makeable, or blocked) when a one-cushion bank is open by
+   * the mirror rule, with no ball in the way: into the pocket asked for, or with none asked for the
+   * widest one on the table. Only on plans that are shown (PlanOptions.record on); absent otherwise.
+   */
+  bankOption?: { pocketId: PocketId; rail: RailId };
 }
 
 export interface ShotSuggestion {
