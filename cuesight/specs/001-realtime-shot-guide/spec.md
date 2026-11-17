@@ -462,5 +462,7 @@ recommended stroke uses below-centre spin and the simulated rest position is wit
 - Default physics uses standard cloth and cushion values. Real tables vary, so predicted paths are
   guidance with stated uncertainty, not guarantees.
 - Ball numbers/colours are not needed for v1 planning beyond identifying the cue ball.
-- Bank, kick, combination, massé and jump shots are out of scope for v1.
+- Kick, combination, massé and jump shots are out of scope for v1, and so are banks off two or more
+  cushions. One-cushion banks were added on 2026-11-17, on request only ("Bank it" on a pocket that
+  cannot be played directly): `ShotRequest.bank`, data-model.md.
 - The player strikes with a level cue (no elevation). Swerve is not modelled in v1.

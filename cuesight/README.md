@@ -37,6 +37,7 @@ the cue ball) and **Practice** (a 3D table you can orbit, drag balls on and repl
 | **Freeze & calibrate** | Freeze the layout and walk around. Fall back to tapping the four cloth corners. Swap the long and short rails (Rotate). Rotate and Calibrate keep your target, cue ball, pocket and landing spot: they are found again where the camera sees them once the new frame locks ("Kept your selection."). A field-of-view or table change in Settings clears them. Tap *Cue ball* to mark the cue ball, live or frozen. Position mode treats every tap, even next to a ball, as the landing spot |
 | **Drills** | No camera needed: built-in practice layouts (straight-in, 30° cut, rail ball, blocked, scratch risk, 9-ball) |
 | **Physics-grounded plan** | Time-stepped rigid-ball simulator with sliding/rolling friction, frictional ball–ball impulse (throw), cushions that change top and back spin, and jaws |
+| **Bank shots** | When the pocket you picked cannot be played directly (wrong side, or a ball in the way), the card offers *Bank it*: the ball off one cushion into the pocket. The aim comes from simulating the bounce at the stroke's pace and spin, not from the mirror rule, and the card says to treat the line as a starting point |
 | **Your stroke** | Power slider and spin pad, plus presets (stun, draw, follow, left, right). Predictions update instantly |
 | **Position play** | Tap where the cue ball should finish. CueSight simulates a grid of strokes, rules out any stroke that misses or scratches when hit 6 % or 12 % too hard or too soft, tests the survivors against tip, aim and squirt errors, and recommends the most forgiving one (at most 324 simulations; a phone gets fewer, sized to its speed). If no stroke survives, it says the stroke may need precise pace. Without a target spot it picks the stroke that leaves the easiest next shot |
 | **Suggest & zones** | Ranks every makeable shot. Heatmap of cue-ball zones that leave an easy next ball |
@@ -62,9 +63,9 @@ committed), and without it `camera.spec.ts` and the Live focus test in `ui.spec.
 "Starting camera…". Timing tests can fail on a busy CPU; re-run them alone before concluding.
 
 <!-- RELEASE: update these counts (and the commit) when the release branch is cut. -->
-**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1037 tests in 68 files**, all
+**Test status** (release branch, 2026-11-15): `npx vitest run` runs **1052 tests in 69 files**, all
 passing (timing guards compare against work measured in the same run, so a busy CPU does not fail them).
-`npm run e2e` runs **140 tests**, all passing, also with a wide fallback font (DejaVu Sans, as on CI).
+`npm run e2e` runs **141 tests**, all passing, also with a wide fallback font (DejaVu Sans, as on CI).
 
 **On your phone:** browsers only allow the camera on **HTTPS** (or localhost). Deploy `dist/` to any static
 HTTPS host (GitHub Pages, Netlify, Cloudflare Pages) and open it on the phone. Then use "Add to Home
@@ -250,6 +251,12 @@ The power scale itself was not changed; R-12 in research.md lists the travel per
   within about 10 % (research.md R-08), so the cue-ball path after a rail is the least certain part of
   a plan. Before 2026-11-15 rails kept top and back spin, which under-predicted travel after a rail by
   up to a third.
+- **Bank shots.** A bank's aim rests on that rail model, and a bank's pocket window is under a degree
+  while the model's rail angles are good to a few. So the line is a starting point to adjust after a
+  first try, a bank is never rated easier than "hard", and its tip says so. In the model a soft,
+  rolling bank comes off wider than the mirror rule and a firm one close to it, as on a real table.
+  Only one cushion, only when you ask for it (*Bank it*), and not for a cue ball frozen to the ball.
+  *Suggest* still ranks direct pots only. *Bank it* is on the shot card, not on Snap's own guide panel.
 - **Pocket model.** Jaws are modelled as points on the cushion line. Facings, which let balls rattle in,
   are not modelled, so margins are slightly conservative.
 - **Assumed stroke.** The cue is assumed level, so there is no swerve or massé. CueSight prescribes the
@@ -316,7 +323,8 @@ The power scale itself was not changed; R-12 in research.md lists the travel per
   photo; if they do not line it up either, CueSight says so and asks for a better photo. With no cloth
   in view, it asks for a new photo straight away.
 - **Ball identity and rules.** Planning is rule-agnostic: any object ball can be the target.
-- **Out of scope for now.** Bank, kick and combination shots.
+- **Out of scope for now.** Kick shots (cue ball off a cushion first), banks off two or more cushions,
+  and combination shots.
 
 ## Built with spec-driven development
 
@@ -350,7 +358,8 @@ installed in `.claude/skills` for the next feature.
 
 1. Real-table dataset and evaluation harness. An optional learned ball detector behind the same
    `detectBalls` contract (ONNX Runtime Web).
-2. Bank and kick shots (mirror system plus simulated correction), and combinations.
+2. Kick shots, two-cushion banks and combinations (one-cushion banks are in: simulated, not the
+   mirror system). Banks in *Suggest*.
 3. Shot-result tracking: record the actual paths after the stroke, compare them with the prediction,
    and auto-calibrate cloth and cushions.
 4. Rule-aware suggestions for 8-ball, 9-ball and snooker (ball numbers and colours).

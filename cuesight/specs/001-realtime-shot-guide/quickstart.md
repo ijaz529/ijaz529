@@ -51,5 +51,5 @@ On `fix2b/app` (2026-11-15; the README's "Test status" line is the one place the
 `npx vitest run` gives 887 tests in 61 files: 881 pass and 6 fail. The failures are the
 touching-cluster and 4:2:0 corner-pair cases in `ball-detect-edge.test.ts` (analysis.md
 "Post-review"), pending the vision branch. On the release branch those 6 cases pass (T074, analysis.md
-"Post-vision merge"): 1037 tests in 68 files, all passing. `npm run e2e` runs 140 tests. Timing tests can fail when
+"Post-vision merge"): 1052 tests in 69 files, all passing. `npm run e2e` runs 141 tests. Timing tests can fail when
 the CPU is shared. Re-run a failing timing test on its own before concluding.

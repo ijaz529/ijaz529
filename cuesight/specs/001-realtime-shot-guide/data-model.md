@@ -123,6 +123,7 @@ miscue limit is **2 tips**, and the words run from ¼ to 2 tips in quarter steps
 |---|---|---|
 | `targetId` | string | must reference an object ball |
 | `pocketId` | PocketId? | when absent, choose the best makeable pocket |
+| `bank` | RailId? (`'bottom' \| 'right' \| 'top' \| 'left'`) | with `pocketId`: play the ball into that pocket off this cushion (a one-cushion bank). The plan then has `bank: { rail, point }` (where the ball's centre meets the cushion); its aim, cut and line are the simulated bounce's at the stroke's pace and spin (`bankSolve`), the mirror rule only seeds the search and gives the window, and it is rated no easier than "hard". A direct plan that cannot be played has `bankOption: { pocketId, rail }` when a bank is open |
 | `stroke` | Stroke? | player override. When absent, use the recommended or default stroke |
 | `landing` | Vec2? | desired CB rest position (position play) |
 

@@ -87,6 +87,9 @@ describeSpin(stroke: { side, vert }): string                // "½ tip below cen
 paceDiamonds(obMouthSpeed, tableLength, params): number; speedReference(…): string | null   // "pocket speed + 2 diamonds"
 shotGeometry(table, balls, cue: Ball, target: Ball, pocket: PocketSpec, params = DEFAULT_PHYSICS): ShotGeometry
   // geometry only (no simulation); params sets the frozen-ball throw bound; used by suggestions
+bankGeometry(table, balls, cue: Ball, target: Ball, pocket: PocketSpec, rail: RailId, params = DEFAULT_PHYSICS): ShotGeometry
+  // a one-cushion bank by the mirror rule (the pocket reflected in the line the ball's centre turns on);
+  // planShot plans it for request.bank and moves the aim by simulation through the cushion
 minimumPower(geo, stroke: { vert }, params, criterion: 'capture' | 'pace' = 'capture'): number   // 10.5 = not even at 10
 planShot(layout, request: ShotRequest, params, opts?: PlanOptions): ShotPlan
   // PlanOptions = { recommended?: Stroke (used when the request has no stroke), record?: boolean,

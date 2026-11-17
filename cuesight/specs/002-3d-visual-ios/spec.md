@@ -678,5 +678,6 @@ appear in TestFlight.
 - An Android store build (the PWA continues to cover Android).
 - App Store submission, review and release; in-app purchases.
 - Recognising ball numbers; rule-aware play (8-ball groups, snooker order).
-- Bank, kick, combination, massé and jump shots (unchanged from 001).
+- Kick, combination, massé and jump shots, and banks off two or more cushions (001; one-cushion
+  banks were added there on 2026-11-17).
 - Accounts, cloud sync, sharing photos or analytics.

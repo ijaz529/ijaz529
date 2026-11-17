@@ -32,7 +32,7 @@ npm run build                             # production PWA into dist/
 ### Testing notes (`fix2b/app`)
 
 <!-- RELEASE: keep these counts in step with the README "Test status" line. -->
-- e2e has **140 tests** on the release branch, all passing in the final full run (2 workers).
+- e2e has **141 tests** on the release branch, all passing in the final full run (2 workers).
 - `practice3d.spec.ts` runs at deviceScaleFactor 1 on the Chromium projects (SwiftShader is slow at a
   phone's pixel ratio); `webkit-iphone` keeps the iPhone 15's 3.
 - "Play shot replays…" is measured in the page, after every drawn 3D frame (`gl.readPixels` against
