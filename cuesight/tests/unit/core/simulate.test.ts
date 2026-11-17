@@ -447,9 +447,11 @@ describe('per-step loop: determinism and no allocation (Constitution IV)', () =>
     // reading the captured `time`, earliest(rem) or friction(i, dt) taking a double argument, or —
     // after the corner-pocket test above — the pocket event's time computed before the ball loop);
     // 17–22 for the loop before the `arg` buffer. Unphysical cloth on purpose: this checks
-    // allocation, not physics. A window in which the JIT has just deoptimised the loop allocates
-    // too, so the best of up to three windows counts; a real per-step allocation shows in every
-    // window.
+    // allocation, not physics. The loop also allocates until V8 has it in its top tier, and that
+    // takes a varying number of windows after the warm-up: in 20 runs (Node 22.22) every window
+    // showed 6 collections until the 2nd to the 5th, and 0–1 in every window after. So the first
+    // window within the limit counts, of up to twelve; a real per-step allocation shows in every
+    // window. (With three windows this test failed 6 of those 20 runs.)
     const p = withPhysics({ muSlide: 0.002, muRoll: 0.0005, spinDecel: 1, maxTime: 60 });
     const lone: SimBallInit[] = [{ id: 'c', pos: v2(-1, 0), vel: v2(0.4, 0), omega: { x: 0, y: -20, z: 30 } }];
     const run = (k: number) => {
@@ -464,7 +466,7 @@ describe('per-step loop: determinism and no allocation (Constitution IV)', () =>
     });
     obs.observe({ entryTypes: ['gc'] });
     let best = Infinity;
-    for (let attempt = 0; attempt < 3 && best > 3; attempt++) {
+    for (let attempt = 0; attempt < 12 && best > 3; attempt++) {
       await new Promise((r) => setTimeout(r, 20));
       gcs = 0;
       const steps = run(150);
